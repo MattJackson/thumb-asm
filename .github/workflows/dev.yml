@@ -1,0 +1,69 @@
+# Fast gate: fmt, clippy (latest stable only), test, and the README example.
+# Runs on every push to dev and on every pull request. The thorough gate
+# (multi-OS, MSRV matrix, coverage, rustdoc links, packaging, semver) lives in
+# qa.yml and runs only on the qa branch, where speed matters less than
+# completeness. Nothing slow is allowed in here: this is the inner loop, and a
+# gate that takes longer than the edit it is checking stops being used.
+#
+# Every third-party action is pinned to a full commit SHA (readable ref in a
+# trailing comment) rather than a tag or branch: a tag is not an identity,
+# since its owner can repoint it to different code at any time, and
+# dtolnay/rust-toolchain's `@stable`/`@nightly` refs are branches, which is
+# the same problem without even the pretence of stability.
+#
+# No `continue-on-error` anywhere: every step here is load-bearing.
+
+name: dev fast gate
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    # A single run of this gate is a ~2 minute job. Ten minutes means something
+    # is wedged (a hung test, a network stall), and failing then is far better
+    # than holding a runner for GitHub's 6 hour default.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # There is no committed Cargo.lock (this is a zero-dependency library, so
+      # `.gitignore` excludes it, which is the normal choice for a lib), which
+      # is why no cargo invocation in any of these workflows passes `--locked`:
+      # on a fresh checkout there is no lockfile to be locked to and cargo
+      # refuses outright. The cache still pays for itself on the build itself.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        # Clippy always runs on latest stable, never on the MSRV toolchain:
+        # its lints track the current edition of Rust idiom, not the floor
+        # this crate promises to build on. The MSRV toolchain's job is only
+        # to prove the code *compiles and passes tests* there (see qa.yml).
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --all-targets
+      - name: doctests
+        # `--all-targets` silently excludes doctests, and this crate's public
+        # API is documented with runnable examples, so they need their own run.
+        run: cargo test --doc
+      - name: README example stays in sync with the API
+        run: cargo run --example trampoline
