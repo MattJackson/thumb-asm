@@ -1,0 +1,25 @@
+# The crate has zero Cargo dependencies by design, so there is no `cargo`
+# ecosystem here to watch: the only third-party code in this repository is the
+# handful of GitHub Actions the three workflows call. Those are pinned to
+# commit SHAs, which is the right thing for supply-chain reasons but means they
+# never move on their own — Dependabot is what keeps a pin from quietly
+# becoming a two-year-old action. It rewrites both the SHA and the readable ref
+# in the trailing comment.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # PRs open against dev, never main: main only ever advances from a green qa,
+    # and an action bump has to walk the same dev -> qa -> main path as any
+    # other change.
+    target-branch: "dev"
+    commit-message:
+      prefix: "ci"
+    # One PR for all of them. Action bumps are reviewed as a batch — five
+    # separate PRs each re-running the fast gate is noise, not diligence.
+    groups:
+      actions:
+        patterns: ["*"]

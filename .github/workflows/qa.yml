@@ -1,0 +1,366 @@
+# Thorough gate. Runs on every push to qa (qa only ever advances by
+# fast-forwarding from a dev commit that already passed dev.yml), so this
+# workflow re-validates everything dev.yml checked and adds what dev.yml
+# skips for speed: the OS matrix, the MSRV toolchain, a hard 100%-coverage
+# gate, a rustdoc build that treats a dead doc link as a build failure, a
+# publish dry run, and a semver check against the crate already on crates.io.
+# Green here is the release signal — main only ever advances from a green qa.
+#
+# release.yml calls this same file (`workflow_call`) before it publishes, so
+# "what qa proved" and "what release re-verified" cannot drift apart: there is
+# exactly one definition of the thorough gate and both paths run it.
+#
+# Actions are pinned to a full commit SHA with the human-readable ref in a
+# trailing comment; see dev.yml's header for why. No `continue-on-error`
+# anywhere: a check that is allowed to fail is not a check.
+
+name: qa full gate
+
+on:
+  push:
+    branches: [qa]
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        description: >-
+          Codecov upload token. Optional: the coverage gate below is enforced
+          locally in this workflow and does not depend on Codecov, so a caller
+          that does not pass this simply gets no upload. It is declared here
+          rather than relying on `secrets: inherit` in the caller because
+          `inherit` hands the called workflow *every* secret the repository
+          has, and the release path that calls this file is the one place that
+          most needs a short list.
+        required: false
+    outputs:
+      version:
+        description: "The [package].version this run verified, read from Cargo.toml"
+        value: ${{ jobs.manifest.outputs.version }}
+      msrv:
+        description: "The rust-version this run tested against, read from Cargo.toml"
+        value: ${{ jobs.manifest.outputs.msrv }}
+
+concurrency:
+  group: qa-${{ github.workflow }}-${{ github.ref }}
+  # Superseding an outdated qa push is free; cancelling the verification half
+  # of an in-flight release is not, so only the push path cancels.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  manifest:
+    name: read manifest (version, MSRV)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      msrv: ${{ steps.read.outputs.msrv }}
+      toolchains: ${{ steps.read.outputs.toolchains }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - name: version and MSRV come from Cargo.toml, not from this file
+        id: read
+        # A hardcoded MSRV in CI is how a crate ends up testing a floor it no
+        # longer promises, or promising one it never tests. `rust-version` in
+        # Cargo.toml is the single declaration; this job turns it into the
+        # test matrix, and release.yml reads the version back out of here so
+        # it publishes exactly the version this gate verified.
+        run: |
+          set -euo pipefail
+          meta=$(cargo metadata --no-deps --format-version=1)
+          version=$(printf '%s' "$meta" | jq -r '.packages[0].version')
+          msrv=$(printf '%s' "$meta" | jq -r '.packages[0].rust_version')
+          if [ -z "$msrv" ] || [ "$msrv" = "null" ]; then
+            echo "Cargo.toml declares no rust-version, so there is no floor to test against." >&2
+            echo "Either declare one or delete the MSRV leg of this matrix deliberately." >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "msrv=$msrv"
+            printf 'toolchains=["stable","%s"]\n' "$msrv"
+          } >> "$GITHUB_OUTPUT"
+          echo "thumb-asm $version, MSRV $msrv" >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: fmt, clippy (latest stable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    needs: manifest
+    strategy:
+      # One red cell should not hide the other five: the interesting question
+      # when MSRV breaks on Windows is whether it also broke everywhere else.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # "stable" proves the crate builds against whatever's current; the
+        # other entry is Cargo.toml's declared `rust-version` floor, resolved
+        # at run time by the manifest job above.
+        rust: ${{ fromJSON(needs.manifest.outputs.toolchains) }}
+    runs-on: ${{ matrix.os }}
+    # The ISA build-out is growing this suite by a lot; 45 minutes is room to
+    # grow into while still being short enough to catch a genuine hang.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.rust }}
+      # Deliberately no clippy on this matrix: on the MSRV toolchain its lints
+      # would be judging 2026 idiom against a 1.58 floor, and on stable the
+      # `lint` job above has already run it once. What the floor has to prove
+      # is only that it builds and passes.
+      - run: cargo build --all-targets
+      - run: cargo test --all-targets
+      - name: doctests
+        # `--all-targets` skips doctests entirely — they are the examples every
+        # downstream reader copies, so they get tested on every cell, including
+        # the MSRV floor.
+        run: cargo test --doc
+      - run: cargo run --example trampoline
+
+  docs:
+    name: cargo doc (dead links are failures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Rustdoc link rot is silent: a broken `[`Type`]` renders as plain text,
+      # docs.rs builds green, and nobody notices for a year. `-D warnings`
+      # already implies the two link lints, but they are named explicitly so
+      # that reading this line tells you what it enforces.
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo doc --no-deps --all-features
+
+  package:
+    name: cargo package / publish --dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: file list going into the .crate
+        run: cargo package --list
+      - name: Arm's spec/ dump must stay out of the published crate
+        # Cargo.toml excludes spec/ because it is ~35 MB of Arm-copyright PDFs
+        # that no downstream build needs. A typo in `exclude` would not fail
+        # any build — it would just ship them — so the exclusion is asserted
+        # here rather than assumed.
+        run: |
+          set -euo pipefail
+          if cargo package --list | grep -q '^spec/'; then
+            echo "spec/ is in the .crate; Cargo.toml's exclude list has regressed" >&2
+            exit 1
+          fi
+      - name: publish dry run
+        # This is the whole packaging path — package, unpack, build the unpacked
+        # copy — run here so that a packaging error surfaces on qa rather than
+        # halfway through a release. It warns but succeeds when the version is
+        # already on crates.io, which is the normal state between bumps.
+        run: cargo publish --dry-run
+
+  coverage:
+    name: coverage (100% gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Lifted out of `secrets` because step-level `if:` cannot read the
+      # `secrets` context at all — `env` is the only context available there
+      # that a secret can be routed through. This is what lets the upload step
+      # below ask "does this token exist yet?" instead of assuming it does.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
+        with:
+          tool: cargo-llvm-cov
+      # This crate is a pure function of its inputs with no I/O and no deps, so
+      # 100% line/region/function coverage is a maintainable bar rather than an
+      # aspiration: the day a change drops below it, this job goes red and
+      # names exactly which lines regressed. Adding an instruction encoder
+      # without a test for it is precisely the thing this catches.
+      - name: cargo llvm-cov (fail under 100%)
+        # One run produces both outcomes: the pass/fail gate and the lcov file
+        # Codecov consumes. Instrumenting and running the suite twice to get the
+        # same numbers into two formats would double the job for nothing, and
+        # would leave open the possibility of the gate and the published report
+        # disagreeing about the same commit.
+        run: |
+          cargo llvm-cov --all-features \
+            --lcov --output-path lcov.info \
+            --fail-under-lines 100 \
+            --fail-under-regions 100 \
+            --fail-under-functions 100
+
+      # Codecov is a second opinion and a place to see *which* lines moved
+      # between commits; it is not the gate. The gate is the step above, which
+      # runs whether or not Codecov is configured, so this repository's coverage
+      # guarantee never depends on a third-party service being reachable.
+      #
+      # Tokenless uploads from public repos have worked historically but Codecov
+      # has been steadily tightening that, so a token is passed. Until the
+      # maintainer adds the CODECOV_TOKEN secret (see docs/SETUP.md) the
+      # expression below is the empty string and the upload is skipped with the
+      # note in the next step. Deliberately an `if:` and not `continue-on-error`:
+      # "this is not configured yet" and "this failed and we ignored it" must not
+      # look the same in the run log. Once the secret exists this starts working
+      # on the next push with no edit to this file.
+      #
+      # Note the release path: release.yml calls this workflow and passes
+      # CODECOV_TOKEN through explicitly, so pushes to main upload too — which
+      # is what makes the badge (which reports the *default* branch) resolve
+      # rather than sitting on data that only ever came from qa.
+      - name: upload coverage to Codecov
+        if: env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          # The lcov file is named explicitly, so searching the tree for other
+          # coverage reports can only find something unintended.
+          disable_search: true
+          # If an upload is attempted at all, it has to succeed. A silently
+          # dropped report is how a coverage badge ends up months stale while
+          # every run still shows green.
+          fail_ci_if_error: true
+
+      - name: Codecov upload skipped (no CODECOV_TOKEN)
+        if: env.CODECOV_TOKEN == ''
+        run: |
+          set -euo pipefail
+          {
+            echo "### Codecov upload skipped"
+            echo ""
+            echo "The 100% coverage gate ran and passed; only the upload to codecov.io was skipped,"
+            echo "because the repository has no \`CODECOV_TOKEN\` secret."
+            echo ""
+            echo "To enable it: activate the repo at https://app.codecov.io/gh/MattJackson/thumb-asm,"
+            echo "copy the upload token, and add it as the repository secret \`CODECOV_TOKEN\`."
+            echo "See docs/SETUP.md. No change to this workflow is needed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  conformance:
+    name: conformance against LLVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install LLVM
+        # Every other gate in this repository checks the crate against itself:
+        # the round-trip sweeps prove decode and encode agree, which a
+        # systematic misreading of the architecture would satisfy perfectly
+        # while still being wrong. This job is the only one that asks an
+        # implementation nobody here wrote. `llvm` supplies `llvm-mc` and
+        # `llvm-objdump`; the harness discovers whichever of the three it finds.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends llvm clang
+          clang --version
+      - name: Sweep the encoding space against LLVM
+        # `--nocapture` is load-bearing, not debugging noise. The harness skips
+        # cleanly when no toolchain is present, so without the banner and the
+        # outcome tables in the log a green run cannot be distinguished from a
+        # run that checked nothing. `--test-threads=1` only keeps the four
+        # sweeps' tables from interleaving for a human reader.
+        run: cargo test --test conformance -- --nocapture --test-threads=1
+
+  semver:
+    name: cargo-semver-checks vs the published crate
+    needs: manifest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
+        with:
+          tool: cargo-semver-checks
+      - name: is there a published baseline to compare against?
+        id: baseline
+        # Before the first release there is nothing on crates.io to diff
+        # against, and cargo-semver-checks can only error in that case. This
+        # is a guard, not a `continue-on-error`: once a version exists the
+        # check below is mandatory and can never be skipped again.
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: thumb-asm CI (https://github.com/MattJackson/thumb-asm)" \
+            "https://crates.io/api/v1/crates/thumb-asm")
+          case "$code" in
+            200) echo "exists=true"  >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "crates.io answered $code; refusing to guess" >&2; exit 1 ;;
+          esac
+      - name: cargo semver-checks
+        if: steps.baseline.outputs.exists == 'true'
+        # This crate has downstream consumers, and the failure worth automating
+        # away is a breaking change shipped under a patch bump. semver-checks
+        # diffs this tree's public API against the greatest published version
+        # and fails when the change needs a bigger bump than Cargo.toml took.
+        # So while the ISA build-out is additive, this stays green; the moment
+        # something public is removed or has its signature changed, it goes red
+        # until the version is bumped to cover it (for 0.x that means the minor:
+        # 0.1.x -> 0.2.0).
+        run: cargo semver-checks --all-features
+
+  gate:
+    name: qa gate
+    needs: [manifest, lint, test, docs, package, coverage, conformance, semver]
+    # `always()` plus an explicit results check, rather than a bare `needs:`,
+    # so that a cancelled or skipped upstream job reports as a red gate instead
+    # of a green-looking skip. This is the one job to mark as required in
+    # branch protection for qa.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every qa job must have succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"' | sort
+          printf '%s' "$NEEDS" | jq -e 'all(.[]; .result == "success")' >/dev/null
+          echo "qa gate green: thumb-asm is releasable from this commit" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,264 @@
+# Release. A push to main publishes thumb-asm to crates.io, tags v<version>,
+# and opens a GitHub Release whose body is that version's CHANGELOG section.
+# Nothing is published that has not just passed the full qa gate: the `verify`
+# job below *calls qa.yml itself*, so the release path re-runs the OS matrix,
+# the MSRV floor, coverage, rustdoc links, packaging and semver-checks against
+# the exact commit being released.
+#
+# An ordinary docs commit to main is a clean no-op: every action here is
+# guarded by "does this already exist" (version on crates.io, tag in git,
+# release on GitHub), so main can be pushed to freely and only a version bump
+# actually releases. The same guards make a re-run safe after a partial
+# failure — publish, tag and release are each skipped if already done.
+#
+# ---------------------------------------------------------------------------
+# ONE-TIME SETUP THE MAINTAINER MUST DO (this half cannot be done from a repo)
+# ---------------------------------------------------------------------------
+# Authentication is crates.io Trusted Publishing: GitHub mints a short-lived
+# OIDC token for this specific workflow, crates.io exchanges it for a ~30
+# minute publish token, and no long-lived secret ever sits in this repository.
+# crates.io has to be told to trust this workflow before the first release:
+#
+#   1. Sign in to https://crates.io as an owner of the `thumb-asm` crate.
+#   2. Go to https://crates.io/crates/thumb-asm/settings
+#      (crate page -> "Settings"), section "Trusted Publishing".
+#   3. Click "Add" / "Add a publisher" and choose GitHub as the publisher.
+#   4. Enter exactly these values:
+#          Repository owner:     MattJackson
+#          Repository name:      thumb-asm
+#          Workflow filename:    release.yml
+#          Environment:          release
+#      (Environment is optional on crates.io's side but this workflow runs in
+#      an environment named `release`, so fill it in — it is what stops a
+#      workflow on some other branch or fork from minting a publish token.)
+#   5. Save. That is all; nothing needs to be pasted back into GitHub.
+#
+#   6. In GitHub: Settings -> Environments. The `release` environment is
+#      created automatically on the first run, but creating it by hand lets you
+#      add "Required reviewers" (yourself) so every publish waits for a click,
+#      and/or a deployment branch rule limiting it to `main`. Recommended.
+#
+# Prefer a token instead? Do not need step 1-5, but do need a secret: create a
+# scoped publish token at https://crates.io/settings/tokens, store it as the
+# repository secret CARGO_REGISTRY_TOKEN, then swap the two marked steps below
+# (the commented-out fallback is right next to the trusted-publishing step).
+# Trusted publishing is strictly better — nothing to rotate, nothing to leak —
+# so it is what this file does by default.
+# ---------------------------------------------------------------------------
+#
+# Actions are pinned to a full commit SHA with the readable ref in a trailing
+# comment; see dev.yml's header for why. No `continue-on-error` anywhere.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  # Dispatch exists for two cases: re-running a release that failed halfway
+  # (safe, see the existence guards above) and rehearsing one with dry_run.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: run the full gate and all the checks, but do not publish, tag or release"
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a release mid-flight: `cargo publish` is not reversible.
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  verify:
+    name: re-verify the full qa gate
+    # The same file the qa branch runs, called on this commit. Re-running it
+    # here rather than trusting a green tick from an earlier run is what makes
+    # "we push to main and it's deployed" safe: main could have been pushed to
+    # directly, or the merge could have combined two individually-green
+    # commits into a broken one.
+    uses: ./.github/workflows/qa.yml
+    permissions:
+      contents: read
+    # Named one at a time rather than `secrets: inherit`, which would hand the
+    # called workflow everything this repository holds. Coverage is uploaded
+    # from this path as well as from qa so that codecov.io has data for the
+    # default branch — its badge reports main, and main is only ever pushed
+    # here. If the secret does not exist this is the empty string and qa.yml
+    # skips the upload; it is declared `required: false` there for that reason.
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  publish:
+    name: publish v${{ needs.verify.outputs.version }}
+    needs: verify
+    # A dispatch from a non-main branch is a useful way to run the full gate on
+    # demand, but only main ever publishes.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Gates the OIDC identity (and lets the maintainer require a review click);
+    # this name must match what crates.io's trusted-publishing entry says.
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      # Tag push and GitHub Release creation.
+      contents: write
+      # Mint the OIDC token crates.io exchanges for a short-lived publish
+      # token. This is the whole reason no CARGO_REGISTRY_TOKEN is needed.
+      id-token: write
+    env:
+      CARGO_TERM_COLOR: always
+      VERSION: ${{ needs.verify.outputs.version }}
+      # On a push this is false; on a dispatch it is whatever was ticked.
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || false }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Full history and tags: the tag-existence check and the CHANGELOG
+          # read both need more than a shallow tip.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: what already exists (registry, tag, release)
+        id: state
+        run: |
+          set -euo pipefail
+          if [ -z "${VERSION:-}" ]; then
+            echo "qa.yml returned no version; refusing to release an unnamed thing" >&2
+            exit 1
+          fi
+          crate=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].name')
+          manifest=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
+          if [ "$manifest" != "$VERSION" ]; then
+            echo "verified version $VERSION but this tree says $manifest" >&2
+            exit 1
+          fi
+
+          # 404 means "not published yet", 200 means "already there". Anything
+          # else is crates.io being unhealthy, and the wrong move then is to
+          # guess: a wrong guess either double-publishes or silently skips a
+          # release, so stop and let a human look.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: thumb-asm release (https://github.com/MattJackson/thumb-asm)" \
+            "https://crates.io/api/v1/crates/${crate}/${VERSION}")
+          case "$code" in
+            200) published=true ;;
+            404) published=false ;;
+            *)   echo "crates.io answered $code for ${crate}/${VERSION}; refusing to guess" >&2; exit 1 ;;
+          esac
+
+          if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            tagged=true
+          else
+            tagged=false
+          fi
+
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            released=true
+          else
+            released=false
+          fi
+
+          {
+            echo "crate=$crate"
+            echo "published=$published"
+            echo "tagged=$tagged"
+            echo "released=$released"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### release v${VERSION}"
+            echo ""
+            echo "| thing | already exists |"
+            echo "| --- | --- |"
+            echo "| crates.io ${crate} ${VERSION} | $published |"
+            echo "| git tag v${VERSION} | $tagged |"
+            echo "| GitHub release v${VERSION} | $released |"
+            echo ""
+            echo "dry run: ${DRY_RUN}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: release notes for v${{ env.VERSION }} from CHANGELOG.md
+        id: notes
+        if: steps.state.outputs.released == 'false'
+        # A release whose body is "see the commits" is a release nobody reads,
+        # so the CHANGELOG section is mandatory: no section for this version
+        # means the version bump was not finished, and that is worth failing
+        # for while it is still cheap to fix.
+        run: |
+          set -euo pipefail
+          # Stop at the next `## ` heading, and also at the block of
+          # `[0.1.0]: https://...` link definitions a Keep-a-Changelog file
+          # ends with: those belong to the whole file, not to the last
+          # section, and would otherwise be pasted into every release body.
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { inside = 1; next }
+            inside && (/^## / || /^\[[^]]+\]:/) { exit }
+            inside { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          # Written outside the checkout on purpose: `cargo publish` refuses to
+          # package a dirty working tree, and a file created here would make it
+          # dirty. That is exactly how 0.10.0's first publish attempt failed.
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "CHANGELOG.md has no '## [$VERSION]' section with content in it" >&2
+            exit 1
+          fi
+          echo "--- release notes ---"
+          cat "$RUNNER_TEMP/release-notes.md"
+
+      - name: mint a short-lived crates.io token (Trusted Publishing, OIDC)
+        id: auth
+        if: steps.state.outputs.published == 'false' && env.DRY_RUN != 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: cargo publish
+        if: steps.state.outputs.published == 'false' && env.DRY_RUN != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          # Token fallback: delete the `auth` step and the line above, and use
+          #   CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # instead. Also drop `id-token: write` from this job's permissions,
+          # since nothing would need OIDC any more.
+        run: cargo publish
+
+      # Publish first, then tag, then release. Each is independently guarded,
+      # so if the tag push fails after a successful upload, re-running this
+      # workflow skips the (irreversible) publish and finishes the rest.
+      - name: tag v${{ env.VERSION }}
+        if: steps.state.outputs.tagged == 'false' && env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          git -c user.name="thumb-asm release" -c user.email="dev4@getbusbar.com" \
+            tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "refs/tags/v${VERSION}"
+
+      - name: GitHub release v${{ env.VERSION }}
+        if: steps.state.outputs.released == 'false' && env.DRY_RUN != 'true'
+        # --verify-tag so this cannot invent a tag of its own: the tag above is
+        # the one thing that fixes what "v0.1.0" means.
+        run: |
+          set -euo pipefail
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --verify-tag
+
+      - name: what this run actually did
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Dry run: the full qa gate passed and every check ran, nothing was published." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.state.outputs.published }}" = "true" ] \
+            && [ "${{ steps.state.outputs.tagged }}" = "true" ] \
+            && [ "${{ steps.state.outputs.released }}" = "true" ]; then
+            echo "v${VERSION} was already published, tagged and released: nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            echo "Bump [package].version in Cargo.toml (and add its CHANGELOG section) to release the next one." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Released v${VERSION}: https://crates.io/crates/${{ steps.state.outputs.crate }}/${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          fi
