@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-23
+
+Know what the registers and flags are doing. The crate stops refusing
+instructions it can prove are safe to rewrite.
+
+### Emitted bytes changed
+
+Nothing changes for an existing caller. The one rewrite this release adds is
+off by default: `DetourOptions::rewrite_compare_branches` is `false`, so a
+displaced `CBZ`/`CBNZ` that cannot reach its target is still refused exactly
+as in 0.12.0. Turn it on and a `CBZ` at a site where every condition flag is
+dead becomes `CMP` + `B<cond>.W` — different bytes, deliberately, and only
+where they mean the same thing.
+
+The 16-bit digest is unchanged: `0x0e06fda25d6b89e8`.
+
+### Added
+
+- **`flags`** — which condition flags an instruction reads and writes, and
+  which are live at a point in an image.
+
+  This is per-flag rather than a bool, and that is the whole point.
+  `Insn::sets_flags` says *that* flags are written; the mnemonic says *which*.
+  Logical and shift operations with `S` — `ANDS`, `ORRS`, `EORS`, `BICS`,
+  `MVNS`, `LSLS`, `LSRS`, `ASRS` — write N, Z and C and leave **V untouched**,
+  with DDI 0403E.e A7.7.9 and its siblings saying `// APSR.V unchanged`
+  outright. Arithmetic and the comparisons write all four. A model that reads
+  `sets_flags` as "all four die here" therefore reports V dead after an
+  `ANDS`, which would licence a rewrite that destroys a V the next branch
+  tests.
+
+  Reads are asymmetric in the same way: `ADC`, `SBC`, `RSC` and `RRX` consume
+  the carry flag with `cond: None`, so a rule built on `insn.cond.is_some()`
+  misses every one of them.
+
+  `live_after` follows **both** the fall-through and the taken path. That is
+  not a refinement — the motivating caller is rewriting a `CBZ`, which is
+  itself a conditional branch, so half of what happens after it is at its
+  target. Anything it cannot follow (an unresolvable target, a target outside
+  the image, undecodable bytes, the walk budget running out) resolves to every
+  flag live. The approximation is one-directional by design: a flag reported
+  live may be dead, but a flag reported dead is dead on every path it saw.
+
+- **`relocate::widen_compare_branch`** — rewrites `cbz rn, t` as `cmp rn, #0`
+  + `beq.w t`. `relocate` refuses these outright, because the offset is
+  unsigned and forward-only (0 to 126 bytes, no backward form), so a stub in
+  free space essentially never reaches.
+
+  It takes the liveness as an argument rather than computing it, because it
+  receives an `Insn` and liveness is a property of the image around it. It
+  refuses unless every flag is dead.
+
+- **`RelocateError::FlagsLive`** — names *which* flags are live, not just that
+  some are. Worth reading rather than treating as a yes/no: "only V" is the
+  common answer, because a nearby `ANDS` kills three of the four and looks as
+  though it killed all of them.
+
+- **`DetourOptions::rewrite_compare_branches`** — opt in, and it does not make
+  the rewrite unconditional. Liveness is computed from the image at each
+  displaced instruction's original address, and a site where any flag survives
+  is still refused.
+
+### Deferred
+
+- **The `UNPREDICTABLE` channel on `Insn`**, again. It needs
+  `#[non_exhaustive]` on `Insn`, which removes literal construction from a
+  struct whose hand-construction is a documented use case, so it needs a
+  builder designed first — and then every group module has to classify its own
+  encodings, which is a pass over nineteen files rather than an afternoon.
+  Shipping half of it would mean a second breaking release to finish it.
+
 ## [0.12.0] - 2026-09-23
 
 Say what you are patching. The crate stops inferring the instruction set from

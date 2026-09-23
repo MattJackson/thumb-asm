@@ -52,7 +52,7 @@ dependencies beyond `std`, and no Cargo features to choose between.
 
 ```toml
 [dependencies]
-thumb-asm = "0.12"
+thumb-asm = "0.13"
 ```
 
 ## Status
@@ -574,7 +574,7 @@ and a keyless cosign signature over the exact `.crate` published to crates.io,
 both attached as release assets:
 
 ```sh
-gh attestation verify thumb-asm-0.12.0.crate --repo MattJackson/thumb-asm
+gh attestation verify thumb-asm-0.13.0.crate --repo MattJackson/thumb-asm
 ```
 
 ## Changelog
