@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-23
+
+Four additions requested by a consumer patching firmware with this crate, each
+a case where the crate was close but an assumption blocked them. Two of the
+four cannot be made without breaking changes, which is what makes this 0.11.0
+rather than 0.10.2 — `cargo-semver-checks` runs in the `qa` gate and would have
+refused a patch bump.
+
+### Breaking changes
+
+- **`Needle`, `BranchKind`, `Convention` and `DetourOptions` are now
+  `#[non_exhaustive]`.** This is the last time an addition to any of them costs
+  a version. A downstream `match` on one of the enums now needs a `_` arm, and
+  `DetourOptions` must be built through `DetourOptions::new()` and the `with_*`
+  chain rather than a struct literal — which is what the examples already did.
+
+- **`DetourOptions` gained a `style` field.** Defaults to
+  `DetourStyle::ResumeAfter`, which is the existing behaviour, so a caller
+  using the builder is unaffected.
+
+### Added
+
+- **`Needle::Masked(&[(u16, u16)])` — instruction search with don't-care
+  bits.** A signature is `(value, mask)` halfword pairs: "any `BL`" is
+  `(0xF000, 0xF800)`, the five bits that identify the encoding fixed and the
+  eleven displacement bits ignored. `Needle::Bytes` cannot express that at all,
+  because the bytes differ at every call site, so every consumer was
+  hand-rolling the scan. Matches are **halfword-aligned**: Thumb instructions
+  are 2-aligned, and a byte-granular scan reports hits straddling two real
+  instructions that look plausible and are not instructions. An empty pattern
+  matches nothing rather than everything.
+
+- **`find_one` — search that refuses to guess.** `find` returns the first
+  match, which is right when scanning and wrong when *identifying*: a signature
+  matching three places has not found the function, it has said the signature
+  is too weak, and patching the first one is how a tool reports success and
+  bricks a device. `Err(FindError::Ambiguous { count, first })` carries both
+  numbers so a caller can say what happened without repeating the search.
+
+- **`find_free_space_in` and `Fit`** — free space restricted to regions the
+  caller says are writable, with a first-fit or largest-fit policy.
+  `find_free_space` scans the whole image, which assumes every erased byte is
+  fair game; in a real image it is not — a region may be integrity-covered,
+  vendor-reserved, or outside the erase block being rewritten. Only the caller
+  knows. **Slicing the image and searching that is not a workaround**: slicing
+  at an unaligned offset moves the alignment origin, so a result that is
+  4-aligned within the slice is not 4-aligned within the image — the same
+  failure the `align` parameter exists to prevent, reintroduced one layer up.
+  `Fit::Largest` exists because first-fit takes the first hole big enough and
+  leaves the large one fragmented.
+
+- **`classify_branch` and `BranchAt` — ask what is at a site before
+  overwriting it.** `verify_branch` checks an assertion: you say which kind and
+  target you expect and it agrees or disagrees. It cannot catch the
+  expectation itself being wrong, which is the interesting failure. The field
+  that matters most is **width**: a 16-bit `b` at the site comes back as
+  `Direct { kind: None, width: 2 }`, and `install_branch` only writes 4-byte
+  branches, so patching over it consumes the two bytes of whatever follows.
+  Checking `width` first turns a field-reported brick into a refusal.
+
+- **`DetourStyle::DiscardAndJumpTo(u32)`** — the tail-call detour shape:
+  replace the site's instructions and branch to a computed address rather than
+  relocating them and resuming. The variant is named for what it does because
+  the displaced instructions **do not run**; an arm called `JumpTo` reads like
+  a destination choice and hides that. This is the only operation in the crate
+  that discards instructions, and the crate cannot check that you meant it.
+
 ## [0.10.1] - 2026-09-23
 
 No code changes: the library is byte-identical in behaviour to 0.10.0. This

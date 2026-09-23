@@ -63,7 +63,13 @@ pub type Result<T, E = AsmError> = core::result::Result<T, E>;
 
 /// A thing [`find`] can search for. Add a variant here to teach every caller a
 /// new kind of search without touching caller code.
+///
+/// `#[non_exhaustive]`: a `match` on this in a downstream crate must carry a
+/// `_` arm, so a future search kind is an addition rather than a breaking
+/// change. That was not true before 0.11.0, and adding [`Needle::Masked`] is
+/// what cost the minor bump.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Needle<'a> {
     /// An exact byte pattern.
     Bytes(&'a [u8]),
@@ -88,6 +94,35 @@ pub enum Needle<'a> {
         /// Required alignment of the run's start offset, in bytes. Must be >= 1.
         align: usize,
     },
+    /// An instruction pattern with don't-care bits: a slice of
+    /// `(value, mask)` halfword pairs, matching where
+    /// `halfword & mask == value & mask` for every pair in order.
+    ///
+    /// This is how a signature is actually written. "Any `BL`" is
+    /// `(0xF000, 0xF800)` — the five bits that identify the encoding fixed and
+    /// the eleven displacement bits ignored — and searching for it with
+    /// [`Needle::Bytes`] is not possible at all, because the bytes differ at
+    /// every call site.
+    ///
+    /// **Matches are halfword-aligned.** Thumb instructions are 2-aligned, so
+    /// a match at an odd offset is not an instruction; scanning every byte
+    /// offset would report plausible-looking hits straddling two real
+    /// instructions. The scan starts at the first even offset at or after
+    /// `start`.
+    ///
+    /// An empty pattern matches nothing rather than matching everywhere: a
+    /// needle that is satisfied by any position is a mistake in the caller,
+    /// and returning the start offset would hide it.
+    ///
+    /// ```
+    /// use thumb_asm::{find, Needle};
+    ///
+    /// // `bl` to somewhere, preceded by `movs r0, #1`.
+    /// let image = [0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF];
+    /// let any_bl = [(0xF000u16, 0xF800u16), (0xD000, 0xD000)];
+    /// assert_eq!(find(&image, Needle::Masked(&any_bl), 0), Some(2));
+    /// ```
+    Masked(&'a [(u16, u16)]),
 }
 
 /// The one search primitive. Find `needle` at or after byte offset `start`;
@@ -98,6 +133,97 @@ pub fn find(image: &[u8], needle: Needle, start: usize) -> Option<usize> {
         Needle::Bytes(pat) => find_bytes(image, pat, start),
         Needle::Word(w) => find_bytes(image, &w.to_le_bytes(), start),
         Needle::FreeRun { len, align } => find_free_run(image, len, align, start),
+        Needle::Masked(pat) => find_masked(image, pat, start),
+    }
+}
+
+/// How many bytes one occurrence of `needle` spans, for advancing past a match.
+fn needle_len(needle: Needle) -> usize {
+    match needle {
+        Needle::Bytes(pat) => pat.len(),
+        Needle::Word(_) => 4,
+        Needle::FreeRun { len, .. } => len,
+        Needle::Masked(pat) => pat.len() * 2,
+    }
+}
+
+/// Why [`find_one`] did not return an offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FindError {
+    /// Nothing matched.
+    NotFound,
+    /// More than one thing matched.
+    Ambiguous {
+        /// How many non-overlapping occurrences were found.
+        count: usize,
+        /// The offset of the first, for diagnostics — so a message can say
+        /// *where* the search became ambiguous rather than only that it did.
+        first: usize,
+    },
+}
+
+impl core::fmt::Display for FindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FindError::NotFound => f.write_str("no match"),
+            FindError::Ambiguous { count, first } => {
+                write!(f, "{count} matches, first at {first:#x}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FindError {}
+
+/// Find `needle` and require that it occurs exactly once.
+///
+/// [`find`] returns the first match, which is the right answer when you are
+/// scanning. It is the wrong answer when you are *identifying* something: a
+/// signature that matches three places in a firmware image has not found the
+/// function you meant, it has told you the signature is too weak. Taking the
+/// first one and patching it is how a device gets bricked by a tool that
+/// reported success.
+///
+/// So this refuses to choose. `Err(FindError::Ambiguous { count, first })`
+/// carries both the count and the first offset, so a caller can say what
+/// happened without repeating the search.
+///
+/// Occurrences are counted **non-overlapping**: after a match the scan resumes
+/// one needle-length later. For [`Needle::FreeRun`] that makes the count the
+/// number of disjoint free windows, which is rarely a useful question — use
+/// [`find_free_space_in`] to place something instead.
+///
+/// ```
+/// use thumb_asm::{find_one, FindError, Needle};
+///
+/// let image = [0x01, 0x20, 0x01, 0x20];
+/// assert_eq!(
+///     find_one(&image, Needle::Bytes(&[0x01, 0x20])),
+///     Err(FindError::Ambiguous { count: 2, first: 0 })
+/// );
+/// assert_eq!(find_one(&image, Needle::Bytes(&[0x70, 0x47])), Err(FindError::NotFound));
+/// assert_eq!(find_one(&image, Needle::Word(0x2001_2001)), Ok(0));
+/// ```
+pub fn find_one(image: &[u8], needle: Needle) -> Result<usize, FindError> {
+    let step = needle_len(needle).max(1);
+    let first = match find(image, needle, 0) {
+        Some(p) => p,
+        None => return Err(FindError::NotFound),
+    };
+    let mut count = 1;
+    let mut at = first;
+    while let Some(next) = at
+        .checked_add(step)
+        .and_then(|from| find(image, needle, from))
+    {
+        count += 1;
+        at = next;
+    }
+    if count == 1 {
+        Ok(first)
+    } else {
+        Err(FindError::Ambiguous { count, first })
     }
 }
 
@@ -1257,6 +1383,7 @@ pub fn encode_b_cond(site: usize, cond: Cond, target: u32) -> Option<Vec<u8>> {
 /// Both members are 32-bit and ±16 MB, and differ only in whether `lr` is
 /// written; see [`encode_b_wide`] for when that distinction decides a patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BranchKind {
     /// `BL` (T1) — a call: sets `lr` to `site + 4`, so the callee returns here.
     Bl,
@@ -1339,6 +1466,107 @@ impl core::fmt::Display for InstallMismatch {
 }
 
 impl std::error::Error for InstallMismatch {}
+
+/// What is already at a patch site. Returned by [`classify_branch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BranchAt {
+    /// Nothing decoded there, or what decoded is not a branch.
+    NotABranch,
+    /// A branch whose destination is fixed in the encoding.
+    Direct {
+        /// Which installable kind this is, or `None` for a direct branch that
+        /// [`install_branch`] cannot write — a 16-bit `b`, a `cbz`, a `blx`
+        /// to an Arm-state label. `None` is the interesting answer: it means
+        /// the site holds a branch you cannot replace in place without
+        /// thinking about width.
+        kind: Option<BranchKind>,
+        /// How many bytes it occupies: 2 or 4. **This is the field that
+        /// matters.** Writing a 4-byte branch over a 2-byte one does not just
+        /// change the branch, it overwrites the instruction after it.
+        width: u8,
+        /// Where it goes, with the Thumb bit already cleared.
+        target: u32,
+    },
+    /// A branch whose destination is computed — `bx`/`blx` on a register,
+    /// `ldr pc, [..]`, `tbb`/`tbh`. There is no target to compare against.
+    Indirect {
+        /// How many bytes it occupies: 2 or 4.
+        width: u8,
+    },
+}
+
+/// Ask what branch is already at `at`, before overwriting it.
+///
+/// [`verify_branch`] checks an *assertion*: you say which kind and target you
+/// expect and it agrees or disagrees. That cannot catch the case where the
+/// expectation itself is wrong — which is the interesting failure, because a
+/// patcher that believes the site holds a `BL` when it holds a `B` will
+/// happily install the wrong one and report success.
+///
+/// This asks the question instead of asserting the answer. The decoder already
+/// knows; this only puts it in the same vocabulary [`install_branch`] takes.
+///
+/// # The width is the dangerous part
+///
+/// A 16-bit `b` at the site is [`BranchAt::Direct`] with `kind: None` and
+/// `width: 2`. [`install_branch`] only writes 4-byte branches, so patching
+/// over it silently consumes the two bytes of whatever follows. Checking
+/// `width` before installing turns that from a field-reported brick into a
+/// refusal:
+///
+/// ```
+/// use thumb_asm::{classify_branch, BranchAt, BranchKind};
+///
+/// // `b.n +0` — a 16-bit unconditional branch.
+/// let image = [0xFE, 0xE7];
+/// match classify_branch(&image, 0) {
+///     BranchAt::Direct { kind, width, .. } => {
+///         assert_eq!(kind, None, "not a kind install_branch can write");
+///         assert_eq!(width, 2, "installing a 4-byte branch here eats the next instruction");
+///     }
+///     other => panic!("expected a direct branch, got {other:?}"),
+/// }
+///
+/// // `bl +0` — 4 bytes, and installable.
+/// let image = [0xFF, 0xF7, 0xFE, 0xFF];
+/// assert!(matches!(
+///     classify_branch(&image, 0),
+///     BranchAt::Direct { kind: Some(BranchKind::Bl), width: 4, .. }
+/// ));
+/// ```
+pub fn classify_branch(image: &[u8], at: usize) -> BranchAt {
+    let insn = match isa::decode_at_with(image, at, at as u32, false) {
+        Some(i) => i,
+        None => return BranchAt::NotABranch,
+    };
+    if !insn.is_branch() {
+        return BranchAt::NotABranch;
+    }
+    let width = insn.len() as u8;
+    // A `Target` alongside a `Mem` is the address of a literal-pool word, not
+    // a destination — the same overload `analysis::reachable` documents, and
+    // the shape of `ldr pc, [pc, #imm]`, which is emphatically indirect.
+    let has_mem = insn
+        .operands
+        .as_slice()
+        .any(|o| matches!(o, isa::Operand::Mem(_)));
+    match insn.branch_target() {
+        Some(target) if !has_mem => {
+            let kind = match (insn.mnemonic, insn.len()) {
+                ("bl", 4) => Some(BranchKind::Bl),
+                ("b", 4) => Some(BranchKind::BWide),
+                _ => None,
+            };
+            BranchAt::Direct {
+                kind,
+                width,
+                target: target & !1,
+            }
+        }
+        _ => BranchAt::Indirect { width },
+    }
+}
 
 /// Confirm that the four bytes at `site` are a `kind` branch to `expected`.
 ///
@@ -1456,6 +1684,123 @@ fn find_free_run(image: &[u8], len: usize, align: usize, start: usize) -> Option
             Some(k) => p = round_up(p + k + 1, align),
         }
     }
+}
+
+/// Halfword-aligned masked search. See [`Needle::Masked`].
+fn find_masked(image: &[u8], pat: &[(u16, u16)], start: usize) -> Option<usize> {
+    // An empty pattern is satisfied by every position; reporting `start` would
+    // be technically true and useless. See the variant's documentation.
+    if pat.is_empty() {
+        return None;
+    }
+    // `* 2`, not `checked_mul`: `pat` is a real slice of 4-byte elements, so
+    // its length is at most `usize::MAX / 4` and the product cannot overflow.
+    // A `checked_mul` here would add an arm no input can reach.
+    let need = pat.len() * 2;
+    let mut p = round_up(start.min(image.len()), 2);
+    while p.checked_add(need).map_or(false, |end| end <= image.len()) {
+        let hit = pat.iter().enumerate().all(|(i, &(value, mask))| {
+            let at = p + i * 2;
+            u16::from_le_bytes([image[at], image[at + 1]]) & mask == value & mask
+        });
+        if hit {
+            return Some(p);
+        }
+        p += 2;
+    }
+    None
+}
+
+/// Which free run to choose when more than one will do. See
+/// [`find_free_space_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Fit {
+    /// The lowest usable offset. Cheapest, and what [`find_free_space`] does.
+    First,
+    /// The usable offset inside the longest free run. Prefer this when placing
+    /// several stubs: first-fit takes the first hole big enough and leaves the
+    /// large one fragmented, whereas this keeps the big hole for the things
+    /// that need it.
+    Largest,
+}
+
+/// Free space, restricted to regions the caller says are writable.
+///
+/// [`find_free_space`] scans the whole image, which assumes every erased byte
+/// is fair game. In a real firmware image it is not: a region may be covered
+/// by an integrity check, reserved by the vendor, or outside the erase block
+/// the caller intends to rewrite. Only the caller knows which, and there is no
+/// safe way to express it from outside — **slicing the image and searching
+/// that is wrong**, because slicing at an unaligned offset moves the alignment
+/// origin, so a result that looks 4-aligned within the slice is not 4-aligned
+/// within the image. That is the same failure the `align` parameter exists to
+/// prevent, reintroduced one layer up.
+///
+/// `within` is in *image* coordinates. Ranges are clipped to the image, may be
+/// given in any order, and need not be disjoint; an empty slice finds nothing.
+///
+/// # Panics
+///
+/// Panics if `align` is 0, as [`find_free_space`] does.
+///
+/// ```
+/// use thumb_asm::{find_free_space_in, Fit};
+///
+/// //          0..4 live        4..12 free       12..16 live    16..32 free
+/// let mut image = vec![0x00; 4];
+/// image.extend(std::iter::repeat(0xFF).take(8));
+/// image.extend(std::iter::repeat(0x00).take(4));
+/// image.extend(std::iter::repeat(0xFF).take(16));
+///
+/// // First fit takes the 8-byte hole; largest fit keeps to the 16-byte one.
+/// assert_eq!(find_free_space_in(&image, 4, 4, &[0..image.len()], Fit::First), Some(4));
+/// assert_eq!(find_free_space_in(&image, 4, 4, &[0..image.len()], Fit::Largest), Some(16));
+///
+/// // Restricted to the first region, the big hole is not a candidate at all.
+/// assert_eq!(find_free_space_in(&image, 4, 4, &[0..12], Fit::Largest), Some(4));
+/// ```
+pub fn find_free_space_in(
+    image: &[u8],
+    len: usize,
+    align: usize,
+    within: &[core::ops::Range<usize>],
+    fit: Fit,
+) -> Option<usize> {
+    assert!(align != 0, "alignment must be at least 1 byte");
+    let mut best: Option<(usize, usize)> = None; // (usable bytes, offset)
+    for region in within {
+        let lo = region.start.min(image.len());
+        let hi = region.end.min(image.len());
+        let mut p = lo;
+        while p < hi {
+            // Skip live bytes, then measure the free run that follows.
+            if image[p] != 0xFF {
+                p += 1;
+                continue;
+            }
+            let run_start = p;
+            while p < hi && image[p] == 0xFF {
+                p += 1;
+            }
+            // Alignment is applied inside the run, not to the run's start, so
+            // a run whose start is unaligned still counts the bytes it can
+            // actually offer.
+            let at = round_up(run_start, align);
+            if at.checked_add(len).map_or(false, |end| end <= p) {
+                match fit {
+                    Fit::First => return Some(at),
+                    Fit::Largest => {
+                        let usable = p - at;
+                        if best.map_or(true, |(b, _)| usable > b) {
+                            best = Some((usable, at));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, at)| at)
 }
 
 /// `v` rounded up to the next multiple of `align`, saturating.

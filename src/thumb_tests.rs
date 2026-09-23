@@ -1441,3 +1441,297 @@ fn a_bound_label_resolves_to_the_offset_it_was_bound_at() {
         "bx lr"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.11.0: the consumer-requested search and classification surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn masked_search_matches_dont_care_bits_and_only_on_halfword_boundaries() {
+    // `bl` is `1111 0Sii iiii iiii` + `11J1 Jiii iiii iiii`: the top five bits
+    // of each halfword identify it and the rest is displacement, which is why
+    // a byte search cannot find "any bl".
+    let any_bl = [(0xF000u16, 0xF800u16), (0xD000u16, 0xD000u16)];
+
+    // movs r0,#1 | bl +0 | movs r1,#2
+    let image = [0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF, 0x02, 0x21];
+    assert_eq!(find(&image, Needle::Masked(&any_bl), 0), Some(2));
+    // Searching past it finds nothing more.
+    assert_eq!(find(&image, Needle::Masked(&any_bl), 4), None);
+
+    // A pattern with no don't-care bits behaves like an exact halfword search.
+    let exact = [(0x2001u16, 0xFFFFu16)];
+    assert_eq!(find(&image, Needle::Masked(&exact), 0), Some(0));
+    assert_eq!(find(&image, Needle::Masked(&[(0x2002, 0xFFFF)]), 0), None);
+
+    // Odd offsets are never reported, even when the bytes there do match.
+    // The halfwords at even offsets are 0x2001, 0xF7FF, 0xFFFE, 0x2102; read
+    // from offset 3 the bytes spell 0xFEF7, which is not an instruction — it
+    // is the tail of the `bl` glued to the head of its second halfword. A
+    // byte-granular scan would report it and a caller would patch nonsense.
+    let straddle = [(0xFEF7u16, 0xFFFFu16)];
+    assert_eq!(
+        image[3] as u16 | ((image[4] as u16) << 8),
+        0xFEF7,
+        "the straddling value really is present at offset 3"
+    );
+    assert_eq!(find(&image, Needle::Masked(&straddle), 0), None);
+
+    // An odd `start` is rounded up rather than scanning from it.
+    assert_eq!(find(&image, Needle::Masked(&any_bl), 1), Some(2));
+    assert_eq!(find(&image, Needle::Masked(&any_bl), 3), None);
+}
+
+#[test]
+fn an_empty_masked_pattern_matches_nothing_rather_than_everything() {
+    let image = [0x01, 0x20, 0x70, 0x47];
+    assert_eq!(find(&image, Needle::Masked(&[]), 0), None);
+    // And a pattern longer than the image is not a match either.
+    let long = [(0u16, 0u16); 8];
+    assert_eq!(find(&image, Needle::Masked(&long), 0), None);
+}
+
+#[test]
+fn find_one_refuses_to_choose_between_ambiguous_matches() {
+    // Two identical instructions: a signature that cannot tell them apart has
+    // not identified anything, and picking the first is how the wrong site
+    // gets patched.
+    let image = [0x01, 0x20, 0x70, 0x47, 0x01, 0x20, 0x70, 0x47];
+    assert_eq!(
+        find_one(&image, Needle::Bytes(&[0x01, 0x20])),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+    // Unique: answered.
+    assert_eq!(
+        find_one(&image, Needle::Bytes(&[0x20, 0x70, 0x47, 0x01])),
+        Ok(1)
+    );
+    // Absent: said so, distinctly from ambiguous.
+    assert_eq!(
+        find_one(&image, Needle::Bytes(&[0xDE, 0xAD])),
+        Err(FindError::NotFound)
+    );
+
+    // Counting is non-overlapping: `AA AA AA` holds two `AA AA`, not three.
+    let overlap = [0xAAu8, 0xAA, 0xAA, 0xAA];
+    assert_eq!(
+        find_one(&overlap, Needle::Bytes(&[0xAA, 0xAA])),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+
+    // Every needle kind reaches the same machinery.
+    assert_eq!(
+        find_one(&image, Needle::Word(0x4770_2001)),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+    assert_eq!(
+        find_one(&image, Needle::Masked(&[(0x2001, 0xFFFF)])),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+    let free = [0xFFu8; 8];
+    assert_eq!(
+        find_one(&free, Needle::FreeRun { len: 4, align: 4 }),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+}
+
+#[test]
+fn find_error_says_which_failure_it_was() {
+    assert_eq!(FindError::NotFound.to_string(), "no match");
+    assert_eq!(
+        FindError::Ambiguous {
+            count: 3,
+            first: 0x120
+        }
+        .to_string(),
+        "3 matches, first at 0x120"
+    );
+    // It is a std::error::Error, so `?` works in a consumer's error type.
+    fn as_err(e: FindError) -> Box<dyn std::error::Error> {
+        Box::new(e)
+    }
+    assert!(as_err(FindError::NotFound).to_string().contains("no match"));
+}
+
+/// One region, as a slice. Written this way rather than `&[a..b]` because a
+/// one-element array of `Range` is ambiguous enough that clippy rejects the
+/// literal: it cannot tell it from `vec![a; b]`.
+fn region(r: core::ops::Range<usize>) -> [core::ops::Range<usize>; 1] {
+    [r]
+}
+
+/// 4 live | 8 free | 4 live | 16 free
+fn two_holes() -> Vec<u8> {
+    let mut v = vec![0x00; 4];
+    v.extend(std::iter::repeat(0xFF).take(8));
+    v.extend(std::iter::repeat(0x00).take(4));
+    v.extend(std::iter::repeat(0xFF).take(16));
+    v
+}
+
+#[test]
+fn free_space_search_honours_the_regions_it_was_given() {
+    let image = two_holes();
+    let all = region(0..image.len());
+
+    // First fit takes the near hole; largest fit keeps to the far one.
+    assert_eq!(find_free_space_in(&image, 4, 4, &all, Fit::First), Some(4));
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &all, Fit::Largest),
+        Some(16)
+    );
+
+    // A region that excludes the big hole cannot return it under either policy.
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &region(0..12), Fit::Largest),
+        Some(4)
+    );
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &region(0..12), Fit::First),
+        Some(4)
+    );
+
+    // A region that excludes both holes finds nothing.
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &region(0..4), Fit::First),
+        None
+    );
+    // No regions at all is not "the whole image".
+    assert_eq!(find_free_space_in(&image, 4, 4, &[], Fit::First), None);
+    assert_eq!(find_free_space_in(&image, 4, 4, &[], Fit::Largest), None);
+
+    // Ranges may be given out of order and are considered on their merits.
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &[16..32, 0..12], Fit::Largest),
+        Some(16)
+    );
+
+    // Ranges past the end are clipped rather than panicking.
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &region(0..usize::MAX), Fit::First),
+        Some(4)
+    );
+    assert_eq!(
+        find_free_space_in(&image, 4, 4, &region(100..200), Fit::First),
+        None
+    );
+
+    // Nothing fits: the biggest hole is 16 bytes.
+    assert_eq!(find_free_space_in(&image, 32, 4, &all, Fit::Largest), None);
+    assert_eq!(find_free_space_in(&image, 32, 4, &all, Fit::First), None);
+}
+
+#[test]
+fn free_space_alignment_is_applied_inside_the_run_not_to_its_start() {
+    // A free run starting at an unaligned offset still offers aligned space,
+    // and the amount it offers is measured from the aligned point — rounding
+    // the start up without re-measuring is the bug `align` exists to avoid.
+    let mut image = vec![0x00; 3];
+    image.extend(std::iter::repeat(0xFF).take(9)); // free 3..12
+    let all = region(0..image.len());
+    // The run is 3..12; the first 4-aligned offset in it is 4, leaving 8 bytes.
+    assert_eq!(find_free_space_in(&image, 8, 4, &all, Fit::First), Some(4));
+    // Nine bytes will not fit even though the run is nine long, because the
+    // usable part starts at 4.
+    assert_eq!(find_free_space_in(&image, 9, 4, &all, Fit::First), None);
+    // align 1 uses the whole run.
+    assert_eq!(find_free_space_in(&image, 9, 1, &all, Fit::First), Some(3));
+}
+
+#[test]
+#[should_panic(expected = "alignment must be at least 1 byte")]
+fn free_space_in_rejects_a_zero_alignment() {
+    let image = two_holes();
+    let _ = find_free_space_in(&image, 4, 0, &region(0..image.len()), Fit::First);
+}
+
+#[test]
+fn classify_branch_reports_the_width_that_decides_whether_a_patch_fits() {
+    // `b.n` — 2 bytes, and not a kind `install_branch` can write. Overwriting
+    // it with a 4-byte branch consumes the next instruction, which is exactly
+    // what a caller needs to know before doing it.
+    let narrow = [0xFE, 0xE7];
+    assert_eq!(
+        classify_branch(&narrow, 0),
+        BranchAt::Direct {
+            kind: None,
+            width: 2,
+            target: 0
+        }
+    );
+
+    // `bl` — 4 bytes and installable.
+    let bl = [0xFF, 0xF7, 0xFE, 0xFF];
+    assert!(matches!(
+        classify_branch(&bl, 0),
+        BranchAt::Direct {
+            kind: Some(BranchKind::Bl),
+            width: 4,
+            ..
+        }
+    ));
+
+    // `b.w` — 4 bytes, the jump form.
+    let bw = encode_b_wide(0, 0x100).expect("b.w +0x100");
+    assert!(matches!(
+        classify_branch(&bw, 0),
+        BranchAt::Direct {
+            kind: Some(BranchKind::BWide),
+            width: 4,
+            target: 0x100
+        }
+    ));
+
+    // `bx lr` — indirect, 2 bytes: no target to compare against.
+    assert_eq!(
+        classify_branch(&[0x70, 0x47], 0),
+        BranchAt::Indirect { width: 2 }
+    );
+
+    // Not a branch, and not decodable at all.
+    assert_eq!(classify_branch(&[0x01, 0x20], 0), BranchAt::NotABranch);
+    assert_eq!(classify_branch(&[0x00], 0), BranchAt::NotABranch);
+    assert_eq!(classify_branch(&[], 0), BranchAt::NotABranch);
+
+    // `cbz r0, +6` is direct but not installable.
+    assert!(matches!(
+        classify_branch(&[0x08, 0xB1], 0),
+        BranchAt::Direct {
+            kind: None,
+            width: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn classify_branch_does_not_mistake_a_literal_pool_address_for_a_destination() {
+    // `ldr.w pc, [pc, #0]` — a veneer. Its `Target` operand is the address of
+    // the pool word, not where control goes, so this is Indirect.
+    let v = crate::analysis::veneer(0, 0x1234).expect("veneer at 0");
+    assert_eq!(classify_branch(&v, 0), BranchAt::Indirect { width: 4 });
+}
+
+#[test]
+fn classify_branch_agrees_with_verify_branch_wherever_both_have_an_opinion() {
+    // The two answer different questions; where they overlap they must not
+    // disagree, or one of them is lying to a caller about the same bytes.
+    for target in [0x100u32, 0x1000, 0x10_0000] {
+        for kind in [BranchKind::Bl, BranchKind::BWide] {
+            let bytes = kind.encode(0, target).expect("encodable");
+            assert!(verify_branch(&bytes, 0, kind, target).is_ok());
+            match classify_branch(&bytes, 0) {
+                BranchAt::Direct {
+                    kind: k,
+                    width,
+                    target: t,
+                } => {
+                    assert_eq!(k, Some(kind));
+                    assert_eq!(width, 4);
+                    assert_eq!(t, target);
+                }
+                other => panic!("{kind:?} to {target:#x} classified as {other:?}"),
+            }
+        }
+    }
+}

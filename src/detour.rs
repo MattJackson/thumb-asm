@@ -169,6 +169,7 @@ impl Detour {
 /// stub that saved and restored `r0`–`r3` would also make it impossible for a
 /// hook to *change* them, which is most of the point of hooking a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Convention {
     /// **Call the hook, then continue.** The ordinary detour, and the default.
     ///
@@ -209,12 +210,42 @@ pub enum Convention {
     HookDecides,
 }
 
+/// What the stub does with the instructions the patch displaced.
+///
+/// The two are genuinely different operations, not two spellings of one, which
+/// is why the discarding variant says so in its name: an enum arm called
+/// `JumpTo` reads like a destination choice and hides that the site's original
+/// instructions stop running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DetourStyle {
+    /// Relocate the displaced instructions into the stub and continue at
+    /// `site + displaced`, so the patched function behaves as it did plus the
+    /// hook. The default, and the only safe choice when you do not know what
+    /// the displaced instructions were for.
+    ResumeAfter,
+    /// **Discard the displaced instructions** and branch to `to` instead.
+    ///
+    /// The instructions the patch overwrote are not relocated and never run.
+    /// That is the point — this is the shape for replacing an OEM routine's
+    /// entry with your own decision and tail-calling somewhere chosen
+    /// (`ramp_exit`, `deny`, an alternate implementation) — but it means the
+    /// original behaviour at the site is gone, and the crate cannot check that
+    /// you meant it. Nothing else in this crate discards instructions.
+    ///
+    /// `to` is an absolute address with the Thumb bit ignored, as everywhere
+    /// else here, and must be within `b.w` range of the stub.
+    DiscardAndJumpTo(u32),
+}
+
 /// How to install a detour.
 ///
-/// Public fields, and [`Default`], so a caller can write
-/// `DetourOptions { kind: BranchKind::BWide, ..Default::default() }`; the
-/// `with_*` methods are there for the cases where a chain reads better.
+/// `#[non_exhaustive]`, so construct it through [`DetourOptions::new`] and the
+/// `with_*` chain rather than a struct literal. That is what makes a new
+/// option — like [`DetourOptions::with_style`], added in 0.11.0 — an addition
+/// rather than a breaking change for everyone who wrote a literal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DetourOptions {
     /// Which four-byte branch to install at the site. [`BranchKind::Bl`] by
     /// default, because a hook that wants to be called is the common case;
@@ -224,6 +255,8 @@ pub struct DetourOptions {
     /// Where the displaced code runs. [`Convention::CallThenContinue`] by
     /// default.
     pub convention: Convention,
+    /// What happens to the displaced instructions. See [`DetourStyle`].
+    pub style: DetourStyle,
     /// Byte offset to start the free-space search from. `0` by default.
     pub search_start: usize,
     /// Place the stub at this address instead of searching. Must be 4-byte
@@ -247,6 +280,7 @@ impl Default for DetourOptions {
         DetourOptions {
             kind: BranchKind::Bl,
             convention: Convention::CallThenContinue,
+            style: DetourStyle::ResumeAfter,
             search_start: 0,
             stub_at: None,
             scan_from: None,
@@ -269,6 +303,15 @@ impl DetourOptions {
     /// Set [`convention`](Self::convention).
     pub fn with_convention(mut self, convention: Convention) -> Self {
         self.convention = convention;
+        self
+    }
+
+    /// Choose what becomes of the displaced instructions.
+    ///
+    /// [`DetourStyle::DiscardAndJumpTo`] throws them away; read its
+    /// documentation before using it.
+    pub fn with_style(mut self, style: DetourStyle) -> Self {
+        self.style = style;
         self
     }
 
@@ -886,22 +929,38 @@ fn build_stub(
         out[CONTINUATION_WORD..CONTINUATION_WORD + 4].copy_from_slice(&word);
     }
 
+    // Where the stub goes when the hook is done, and whether the displaced
+    // instructions travel with it.
+    let destination = match opts.style {
+        DetourStyle::ResumeAfter => resume,
+        DetourStyle::DiscardAndJumpTo(to) => to & !1,
+    };
+
     // One forward pass. Widening instruction *n* moves only the instructions
     // after it, and those have not been placed yet — so no second pass and no
     // fixed point.
+    //
+    // Skipped entirely under `DiscardAndJumpTo`: the displaced instructions
+    // are deliberately not carried into the stub, which is the whole of the
+    // difference between the two styles.
     let mut at = body;
-    for insn in insns {
-        let bytes =
-            relocate_bytes(insn, at, Widen::IfNeeded).map_err(|source| DetourError::Relocate {
-                at: insn.addr,
-                source,
+    if opts.style == DetourStyle::ResumeAfter {
+        for insn in insns {
+            let bytes = relocate_bytes(insn, at, Widen::IfNeeded).map_err(|source| {
+                DetourError::Relocate {
+                    at: insn.addr,
+                    source,
+                }
             })?;
-        at = at.wrapping_add(bytes.len() as u32);
-        out.extend_from_slice(&bytes);
+            at = at.wrapping_add(bytes.len() as u32);
+            out.extend_from_slice(&bytes);
+        }
     }
 
-    let tail = encode_b_wide(at as usize, resume)
-        .ok_or(DetourError::ResumeUnreachable { from: at, resume })?;
+    let tail = encode_b_wide(at as usize, destination).ok_or(DetourError::ResumeUnreachable {
+        from: at,
+        resume: destination,
+    })?;
     out.extend_from_slice(&tail);
     Ok(out)
 }
@@ -1936,5 +1995,115 @@ mod tests {
             prologue_len(&opts(Convention::HookDecides, BranchKind::BWide)),
             12
         );
+    }
+
+    // ------------------------------------------------- DetourStyle (0.11.0)
+
+    /// `DiscardAndJumpTo` leaves the displaced instructions out of the stub.
+    ///
+    /// This is the one operation in the crate that throws instructions away,
+    /// which is why the variant says so in its name. The test pins both halves
+    /// of the difference: the displaced instructions are *not* in the stub,
+    /// and the tail goes where the caller said rather than back to the site.
+    #[test]
+    fn discard_and_jump_to_omits_the_displaced_instructions() {
+        // movs r0, #1 · movs r1, #2 — four bytes, both would normally be
+        // relocated into the stub.
+        let code = [0x01, 0x20, 0x02, 0x21];
+
+        let mut resumed = image_with(&code);
+        let r = detour(&mut resumed, SITE, HOOK, DetourOptions::new()).unwrap();
+        let resumed_text = text(&resumed, &r);
+
+        let elsewhere = (SITE + 0x40) as u32;
+        let mut jumped = image_with(&code);
+        let j = detour(
+            &mut jumped,
+            SITE,
+            HOOK,
+            DetourOptions::new().with_style(DetourStyle::DiscardAndJumpTo(elsewhere)),
+        )
+        .unwrap();
+        let jumped_text = text(&jumped, &j);
+
+        // The resuming stub carries the two displaced instructions; the
+        // discarding one does not carry either.
+        assert!(
+            resumed_text.iter().any(|t| t == "movs r0, #1"),
+            "resume stub should relocate the displaced instructions: {resumed_text:?}"
+        );
+        assert!(
+            !jumped_text.iter().any(|t| t.starts_with("movs")),
+            "discarding stub must not carry them: {jumped_text:?}"
+        );
+        assert!(
+            j.stub_len < r.stub_len,
+            "discarding four bytes of displaced code should make the stub shorter: \
+             {} vs {}",
+            j.stub_len,
+            r.stub_len
+        );
+
+        // The site itself is patched identically either way — the style is
+        // about the stub, not the site.
+        assert_eq!(resumed[SITE..SITE + 4], jumped[SITE..SITE + 4]);
+
+        // And the tail goes where it was told, not back to the site.
+        let tail = walk(&jumped, &j).pop().expect("a tail branch");
+        assert_eq!(tail.branch_target(), Some(elsewhere));
+        assert_ne!(tail.branch_target(), Some(r.resume()));
+    }
+
+    /// The Thumb bit on the destination is ignored, as everywhere else here.
+    #[test]
+    fn discard_and_jump_to_ignores_the_thumb_bit_on_its_destination() {
+        let code = [0x01, 0x20, 0x02, 0x21];
+        let to = (SITE + 0x40) as u32;
+        let mut a = image_with(&code);
+        let mut b = image_with(&code);
+        let da = detour(
+            &mut a,
+            SITE,
+            HOOK,
+            DetourOptions::new().with_style(DetourStyle::DiscardAndJumpTo(to)),
+        )
+        .unwrap();
+        let db = detour(
+            &mut b,
+            SITE,
+            HOOK,
+            DetourOptions::new().with_style(DetourStyle::DiscardAndJumpTo(to | 1)),
+        )
+        .unwrap();
+        assert_eq!(a, b, "the Thumb bit must not change a byte");
+        assert_eq!(da.stub, db.stub);
+    }
+
+    /// An unreachable destination is refused rather than silently truncated.
+    #[test]
+    fn discard_and_jump_to_refuses_a_destination_out_of_branch_range() {
+        let mut image = image_with(&[0x01, 0x20, 0x02, 0x21]);
+        let err = detour(
+            &mut image,
+            SITE,
+            HOOK,
+            // Well past the ±16 MB a `b.w` can reach.
+            DetourOptions::new().with_style(DetourStyle::DiscardAndJumpTo(0x7F00_0000)),
+        )
+        .expect_err("out of range must not encode");
+        assert_eq!(err.reason(), "resume-unreachable");
+        // Nothing was written: planning fails before the site is touched.
+        assert_eq!(image, image_with(&[0x01, 0x20, 0x02, 0x21]));
+    }
+
+    #[test]
+    fn with_style_defaults_to_resuming() {
+        assert_eq!(DetourOptions::new().style, DetourStyle::ResumeAfter);
+        assert_eq!(DetourOptions::default().style, DetourStyle::ResumeAfter);
+        let o = DetourOptions::new().with_style(DetourStyle::DiscardAndJumpTo(0x200));
+        assert_eq!(o.style, DetourStyle::DiscardAndJumpTo(0x200));
+        // The other options are untouched by setting the style.
+        assert_eq!(o.kind, DetourOptions::new().kind);
+        assert_eq!(o.convention, DetourOptions::new().convention);
     }
 }
