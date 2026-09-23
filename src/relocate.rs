@@ -301,6 +301,26 @@ pub enum RelocateError {
         /// The address it was asked to move to.
         to: u32,
     },
+    /// A rewrite was asked for that clobbers condition flags still in use.
+    ///
+    /// Returned by [`widen_compare_branch`], which turns a `CBZ`/`CBNZ` into
+    /// `CMP` + `B<cond>.W`. `CBZ` writes no flags and `CMP` writes all four,
+    /// so the rewrite is only sound where every flag is dead.
+    ///
+    /// Worth reading `live` rather than only its emptiness: it is common for
+    /// this to name **only V**, because every `S`-suffixed logical and shift
+    /// operation writes N, Z and C and leaves V alone, so a nearby `ANDS` kills
+    /// three of the four and looks as though it killed all of them.
+    FlagsLive {
+        /// The instruction's mnemonic, `"cbz"` or `"cbnz"`.
+        mnemonic: &'static str,
+        /// The address it was decoded at.
+        from: u32,
+        /// The address it was asked to move to.
+        to: u32,
+        /// Which flags are still live there.
+        live: crate::flags::Flags,
+    },
 }
 
 impl RelocateError {
@@ -324,6 +344,7 @@ impl RelocateError {
             RelocateError::OutOfRange { .. } => "out-of-range",
             RelocateError::NotEncodable { .. } => "not-encodable",
             RelocateError::SecureGateway { .. } => "secure-gateway",
+            RelocateError::FlagsLive { .. } => "flags-live",
         }
     }
 
@@ -341,6 +362,7 @@ impl RelocateError {
             // `SG` carries no mnemonic field because it can only ever be one
             // instruction: the encoding is a single fixed pattern.
             RelocateError::SecureGateway { .. } => "sg",
+            RelocateError::FlagsLive { mnemonic, .. } => mnemonic,
         }
     }
 
@@ -356,6 +378,7 @@ impl RelocateError {
             | RelocateError::OutOfRange { from, .. }
             | RelocateError::NotEncodable { from, .. } => from,
             RelocateError::SecureGateway { from, .. } => from,
+            RelocateError::FlagsLive { from, .. } => from,
         }
     }
 
@@ -371,6 +394,7 @@ impl RelocateError {
             | RelocateError::OutOfRange { to, .. }
             | RelocateError::NotEncodable { to, .. } => to,
             RelocateError::SecureGateway { to, .. } => to,
+            RelocateError::FlagsLive { to, .. } => to,
         }
     }
 
@@ -411,6 +435,10 @@ impl core::fmt::Display for RelocateError {
             RelocateError::SecureGateway { .. } => {
                 f.write_str(" (a secure gateway is identified by the address it sits at)")
             }
+            RelocateError::FlagsLive { live, .. } => write!(
+                f,
+                " (the rewrite writes flags that are still live: {live:?})"
+            ),
             RelocateError::ForwardOnlyBranch { target, .. } => write!(
                 f,
                 " (target {target:#x} is not 0..126 bytes forward; cbz/cbnz has no backward form)"
@@ -1940,5 +1968,276 @@ mod secure_gateway_tests {
             assert_eq!(moved.addr, 0x9000);
             assert_eq!(moved.mnemonic, insn.mnemonic);
         }
+    }
+}
+
+/// Relocate a `CBZ`/`CBNZ` by rewriting it as `CMP` + `B<cond>.W`, when the
+/// condition flags are provably dead.
+///
+/// [`relocate`] refuses these outright
+/// ([`ForwardOnlyBranch`](RelocateError::ForwardOnlyBranch)) because the
+/// offset is `ZeroExtend(i:imm5:'0')` — unsigned, 0 to 126 bytes forward, with
+/// no backward form — so a stub in free space essentially never reaches. The
+/// only way to move one is to stop using the encoding:
+///
+/// ```text
+/// cbz rn, target   ->   cmp rn, #0
+///                       beq.w target
+/// ```
+///
+/// # Why this needs a proof and not a flag
+///
+/// `CBZ` writes **no** condition flags; `CMP` writes all four. So the rewrite
+/// is a behaviour change unless every flag is already dead at the site, and
+/// getting that wrong is the silent kind of wrong — the patched code runs, and
+/// a later branch takes the other arm.
+///
+/// `flags` is what [`crate::flags::live_after`] said about the *original*
+/// site, which is the only place the question can be answered: after the move
+/// the instruction has no successors yet. This function refuses unless that
+/// set is empty. It deliberately does not compute liveness itself, because it
+/// receives an `Insn` and liveness is a property of the image around it.
+///
+/// Note that no `S`-suffixed logical or shift operation makes the flags dead:
+/// `ANDS`, `LSLS` and their siblings leave V untouched, and `CMP` writes V.
+///
+/// # Example
+///
+/// ```
+/// use thumb_asm::flags::{live_after, Flags};
+/// use thumb_asm::isa::{self, Target};
+/// use thumb_asm::relocate::widen_compare_branch;
+///
+/// // 0: cbz r0, +8      (branches to 8)
+/// // 2: adds r1, r2, r3  (fall-through: writes all four)
+/// // 4: bx lr
+/// // 6: nop
+/// // 8: adds r4, r5, r6  (taken path: writes all four)
+/// // 10: bx lr
+/// let image = [
+///     0x10, 0xb1, 0xd1, 0x18, 0x70, 0x47, 0x00, 0xbf, 0xac, 0x19, 0x70, 0x47,
+/// ];
+/// let cbz = isa::decode_at_with(&image, 0, 0, Target::Union).unwrap();
+/// // Both paths overwrite every flag before anything reads one.
+/// let live = live_after(&image, 0, Target::Union, 8);
+/// assert_eq!(live, Flags::NONE);
+///
+/// let bytes = widen_compare_branch(&cbz, 0x9000, live).unwrap();
+/// assert_eq!(bytes.len(), 6); // cmp (2) + beq.w (4)
+/// ```
+pub fn widen_compare_branch(
+    insn: &Insn,
+    to: u32,
+    flags: crate::flags::Flags,
+) -> Result<Vec<u8>, RelocateError> {
+    let mnemonic = insn.mnemonic;
+    let from = insn.addr;
+    if !matches!(mnemonic, "cbz" | "cbnz") {
+        return Err(RelocateError::NotEncodable {
+            mnemonic,
+            encoding: insn.encoding,
+            from,
+            to,
+        });
+    }
+    if to & 1 != 0 {
+        return Err(RelocateError::Misaligned { mnemonic, from, to });
+    }
+    let target = first_target(insn).ok_or(RelocateError::NotEncodable {
+        mnemonic,
+        encoding: insn.encoding,
+        from,
+        to,
+    })?;
+    // The proof, and the whole reason this is a separate entry point.
+    if !flags.is_empty() {
+        return Err(RelocateError::FlagsLive {
+            mnemonic,
+            from,
+            to,
+            live: flags,
+        });
+    }
+    let rn = match insn.operands.get(0) {
+        Some(Operand::Reg(r)) => r,
+        _ => {
+            return Err(RelocateError::NotEncodable {
+                mnemonic,
+                encoding: insn.encoding,
+                from,
+                to,
+            })
+        }
+    };
+    // `CMP (immediate)` T1 — `0010 1 Rn imm8` — needs a low register.
+    if rn.num() > 7 {
+        return Err(RelocateError::NotEncodable {
+            mnemonic,
+            encoding: insn.encoding,
+            from,
+            to,
+        });
+    }
+    let cmp = 0x2800u16 | (u16::from(rn.num()) << 8);
+    // `CBZ` branches when the register *is* zero, so the test is `EQ`;
+    // `CBNZ` is `NE`.
+    let cond = if mnemonic == "cbz" {
+        Cond::Eq
+    } else {
+        Cond::Ne
+    };
+    // The `B<cond>` sits two bytes after the `CMP`, and its range is measured
+    // from there — not from `to`.
+    let branch =
+        crate::encode_b_cond((to as usize) + 2, cond, target).ok_or(RelocateError::OutOfRange {
+            mnemonic,
+            from,
+            to,
+            target: Some(target),
+        })?;
+    let mut out = Vec::with_capacity(2 + branch.len());
+    out.extend_from_slice(&cmp.to_le_bytes());
+    out.extend_from_slice(&branch);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod compare_branch_tests {
+    use super::*;
+    use crate::flags::{live_after, Flags};
+    use crate::isa::{decode_at_with, Target};
+
+    /// `cbz r0, 8` at 0; both the fall-through and the taken path overwrite
+    /// every flag before reading one, so all four are dead.
+    const BOTH_PATHS_CLOBBER: [u8; 12] = [
+        0x10, 0xb1, // 0: cbz r0, 8
+        0xd1, 0x18, // 2: adds r1, r2, r3
+        0x70, 0x47, // 4: bx lr
+        0x00, 0xbf, // 6: nop
+        0xac, 0x19, // 8: adds r4, r5, r6
+        0x70, 0x47, // 10: bx lr
+    ];
+
+    #[test]
+    fn a_compare_branch_rewrites_when_every_flag_is_dead() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        let live = live_after(&BOTH_PATHS_CLOBBER, 0, Target::Union, 8);
+        assert_eq!(live, Flags::NONE, "the fixture's whole point");
+
+        let bytes = widen_compare_branch(&cbz, 0x9000, live).expect("should rewrite");
+        // `cmp r0, #0` then `beq.w`.
+        assert_eq!(bytes.len(), 6);
+        assert_eq!(&bytes[..2], &0x2800u16.to_le_bytes());
+
+        let cmp = decode_at_with(&bytes, 0, 0x9000, Target::Union).expect("cmp decodes");
+        assert_eq!(cmp.mnemonic, "cmp");
+        let b = decode_at_with(&bytes, 2, 0x9002, Target::Union).expect("branch decodes");
+        assert_eq!(b.mnemonic, "b");
+        assert_eq!(b.cond, Some(Cond::Eq), "cbz branches when zero, so EQ");
+        assert_eq!(
+            b.branch_target(),
+            cbz.branch_target(),
+            "the rewrite must land on the same target the cbz had"
+        );
+    }
+
+    /// `CBNZ` becomes `NE`, which is the half of this that is easy to invert.
+    #[test]
+    fn a_compare_branch_nonzero_becomes_a_not_equal_test() {
+        // cbnz r0, 8 — same as above with bit 11 set.
+        let mut image = BOTH_PATHS_CLOBBER;
+        image[1] = 0xb9;
+        let cbnz = decode_at_with(&image, 0, 0, Target::Union).expect("cbnz");
+        assert_eq!(cbnz.mnemonic, "cbnz");
+        let live = live_after(&image, 0, Target::Union, 8);
+        let bytes = widen_compare_branch(&cbnz, 0x9000, live).expect("should rewrite");
+        let b = decode_at_with(&bytes, 2, 0x9002, Target::Union).expect("branch");
+        assert_eq!(b.cond, Some(Cond::Ne));
+    }
+
+    /// The refusal that makes this safe, and the case that makes it subtle.
+    ///
+    /// An `ANDS` on the fall-through kills N, Z and C but leaves V, so a
+    /// model that read `sets_flags` as "all four die" would allow the rewrite
+    /// and destroy a V the `bvs` is about to test.
+    #[test]
+    fn a_live_overflow_flag_alone_is_enough_to_refuse() {
+        // 0: cbz r0, 8 / 2: ands r1, r2 / 4: bvs .. / 6: nop
+        // 8: adds r4, r5, r6 / 10: bx lr
+        let image: [u8; 12] = [
+            0x10, 0xb1, 0x11, 0x40, 0xfd, 0xd6, 0x00, 0xbf, 0xac, 0x19, 0x70, 0x47,
+        ];
+        let cbz = decode_at_with(&image, 0, 0, Target::Union).expect("cbz");
+        let live = live_after(&image, 0, Target::Union, 8);
+        assert!(live.v, "the bvs reads V and the ands did not write it");
+
+        let err = widen_compare_branch(&cbz, 0x9000, live).expect_err("must refuse");
+        assert_eq!(err.reason(), "flags-live");
+        assert_eq!(err.mnemonic(), "cbz");
+        assert!(
+            err.to_string().contains("still live"),
+            "the message should say why: {err}"
+        );
+    }
+
+    /// Anything that is not a compare-branch is not this function's business.
+    #[test]
+    fn only_a_compare_branch_is_rewritten() {
+        let b = decode_at_with(&[0x00, 0xe0], 0, 0, Target::Union).expect("b");
+        let err = widen_compare_branch(&b, 0x9000, Flags::NONE).expect_err("not a cbz");
+        assert_eq!(err.reason(), "not-encodable");
+    }
+
+    /// A `CBZ` whose first operand is not a register has nothing to compare.
+    ///
+    /// Unreachable from the decoder, which always gives `CBZ` a register
+    /// first — this guards the hand-built `Insn` path, which is exactly the
+    /// path that produced the `faithful` encoding bug in 0.11.1.
+    #[test]
+    fn a_compare_branch_without_a_register_is_refused() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        let mut no_reg = cbz;
+        no_reg.operands = [Operand::Target(8)].iter().copied().collect();
+        let err = widen_compare_branch(&no_reg, 0x9000, Flags::NONE).expect_err("no register");
+        assert_eq!(err.reason(), "not-encodable");
+
+        // ...and the mirror image: a register but no target to branch to.
+        let mut no_target = cbz;
+        no_target.operands = [Operand::Reg(Reg(0))].iter().copied().collect();
+        let err = widen_compare_branch(&no_target, 0x9000, Flags::NONE).expect_err("no target");
+        assert_eq!(err.reason(), "not-encodable");
+    }
+
+    /// An odd destination has no instruction boundary to land on.
+    #[test]
+    fn an_odd_destination_is_refused_before_anything_else() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        let err = widen_compare_branch(&cbz, 0x9001, Flags::NONE).expect_err("odd");
+        assert_eq!(err.reason(), "misaligned-destination");
+    }
+
+    /// `CMP (immediate)` T1 has a three-bit register field, so a high base
+    /// register has no narrow form — and `CBZ` cannot name one anyway, which
+    /// is why this is a guard rather than a reachable refusal.
+    #[test]
+    fn the_rewrite_needs_a_low_register() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        let mut high = cbz;
+        high.operands = [Operand::Reg(Reg(9)), Operand::Target(8)]
+            .iter()
+            .copied()
+            .collect();
+        let err = widen_compare_branch(&high, 0x9000, Flags::NONE).expect_err("r9");
+        assert_eq!(err.reason(), "not-encodable");
+    }
+
+    /// A target the widened branch cannot reach is an out-of-range refusal,
+    /// not a silently wrong offset.
+    #[test]
+    fn a_target_out_of_reach_is_refused() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        // `B<cond>.W` T3 reaches +-1 MB; put the stub far past that.
+        let err = widen_compare_branch(&cbz, 0x40_0000, Flags::NONE).expect_err("too far");
+        assert_eq!(err.reason(), "out-of-range");
     }
 }

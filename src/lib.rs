@@ -37,6 +37,7 @@
 pub mod analysis;
 mod cond;
 pub mod detour;
+pub mod flags;
 pub mod isa;
 pub mod relocate;
 

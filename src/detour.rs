@@ -90,6 +90,15 @@
 
 use crate::isa::{Decoder, Insn};
 use crate::relocate::{relocate_bytes, RelocateError, Widen};
+
+/// How far `plan` walks when asking whether the condition flags are dead.
+///
+/// The walk stops early at the first branch or flag-clobbering instruction,
+/// so this only bounds the pathological case of a long straight line that
+/// touches no flags. Sixteen instructions is well past the point where a
+/// `CBZ`'s flags could plausibly still matter, and the answer when the budget
+/// runs out is "live", which refuses rather than rewrites.
+const FLAG_WALK_LIMIT: usize = 16;
 use crate::{encode_b_wide, encode_bl, BranchKind};
 
 /// `push {lr}` — `PUSH` T1 with `M == 1` and an empty register list
@@ -264,6 +273,25 @@ pub struct DetourOptions {
     /// erased regions the image's checksum table actually covers, say — this is
     /// the hook to use; the built-in search only knows about runs of `0xff`.
     pub stub_at: Option<u32>,
+    /// Rewrite a displaced `CBZ`/`CBNZ` as `CMP` + `B<cond>.W` when — and
+    /// only when — every condition flag is provably dead at its original
+    /// site.
+    ///
+    /// Off by default, because it is a behaviour change: `CBZ` writes no
+    /// flags and `CMP` writes all four, so the rewrite is sound only where
+    /// nothing observes them. With it off, a displaced `CBZ` that cannot
+    /// reach its target is refused, which is what this crate did before.
+    ///
+    /// Turning it on does not make the rewrite unconditional. Liveness is
+    /// computed from the image at the original site, across *both* the
+    /// fall-through and the taken path, and a site where any flag survives is
+    /// still refused — with [`RelocateError::FlagsLive`] naming which. Expect
+    /// that to be `V` alone surprisingly often: every `S`-suffixed logical and
+    /// shift operation writes N, Z and C and leaves V, so a nearby `ANDS`
+    /// kills three of the four and looks as though it killed all of them.
+    ///
+    /// [`RelocateError::FlagsLive`]: crate::relocate::RelocateError::FlagsLive
+    pub rewrite_compare_branches: bool,
     /// A known instruction boundary at or before the site, to decode from.
     ///
     /// Without it, the IT state entering the site is *assumed* inactive, and
@@ -283,6 +311,7 @@ impl Default for DetourOptions {
             style: DetourStyle::ResumeAfter,
             search_start: 0,
             stub_at: None,
+            rewrite_compare_branches: false,
             scan_from: None,
         }
     }
@@ -292,6 +321,12 @@ impl DetourOptions {
     /// The defaults: a `BL` at the site, call-then-continue, search from 0.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set [`rewrite_compare_branches`](Self::rewrite_compare_branches).
+    pub fn with_compare_branch_rewriting(mut self, yes: bool) -> Self {
+        self.rewrite_compare_branches = yes;
+        self
     }
 
     /// Set [`kind`](Self::kind).
@@ -776,11 +811,37 @@ fn plan(
     }
 
     let insns = displaced_at(image, site, opts.scan_from)?;
+    // Liveness is measured here, against the image, at each instruction's
+    // original address — the only place it can be. Once an instruction is
+    // moved into the stub it has no successors yet, so the question "are the
+    // flags dead after this" has no answer there.
+    //
+    // `addr` is the file offset in this crate's flat model, which is what
+    // makes indexing the image by it correct.
+    let live: Vec<crate::flags::Flags> = if opts.rewrite_compare_branches {
+        insns
+            .iter()
+            .map(|i| {
+                crate::flags::live_after(
+                    image,
+                    i.addr as usize,
+                    crate::isa::Target::Union,
+                    FLAG_WALK_LIMIT,
+                )
+            })
+            .collect()
+    } else {
+        // Not asked for, so not computed: the walk is not free and its answer
+        // would go unused. `ALL` is the conservative filler.
+        vec![crate::flags::Flags::ALL; insns.len()]
+    };
     let displaced: usize = insns.iter().map(|i| i.len()).sum();
     let resume = (site + displaced) as u32;
 
     if let Some(stub) = opts.stub_at {
-        return attempt(image, site, hook, stub, &insns, resume, displaced, opts);
+        return attempt(
+            image, site, hook, stub, &insns, &live, resume, displaced, opts,
+        );
     }
 
     // The search has to ask for a size before the stub is laid out, and the
@@ -832,6 +893,7 @@ fn plan(
             hook,
             found as u32,
             &insns,
+            &live,
             resume,
             displaced,
             opts,
@@ -858,6 +920,7 @@ fn attempt(
     hook: u32,
     stub: u32,
     insns: &[Insn],
+    live: &[crate::flags::Flags],
     resume: u32,
     displaced: usize,
     opts: &DetourOptions,
@@ -865,7 +928,7 @@ fn attempt(
     if stub % 4 != 0 {
         return Err(DetourError::StubMisaligned { stub });
     }
-    let bytes = build_stub(stub, insns, hook, resume, site, opts)?;
+    let bytes = build_stub(stub, insns, live, hook, resume, site, opts)?;
     // The commit writes the stub and then the hook branch. If the two overlap,
     // the second write lands inside the first and the result is neither.
     let stub_end = (stub as usize).saturating_add(bytes.len());
@@ -975,6 +1038,7 @@ fn prologue_len(opts: &DetourOptions) -> usize {
 fn build_stub(
     stub: u32,
     insns: &[Insn],
+    live: &[crate::flags::Flags],
     hook: u32,
     resume: u32,
     site: usize,
@@ -1044,13 +1108,32 @@ fn build_stub(
     // difference between the two styles.
     let mut at = body;
     if opts.style == DetourStyle::ResumeAfter {
-        for insn in insns {
-            let bytes = relocate_bytes(insn, at, Widen::IfNeeded).map_err(|source| {
-                DetourError::Relocate {
-                    at: insn.addr,
-                    source,
+        for (i, insn) in insns.iter().enumerate() {
+            let bytes = match relocate_bytes(insn, at, Widen::IfNeeded) {
+                Ok(b) => b,
+                // A `CBZ`/`CBNZ` that cannot reach its target is the one
+                // refusal a rewrite can answer — but only where the flags it
+                // would clobber are dead. `live[i]` was measured at the
+                // *original* site, which is the only place the question can be
+                // asked: once moved, the instruction has no successors yet.
+                Err(RelocateError::ForwardOnlyBranch { .. }) if opts.rewrite_compare_branches => {
+                    crate::relocate::widen_compare_branch(
+                        insn,
+                        at,
+                        live.get(i).copied().unwrap_or(crate::flags::Flags::ALL),
+                    )
+                    .map_err(|source| DetourError::Relocate {
+                        at: insn.addr,
+                        source,
+                    })?
                 }
-            })?;
+                Err(source) => {
+                    return Err(DetourError::Relocate {
+                        at: insn.addr,
+                        source,
+                    })
+                }
+            };
             at = at.wrapping_add(bytes.len() as u32);
             out.extend_from_slice(&bytes);
         }
@@ -2548,5 +2631,95 @@ mod region_tests {
             "Fit::Largest should take the 0x100-byte run, got {:#x}",
             d.stub
         );
+    }
+}
+
+#[cfg(test)]
+mod compare_branch_rewrite_tests {
+    use super::*;
+
+    /// An image whose site begins with a `CBZ` that cannot reach its target
+    /// from any stub, followed by code that clobbers every flag on both paths.
+    fn image_with_a_dead_flag_cbz() -> Vec<u8> {
+        let mut image = vec![0u8; 0x600];
+        // 0x100: cbz r0, 0x108   (verified with the decoder, not by hand)
+        // 0x102: adds r1, r2, r3
+        // 0x104: adds r4, r5, r6
+        // 0x106: nop
+        // 0x108: adds r4, r5, r6
+        // 0x10a: bx lr
+        image[0x100..0x10c].copy_from_slice(&[
+            0x10, 0xb1, 0xd1, 0x18, 0xac, 0x19, 0x00, 0xbf, 0xac, 0x19, 0x70, 0x47,
+        ]);
+        for b in image[0x400..0x500].iter_mut() {
+            *b = 0xff;
+        }
+        image
+    }
+
+    /// Off by default: a displaced `CBZ` is still refused, exactly as before.
+    ///
+    /// This is the compatibility claim. The rewrite changes flag behaviour, so
+    /// a caller who has not asked for it must not get it.
+    #[test]
+    fn a_displaced_compare_branch_is_refused_unless_rewriting_is_asked_for() {
+        let mut image = image_with_a_dead_flag_cbz();
+        let err = detour(&mut image, 0x100, 0x300, DetourOptions::default())
+            .expect_err("cbz cannot reach a stub");
+        // Asserted on the rendered message rather than by `matches!` with a
+        // `{err:?}` note or a `panic!` arm. Both of those are only reached
+        // when the test fails, so under this crate's 100% gate they are dead
+        // regions on every passing run; `Display` is computed either way.
+        assert_eq!(err.reason(), "relocate");
+        let text = err.to_string();
+        assert!(text.contains("forward-only-branch"));
+    }
+
+    /// Asked for, and the flags are dead, so the patch goes in.
+    #[test]
+    fn a_dead_flag_compare_branch_is_rewritten_when_asked() {
+        let mut image = image_with_a_dead_flag_cbz();
+        let d = detour(
+            &mut image,
+            0x100,
+            0x300,
+            DetourOptions::default().with_compare_branch_rewriting(true),
+        )
+        .expect("the flags are dead, so the rewrite is sound");
+
+        // The stub holds a `cmp` where the `cbz` was.
+        // Disassembled with the public walker rather than a hand-rolled loop:
+        // a `None => break` arm never runs on a passing test and would be an
+        // uncovered region under the 100% gate.
+        let text = crate::isa::disassemble(&image, d.stub as usize, d.stub, 8).join("\n");
+        assert!(text.contains("cmp r0, #0"));
+        // ...and the branch it pairs with, carrying the condition `CBZ`
+        // implied and the target the `CBZ` had.
+        assert!(text.contains("beq"));
+        // The `CBZ` itself is gone from the stub.
+        assert!(!text.contains("cbz"));
+    }
+
+    /// Asked for, but a flag is live, so it is still refused — and the error
+    /// says which flag rather than just "no".
+    #[test]
+    fn a_live_flag_still_refuses_even_when_rewriting_is_asked_for() {
+        let mut image = image_with_a_dead_flag_cbz();
+        // Replace the fall-through `adds` with `ands r1, r2` (leaves V) and
+        // the next instruction with `bvs`, so V survives and is then read.
+        image[0x102..0x106].copy_from_slice(&[0x11, 0x40, 0xfd, 0xd6]);
+        let err = detour(
+            &mut image,
+            0x100,
+            0x300,
+            DetourOptions::default().with_compare_branch_rewriting(true),
+        )
+        .expect_err("V is live, so the rewrite is unsound");
+        assert_eq!(err.reason(), "relocate");
+        let text = err.to_string();
+        assert!(text.contains("flags-live"));
+        // The message names which flags, because "only V" is the common and
+        // surprising answer — every `S`-suffixed logical op leaves V alone.
+        assert!(text.contains("v: true"));
     }
 }
