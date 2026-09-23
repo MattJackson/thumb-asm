@@ -1,0 +1,3 @@
+# Keeps MSRV-aware lints (e.g. suggesting APIs newer than this) from firing
+# suggestions this crate's declared floor (Cargo.toml `rust-version`) can't use.
+msrv = "1.58"

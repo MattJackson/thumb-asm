@@ -1,0 +1,61 @@
+LicenseRef-Arm-Documentation
+============================
+
+This is not a licence grant. It is a statement of what certain files in this
+repository are, so that an automated scanner and a human reader both get a
+true answer instead of a convenient one.
+
+WHAT IT COVERS
+
+  spec/ARMv5_DDI0100I.pdf      ARM Architecture Reference Manual, DDI 0100I
+  spec/ARMv7-M_DDI0403E.pdf    Armv7-M Architecture Reference Manual, DDI 0403E.e
+  spec/ARMv7-AR_DDI0406C.pdf   ARMv7-A/R Architecture Reference Manual, DDI 0406C
+  spec/ARMv6-M_DDI0419.pdf     Armv6-M Architecture Reference Manual, DDI 0419C
+
+  spec/ARMv7-M.txt             plain-text dumps of the above, produced with
+  spec/ARMv7-AR.txt            pypdf so that the encodings can be grepped
+  spec/ARMv6-M.txt
+
+WHO OWNS IT
+
+  Arm Limited. These are Arm's own architecture reference manuals, published by
+  Arm and distributed under Arm's terms. Extracting the text of a document does
+  not create a new work, so the .txt dumps are Arm's on exactly the same terms
+  as the PDFs they were made from.
+
+  Nothing about these files is the copyright of the thumb-asm project or of
+  Matthew Jackson, and this repository's MIT licence does not apply to them and
+  is not offered for them. The MIT licence in LICENSES/MIT.txt covers the
+  thumb-asm source, tests, examples, documentation and CI configuration, and
+  stops there.
+
+WHY THEY ARE HERE
+
+  thumb-asm encodes and decodes Arm Thumb instructions. Every encoding claim it
+  makes is a claim about what these documents say, and a claim like that is only
+  worth anything if the reader can check it. They are kept in the tree, next to
+  the code, so that checking is a grep rather than a download — see spec/README.md
+  for the section numbers and the retrieval provenance of each file.
+
+  They are reference material for developing and reviewing this crate. They are
+  not a component of it: Cargo.toml's `exclude` keeps spec/ out of the published
+  .crate (enforced by the `package` job in .github/workflows/qa.yml), so no
+  Arm document is redistributed to anyone installing thumb-asm from crates.io.
+
+IF YOU WANT THESE DOCUMENTS
+
+  Get them from Arm, who publish them for free after a click-through:
+
+    https://developer.arm.com/documentation/ddi0100/latest/   (DDI 0100)
+    https://developer.arm.com/documentation/ddi0403/latest/   (DDI 0403)
+    https://developer.arm.com/documentation/ddi0406/latest/   (DDI 0406)
+    https://developer.arm.com/documentation/ddi0419/latest/   (DDI 0419)
+
+  Arm's own terms govern what you may then do with them. If Arm would prefer
+  these copies not be mirrored here, they should be removed from the repository:
+  open an issue at https://github.com/MattJackson/thumb-asm/issues and they will
+  be, and spec/README.md's provenance table plus the section numbers cited
+  throughout the source are enough to keep every claim checkable without them.
+
+Arm is a registered trademark of Arm Limited (or its subsidiaries). This project
+is not affiliated with, endorsed by, or sponsored by Arm Limited.

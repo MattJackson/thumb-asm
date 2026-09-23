@@ -1,0 +1,1443 @@
+use super::*;
+
+#[test]
+fn find_bytes_word_and_start() {
+    let img = [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+    assert_eq!(find(&img, Needle::Bytes(&[0x22, 0x33]), 0), Some(2));
+    // little-endian word 0x33221100 == bytes 00 11 22 33 at offset 0.
+    assert_eq!(find(&img, Needle::Word(0x3322_1100), 0), Some(0));
+    // `start` skips earlier matches.
+    assert_eq!(find(&img, Needle::Bytes(&[0x22, 0x33]), 3), None);
+}
+
+#[test]
+fn find_free_run_and_wrapper() {
+    let mut img = vec![0u8; 32];
+    for b in img.iter_mut().skip(10).take(8) {
+        *b = 0xFF;
+    }
+    // find_free_space is exactly find(FreeRun, ..).
+    assert_eq!(find_free_space(&img, 8, 1, 0), Some(10));
+    assert_eq!(
+        find(&img, Needle::FreeRun { len: 8, align: 1 }, 0),
+        Some(10)
+    );
+    assert_eq!(find(&img, Needle::FreeRun { len: 9, align: 1 }, 0), None);
+    // Nested/composed find: nothing more free past the run.
+    let run = find(&img, Needle::FreeRun { len: 4, align: 1 }, 0).unwrap();
+    assert_eq!(
+        find(&img, Needle::FreeRun { len: 4, align: 1 }, run + 8),
+        None
+    );
+}
+
+#[test]
+fn bl_encode_decode_roundtrip() {
+    // Forward, backward, and a real observed site (0x9da80 -> 0x9bf50).
+    let cases: &[(usize, u32)] = &[
+        (0x9da80, 0x9bf50),
+        (0x9e3f8, 0x9bf50),
+        (0x1000, 0x1c3810),
+        (0x1c3810, 0x1000),
+        (0x100, 0x100 + 4), // minimal forward
+    ];
+    for &(site, target) in cases {
+        let bytes = encode_bl(site, target).expect("in range");
+        let mut img = vec![0u8; site + 8];
+        img[site..site + 4].copy_from_slice(&bytes);
+        assert_eq!(
+            decode_bl(&img, site),
+            Some(target),
+            "roundtrip site=0x{site:x} target=0x{target:x}"
+        );
+    }
+    // Out of BL range (> 16 MiB) is refused, never mis-encoded.
+    assert_eq!(encode_bl(0, 0x0200_0000), None);
+}
+
+#[test]
+fn find_bl_sites_locates_direct_calls() {
+    // Two BL sites calling the same target, plus unrelated bytes between.
+    let target = 0x1_5000u32;
+    let mut img = vec![0u8; 0x8000];
+    let a = 0x1000usize;
+    let b = 0x2000usize;
+    img[a..a + 4].copy_from_slice(&encode_bl(a, target).unwrap());
+    img[b..b + 4].copy_from_slice(&encode_bl(b, target).unwrap());
+    let sites = find_bl_sites(&img, target);
+    assert!(sites.contains(&a) && sites.contains(&b), "sites: {sites:?}");
+}
+
+#[test]
+fn asm_reproduces_kat_handler_bytes() {
+    // The 3C-0E hijack handler, assembled through the dumb Asm verbs, must equal
+    // the hand-built KAT bytes exactly (handler + literal pool). If the encoder
+    // drifts one bit, this fails against a known-good artifact.
+    const KAT: &str = "094b58780e280dd19878c0280ad1d878de2807d100b5\
+0920f0210022034b9847022000bd024b1847380d00026b2d0a005bad0900";
+    let mut a = Asm::new();
+    let tail = a.label();
+    a.ldr_lit(3, 0x0200_0d38); // ldr r3, =cdb_base
+    a.ldrb_imm(0, 3, 1); // mode = cdb[1]
+    a.cmp_imm(0, 0x0E);
+    a.bne(tail);
+    a.ldrb_imm(0, 3, 2); // cdb[2]
+    a.cmp_imm(0, 0xC0);
+    a.bne(tail);
+    a.ldrb_imm(0, 3, 3); // cdb[3]
+    a.cmp_imm(0, 0xDE);
+    a.bne(tail);
+    a.push(0x0100); // push {lr}
+    a.movs_imm(0, 0x09);
+    a.movs_imm(1, 0xF0);
+    a.movs_imm(2, 0x00);
+    a.ldr_lit(3, 0x000a_2d6b); // ldr r3, =sense_setter|1
+    a.blx(3);
+    a.movs_imm(0, 0x02);
+    a.pop(0x0100); // pop {pc}
+    a.bind(tail);
+    a.ldr_lit(3, 0x0009_ad5b); // ldr r3, =oem_handler|1
+    a.bx(3);
+    let got = a.finish().expect("assemble");
+    let hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, KAT, "assembled handler drifted from the KAT");
+}
+
+#[test]
+fn command_table_walk_follows_chain_and_stops_at_terminator() {
+    // Two segments: base seg has one real record then a chain(flag=4) whose
+    // handler field points at the second segment; second seg has one real record
+    // then a terminator(flag=3).
+    let stride = 8;
+    let seg2 = 0x40usize;
+    let mut img = vec![0u8; 0x80];
+    // seg1[0]: opcode 0x12, flags 0x01, handler 0x1111
+    img[0] = 0x12;
+    img[1] = 0x01;
+    img[4..8].copy_from_slice(&0x1111u32.to_le_bytes());
+    // seg1[1]: chain, flags 0x04, handler = seg2 base
+    img[8] = 0x00;
+    img[9] = 0x04;
+    img[12..16].copy_from_slice(&(seg2 as u32).to_le_bytes());
+    // seg2[0]: opcode 0x3C, flags 0x01, handler 0x2222
+    img[seg2] = 0x3C;
+    img[seg2 + 1] = 0x01;
+    img[seg2 + 4..seg2 + 8].copy_from_slice(&0x2222u32.to_le_bytes());
+    // seg2[1]: terminator flags 0x03
+    img[seg2 + 9] = 0x03;
+    let t = CommandTable {
+        base: 0,
+        stride,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 64,
+    };
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(recs.len(), 2, "expected both segments' real records");
+    assert_eq!((recs[0].opcode, recs[0].handler), (0x12, 0x1111));
+    assert_eq!((recs[1].opcode, recs[1].handler), (0x3C, 0x2222));
+}
+
+#[test]
+fn prologue_check_accepts_push_lr_rejects_data() {
+    let mut img = vec![0u8; 16];
+    img[4..6].copy_from_slice(&0xB5F0u16.to_le_bytes()); // push {r4-r7,lr}
+    assert!(prologue_is_push_lr(&img, 4, 4));
+    assert!(!prologue_is_push_lr(&img, 8, 4));
+}
+
+#[test]
+fn read_modify_insert() {
+    let mut img = vec![0xFFu8; 16];
+    write(&mut img, 4, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(read_u32(&img, 4), 0xEFBE_ADDE);
+    assert_eq!(read_u8(&img, 4), 0xDE);
+    let addr = insert(&mut img, 8, &[1, 2, 3]);
+    assert_eq!(addr, 8);
+    assert_eq!(&img[8..11], &[1, 2, 3]);
+}
+
+// --- Asm::finish() range-check boundaries -------------------------------------
+// A mis-encoded branch/ldr/adr immediate bricks a drive, so every `bail!` guard
+// in `finish()` must actually fire when its immediate goes out of range. `0xBF00`
+// (nop) is used as neutral filler to open the required distance.
+
+#[test]
+fn finish_bails_on_out_of_range_conditional_branch() {
+    let mut a = Asm::new();
+    let back = a.label();
+    a.bind(back);
+    for _ in 0..200 {
+        a.raw16(0xBF00); // 200 halfwords back >> the ±127 conditional limit
+    }
+    a.beq(back);
+    let err = a.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("conditional branch out of range"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn finish_accepts_in_range_conditional_branch() {
+    let mut a = Asm::new();
+    let back = a.label();
+    a.bind(back);
+    for _ in 0..50 {
+        a.raw16(0xBF00); // ~52 halfwords back, within ±127
+    }
+    a.beq(back);
+    assert!(a.finish().is_ok());
+}
+
+#[test]
+fn finish_bails_on_out_of_range_unconditional_branch() {
+    let mut a = Asm::new();
+    let back = a.label();
+    a.bind(back);
+    for _ in 0..1100 {
+        a.raw16(0xBF00); // >1023 halfwords back, past the unconditional limit
+    }
+    a.b(back);
+    let err = a.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("branch out of range"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn finish_bails_on_out_of_range_ldr_literal() {
+    let mut a = Asm::new();
+    a.ldr_lit(0, 0xDEAD_BEEF);
+    for _ in 0..600 {
+        a.raw16(0xBF00); // pushes the literal pool >1020 bytes past the ldr
+    }
+    let err = a.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("ldr literal out of range"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn finish_bails_on_out_of_range_adr() {
+    let mut a = Asm::new();
+    let blob = a.data_blob(vec![0u8; 4]);
+    a.adr(0, blob);
+    for _ in 0..600 {
+        a.raw16(0xBF00); // pushes the blob >1020 bytes past the adr
+    }
+    let err = a.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("adr target out of range"),
+        "unexpected error: {err}"
+    );
+}
+
+// --- coverage: CommandTable::find / replace ------------------------------------
+
+#[test]
+fn command_table_find_locates_matching_opcode_and_misses_absent_one() {
+    let mut img = vec![0u8; 16];
+    // record 0: opcode 0x10, flags 0x01, handler 0xAAAA
+    img[0] = 0x10;
+    img[1] = 0x01;
+    img[4..8].copy_from_slice(&0xAAAAu32.to_le_bytes());
+    // record 1: terminator
+    img[9] = 0x03;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    assert_eq!(
+        t.find(&img, 0x10),
+        Some(CommandRecord {
+            off: 0,
+            opcode: 0x10,
+            flags: 0x01,
+            handler: 0xAAAA,
+        })
+    );
+    // Scan stops at the terminator without a match.
+    assert_eq!(t.find(&img, 0x99), None);
+}
+
+#[test]
+fn command_table_find_gives_up_after_max_records_without_terminator() {
+    // No terminator anywhere: find() must stop after max_records rather than
+    // reading out of bounds or looping forever.
+    let img = vec![0u8; 8]; // opcode 0, flags 0 (never == term_flag 0x03)
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 1,
+    };
+    assert_eq!(t.find(&img, 0x10), None);
+}
+
+#[test]
+fn command_table_replace_overwrites_handler_and_optionally_flags() {
+    let mut img = vec![0u8; 16];
+    img[0] = 0x10;
+    img[1] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    let rec = t.find(&img, 0x10).unwrap();
+
+    t.replace(&mut img, &rec, 0x2000_1001, Some(0x02));
+    assert_eq!(read_u32(&img, 4), 0x2000_1001);
+    assert_eq!(img[1], 0x02);
+
+    // flags = None leaves the flags byte untouched.
+    t.replace(&mut img, &rec, 0x3000_2002, None);
+    assert_eq!(read_u32(&img, 4), 0x3000_2002);
+    assert_eq!(img[1], 0x02);
+}
+
+// --- coverage: CommandTable::walk edge cases ------------------------------------
+
+#[test]
+fn command_table_walk_stops_after_max_records_without_terminator_or_chain() {
+    let mut img = vec![0u8; 16];
+    img[0] = 0x11; // record 0: real, not chain/terminator
+    img[1] = 0x01;
+    img[8] = 0x22; // record 1: real, not chain/terminator
+    img[9] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 2,
+    };
+    // Inner loop exhausts max_records without a chain/terminator/OOB hit, so
+    // the outer loop's `!advanced` guard breaks and `out` returns normally.
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(recs.len(), 2);
+    assert_eq!(recs[0].opcode, 0x11);
+    assert_eq!(recs[1].opcode, 0x22);
+}
+
+#[test]
+fn command_table_walk_breaks_on_chain_cycle() {
+    // Segment A chains to B; B chains back to A. The `seen` guard must break
+    // the outer loop on revisiting a base instead of looping forever.
+    let seg_b = 0x40usize;
+    let mut img = vec![0u8; 0x80];
+    img[0] = 0x12; // A: one real record
+    img[1] = 0x01;
+    img[8] = 0x00; // A: chain to B
+    img[9] = 0x04;
+    img[12..16].copy_from_slice(&(seg_b as u32).to_le_bytes());
+    img[seg_b] = 0x34; // B: one real record
+    img[seg_b + 1] = 0x01;
+    img[seg_b + 8] = 0x00; // B: chain back to A (base 0)
+    img[seg_b + 9] = 0x04;
+    img[seg_b + 12..seg_b + 16].copy_from_slice(&0u32.to_le_bytes());
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(
+        recs.len(),
+        2,
+        "one real record from each segment before the cycle breaks"
+    );
+    assert_eq!((recs[0].opcode, recs[1].opcode), (0x12, 0x34));
+}
+
+#[test]
+fn command_table_walk_returns_collected_records_when_run_exceeds_image_bounds() {
+    // record 0 fits; a hypothetical record 1 would run past the image end
+    // with neither a terminator nor a chain flag seen.
+    let mut img = vec![0u8; 12];
+    img[0] = 0x55;
+    img[1] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].opcode, 0x55);
+}
+
+// --- coverage: the "dumb" Thumb instruction emitters not exercised by the KAT --
+
+#[test]
+fn asm_data_processing_and_load_store_emitters_encode_expected_bits() {
+    let mut a = Asm::new();
+    assert_eq!(a.pos(), 0);
+    a.ldr_imm(1, 2, 4);
+    a.strh_imm(3, 4, 2);
+    a.str_imm(5, 6, 8);
+    a.bics(0, 1);
+    a.orrs(2, 3);
+    a.strb_imm(1, 2, 3);
+    a.cmp_reg(4, 5);
+    a.ldrb_reg(0, 1, 2);
+    a.adds_imm(3, 7);
+    a.subs_imm(2, 9);
+    a.lsls_imm(1, 2, 3);
+    a.lsrs_imm(4, 5, 6);
+    a.adds_reg(1, 2, 3);
+    a.mov_reg(6, 7);
+    a.movs_reg(6, 7);
+    assert_eq!(a.pos(), 30);
+
+    // No fixups/ldrs/blobs were used, so finish() only pads to 4 bytes (already
+    // aligned here) and returns the raw emitted bytes unchanged.
+    let code = a.finish().expect("nothing to range-check");
+    let hw = |i: usize| u16::from_le_bytes([code[i * 2], code[i * 2 + 1]]);
+    assert_eq!(hw(0), 0x6800 | (1 << 6) | (2 << 3) | 1);
+    assert_eq!(hw(1), 0x8000 | (1 << 6) | (4 << 3) | 3);
+    assert_eq!(hw(2), 0x6000 | (2 << 6) | (6 << 3) | 5);
+    assert_eq!(hw(3), 0x4380 | (1 << 3));
+    assert_eq!(hw(4), 0x4300 | (3 << 3) | 2);
+    assert_eq!(hw(5), 0x7000 | (3 << 6) | (2 << 3) | 1);
+    assert_eq!(hw(6), 0x4280 | (5 << 3) | 4);
+    assert_eq!(hw(7), 0x5C00 | (2 << 6) | (1 << 3));
+    assert_eq!(hw(8), 0x3000 | (3 << 8) | 7);
+    assert_eq!(hw(9), 0x3800 | (2 << 8) | 9);
+    assert_eq!(hw(10), (3 << 6) | (2 << 3) | 1);
+    assert_eq!(hw(11), 0x0800 | (6 << 6) | (5 << 3) | 4);
+    assert_eq!(hw(12), 0x1800 | (3 << 6) | (2 << 3) | 1);
+    // `MOV (register)` T1 (A5.2.3), *not* the 0.1.0 `adds rd, rm, #0` lowering.
+    assert_eq!(hw(13), 0x4600 | (7 << 3) | 6);
+    // `MOV (register)` T2 (A5.2.1) — the flag-setting form, low registers only.
+    assert_eq!(hw(14), (7 << 3) | 6);
+}
+
+#[test]
+fn asm_conditional_branch_emitters_cover_all_fourteen_conditions() {
+    // Each conditional branch targets its own bind point (pos == target == 0),
+    // so the encoded offset is always the same small negative value and only
+    // the opcode's high byte (the thing under test) varies.
+    type Emit = fn(&mut Asm, u16);
+    let cases: &[(u16, Emit)] = &[
+        (0xD000, |a, l| a.beq(l)),
+        (0xD100, |a, l| a.bne(l)),
+        (0xD200, |a, l| a.bhs(l)),
+        (0xD300, |a, l| a.blo(l)),
+        (0xD400, |a, l| a.bmi(l)),
+        (0xD500, |a, l| a.bpl(l)),
+        (0xD600, |a, l| a.bvs(l)),
+        (0xD700, |a, l| a.bvc(l)),
+        (0xD800, |a, l| a.bhi(l)),
+        (0xD900, |a, l| a.bls(l)),
+        (0xDA00, |a, l| a.bge(l)),
+        (0xDB00, |a, l| a.blt(l)),
+        (0xDC00, |a, l| a.bgt(l)),
+        (0xDD00, |a, l| a.ble(l)),
+    ];
+    // Fourteen conditions, and the fourteen bases are exactly 0xD000..=0xDD00 —
+    // 0xDE00 (UDF) and 0xDF00 (SVC) are not branches and have no emitter.
+    assert_eq!(cases.len(), 14);
+    for &(base, emit) in cases {
+        let mut a = Asm::new();
+        let here = a.label();
+        a.bind(here);
+        emit(&mut a, here);
+        let code = a.finish().expect("self-branch is always in range");
+        let hw = u16::from_le_bytes([code[0], code[1]]);
+        assert_eq!(hw & 0xFF00, base, "base opcode for {base:#06x}");
+    }
+}
+
+#[test]
+fn asm_b_cond_always_lowers_to_the_unconditional_branch() {
+    // `Cond::Al` has no conditional-branch encoding: 0b1110 is UDF in T1. The
+    // emitter must produce `b` (0xE000 class), never 0xDE00.
+    let mut a = Asm::new();
+    let here = a.label();
+    a.bind(here);
+    a.b_cond(Cond::Al, here);
+    let code = a.finish().expect("self-branch is always in range");
+    let hw = u16::from_le_bytes([code[0], code[1]]);
+    assert_eq!(hw & 0xF800, 0xE000);
+    assert_ne!(hw & 0xFF00, 0xDE00);
+}
+
+#[test]
+fn asm_ldr_lit_dedups_repeated_literal_values() {
+    // Loading the same value twice must reuse one pool slot (the `Some` arm of
+    // finish()'s dedup lookup), not append it twice.
+    let mut a = Asm::new();
+    a.ldr_lit(0, 0x1234_5678);
+    a.ldr_lit(1, 0x1234_5678); // same value, different destination register
+    let code = a.finish().expect("small, in-range pool");
+    // Two 2-byte `ldr` instructions + one 4-byte pool entry = 8 bytes total,
+    // not 12 — proof the second load reused the first's pool slot.
+    assert_eq!(code.len(), 8);
+    let pool = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
+    assert_eq!(pool, 0x1234_5678);
+}
+
+// --- coverage: decode_bl / encode_bl / encode_b_wide / decode_b_wide edges -----
+
+#[test]
+fn decode_bl_rejects_non_bl_bytes_and_out_of_bounds_offset() {
+    let img = [0u8; 4]; // all-zero halfwords never match the BL bit pattern
+    assert_eq!(decode_bl(&img, 0), None);
+    assert_eq!(decode_bl(&img, 1), None); // 1..5 would run past a 4-byte image
+}
+
+#[test]
+fn encode_bl_rejects_odd_target_offset() {
+    // Thumb instructions are 2-byte aligned; an odd site/target delta is refused.
+    assert_eq!(encode_bl(0, 5), None);
+}
+
+#[test]
+fn encode_decode_b_wide_roundtrip_and_rejections() {
+    let cases: &[(usize, u32)] = &[(0x1000, 0x2000), (0x2000, 0x1000), (0x100, 0x104)];
+    for &(site, target) in cases {
+        let bytes = encode_b_wide(site, target).expect("in range");
+        let mut img = vec![0u8; site + 8];
+        img[site..site + 4].copy_from_slice(&bytes);
+        assert_eq!(decode_b_wide(&img, site), Some(target));
+        // A B.W is never mistaken for a BL: same hw1 prefix, different hw2 base.
+        assert_eq!(decode_bl(&img, site), None);
+    }
+    // Same range/alignment rejections as encode_bl.
+    assert_eq!(encode_b_wide(0, 0x0200_0000), None);
+    assert_eq!(encode_b_wide(0, 5), None);
+    // decode_b_wide rejects a too-short buffer and a real BL's bit pattern.
+    assert_eq!(decode_b_wide(&[0u8; 2], 0), None);
+    let bl = encode_bl(0, 0x1000).unwrap();
+    assert_eq!(decode_b_wide(&bl, 0), None);
+}
+
+// --- coverage: find_bytes / find_free_run edge cases ---------------------------
+
+#[test]
+fn find_bytes_rejects_empty_pattern_and_out_of_range_start() {
+    let img = [1u8, 2, 3, 4];
+    assert_eq!(find(&img, Needle::Bytes(&[]), 0), None);
+    assert_eq!(find(&img, Needle::Bytes(&[1]), 10), None);
+}
+
+#[test]
+fn find_free_run_zero_length_matches_at_clamped_start() {
+    let img = [0u8; 8];
+    assert_eq!(find(&img, Needle::FreeRun { len: 0, align: 1 }, 3), Some(3));
+    assert_eq!(
+        find(&img, Needle::FreeRun { len: 0, align: 1 }, 100),
+        Some(8)
+    ); // clamped to image length
+}
+
+// --- coverage: CommandTable::find out-of-bounds run ----------------------------
+
+#[test]
+fn command_table_find_returns_none_when_run_exceeds_image_bounds() {
+    // Record 0 fits; a hypothetical record 1 would run past the image end with
+    // neither a match nor a terminator seen first.
+    let mut img = vec![0u8; 12];
+    img[0] = 0x55;
+    img[1] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    assert_eq!(t.find(&img, 0xAA), None);
+}
+
+// --- coverage: finish() success paths not reached by the bail-out tests -------
+
+#[test]
+fn finish_encodes_in_range_unconditional_branch() {
+    let mut a = Asm::new();
+    let target = a.label();
+    a.raw16(0xBF00); // nop filler so the branch isn't targeting itself
+    a.b(target);
+    a.bind(target);
+    let code = a.finish().expect("well within the +-1023 halfword range");
+    let hw = u16::from_le_bytes([code[2], code[3]]);
+    assert_eq!(hw & 0xF800, 0xE000); // unconditional B opcode class
+}
+
+#[test]
+fn finish_bails_on_unbound_branch_label() {
+    let mut a = Asm::new();
+    let never_bound = a.label();
+    a.beq(never_bound);
+    let err = a.finish().unwrap_err().to_string();
+    assert!(err.contains("unbound label"), "unexpected error: {err}");
+}
+
+#[test]
+fn finish_bails_on_unbound_blob_label() {
+    let mut a = Asm::new();
+    // A label reserved but never passed to `data_blob`, so step 3 of finish()
+    // never binds it — the `adr` fixup in step 4 must reject it by name.
+    let never_bound = a.label();
+    a.adr(0, never_bound);
+    let err = a.finish().unwrap_err().to_string();
+    assert!(
+        err.contains("unbound blob label"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn finish_pads_each_data_blob_to_four_byte_alignment_and_resolves_adr() {
+    // blob1 is 3 bytes, so blob2 would start unaligned without the per-blob
+    // padding loop in finish() running again for it.
+    let mut a = Asm::new();
+    let blob1 = a.data_blob(vec![0xAA, 0xBB, 0xCC]);
+    let blob2 = a.data_blob(vec![0xDD, 0xEE, 0xFF, 0x11]);
+    a.adr(0, blob1);
+    a.adr(1, blob2);
+    let code = a.finish().expect("small, in-range adr targets");
+    assert_eq!(&code[4..7], &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(&code[8..12], &[0xDD, 0xEE, 0xFF, 0x11]); // padded up to the next 4-byte boundary
+}
+
+// ---------------------------------------------------------------------------
+// 0.2.0 additions: checked reads, the conditional-branch codec, and the
+// framework-agnostic install/verify pair.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn find_bl_sites_finds_a_bl_in_the_final_four_bytes() {
+    // Regression for the 0.1.0 off-by-one: the scan bound was
+    // `len.saturating_sub(4)` used exclusively, so offset `len - 4` — a legal
+    // site — was never examined. Here the ONLY `BL` in the image occupies the
+    // last four bytes, so the old code returned an empty vec.
+    let target = 0x40u32;
+    let mut img = vec![0u8; 0x20];
+    let site = img.len() - 4;
+    let bytes = encode_bl(site, target).expect("in range");
+    img[site..].copy_from_slice(&bytes);
+    assert_eq!(find_bl_sites(&img, target), vec![site]);
+    // And with the Thumb bit set on the wanted target, which is masked off.
+    assert_eq!(find_bl_sites(&img, target | 1), vec![site]);
+}
+
+#[test]
+fn find_bl_sites_tolerates_images_too_short_to_hold_one() {
+    for len in 0..4usize {
+        assert!(
+            find_bl_sites(&vec![0xFFu8; len], 0x100).is_empty(),
+            "len {len}"
+        );
+    }
+}
+
+#[test]
+fn read_u16_and_the_checked_read_family() {
+    let img = [0x78u8, 0x56, 0x34, 0x12];
+    assert_eq!(read_u16(&img, 0), 0x5678);
+    assert_eq!(read_u16(&img, 2), 0x1234);
+    assert_eq!(read_u8(&img, 3), 0x12);
+    assert_eq!(read_u32(&img, 0), 0x1234_5678);
+
+    // Checked siblings agree with the panicking ones in bounds …
+    assert_eq!(try_read_u8(&img, 0), Some(0x78));
+    assert_eq!(try_read_u16(&img, 2), Some(0x1234));
+    assert_eq!(try_read_u32(&img, 0), Some(0x1234_5678));
+    // … and return None at exactly the first offset that would run past the end.
+    assert_eq!(try_read_u8(&img, 4), None);
+    assert_eq!(try_read_u16(&img, 3), None);
+    assert_eq!(try_read_u16(&img, 99), None);
+    assert_eq!(try_read_u32(&img, 1), None);
+    // The last legal offset for each width is len - width, not len - width - 1.
+    assert!(try_read_u8(&img, 3).is_some());
+    assert!(try_read_u16(&img, 2).is_some());
+    assert!(try_read_u32(&img, 0).is_some());
+    // Empty image: every read is None, nothing panics.
+    assert_eq!(try_read_u8(&[], 0), None);
+    assert_eq!(try_read_u16(&[], 0), None);
+    assert_eq!(try_read_u32(&[], 0), None);
+}
+
+#[test]
+fn decode_b_cond_t1_hand_computed_vector_and_all_conditions() {
+    // 0xD40E = `bmi` with imm8 = 0x0E, so target = 0 + 4 + 14*2 = 0x20.
+    let b = decode_b_cond(&[0x0E, 0xD4], 0).expect("a bmi");
+    assert_eq!(b.cond, Cond::Mi);
+    assert_eq!(b.target, 0x20);
+    assert_eq!(b.len, 2);
+
+    // Backward branch: imm8 = 0xFE = -2 → target = at + 4 - 4 = at.
+    let at = 0x100;
+    let mut img = vec![0u8; 0x200];
+    img[at..at + 2].copy_from_slice(&0xD1FEu16.to_le_bytes());
+    let b = decode_b_cond(&img, at).expect("a bne");
+    assert_eq!((b.cond, b.target, b.len), (Cond::Ne, at as u32, 2));
+
+    // Every one of the fourteen `cond` values decodes to its condition.
+    for bits in 0u8..=0b1101 {
+        let hw = 0xD000u16 | ((bits as u16) << 8);
+        let got = decode_b_cond(&hw.to_le_bytes(), 0).expect("a branch");
+        assert_eq!(got.cond, Cond::from_bits(bits).unwrap(), "cond {bits:#06b}");
+        assert_eq!(got.target, 4); // imm8 == 0
+    }
+}
+
+#[test]
+fn decode_b_cond_rejects_udf_and_svc() {
+    // A5.2.6 Table A5-8: cond 0b1110 is permanently UNDEFINED (UDF), cond
+    // 0b1111 is SVC. Neither is a branch, so a decoder that treats the whole
+    // 0xD0xx..=0xDFxx range as conditional branches reads an `svc #n` as a jump.
+    assert_eq!(decode_b_cond(&[0x00, 0xDE], 0), None);
+    assert_eq!(decode_b_cond(&[0x00, 0xDF], 0), None);
+    // Not just imm8 == 0: the whole two sixteenths of the space.
+    for imm8 in [0x00u8, 0x01, 0x7F, 0x80, 0xFF] {
+        assert_eq!(
+            decode_b_cond(&[imm8, 0xDE], 0),
+            None,
+            "udf imm8 {imm8:#04x}"
+        );
+        assert_eq!(
+            decode_b_cond(&[imm8, 0xDF], 0),
+            None,
+            "svc imm8 {imm8:#04x}"
+        );
+    }
+    // The last real condition, 0xDD (ble), still decodes — the boundary is tight.
+    assert_eq!(decode_b_cond(&[0x00, 0xDD], 0).unwrap().cond, Cond::Le);
+}
+
+#[test]
+fn decode_b_cond_t3_hand_computed_vector() {
+    // Hand-computed from A5.3.4 / A7.7.12, T3:
+    //   hw1 = 11110 S cond imm6, hw2 = 10 J1 0 J2 imm11,
+    //   imm32 = SignExtend(S:J2:J1:imm6:imm11:'0').
+    //
+    // Forward: site 0x1000, target 0x11004 → off = 0x10000, imm = off>>1 =
+    // 0x8000. As a 20-bit field: S=0, J2=0, J1=0, imm6 = (0x8000>>11)&0x3F =
+    // 0x10, imm11 = 0. cond = Mi = 0b0100 → hw1 = 0xF000|0x100|0x10 = 0xF110,
+    // hw2 = 0x8000. Bytes (two LE halfwords, hw1 first): 10 F1 00 80.
+    let at = 0x1000usize;
+    let mut img = vec![0u8; 0x4000];
+    img[at..at + 4].copy_from_slice(&[0x10, 0xF1, 0x00, 0x80]);
+    let b = decode_b_cond(&img, at).expect("a bmi.w");
+    assert_eq!(b.cond, Cond::Mi);
+    assert_eq!(b.target, 0x1_1004);
+    assert_eq!(b.len, 4);
+
+    // Backward: site 0x2000, target 0x1F04 → off = -0x100, imm = -128, so as a
+    // 20-bit field 0xFFF80: S=1, J2=1, J1=1, imm6 = 0x3F, imm11 = 0x780.
+    // cond = Lt = 0b1011 → hw1 = 0xF000|0x400|0x2C0|0x3F = 0xF6FF,
+    // hw2 = 0x8000|0x2000|0x0800|0x780 = 0xAF80. (-0x100 also fits T1, so this
+    // is a legal but redundantly wide encoding — the sort an assembler emits
+    // for an explicit `blt.w`. The decoder must read it; the encoder, which
+    // picks the narrowest form, never produces it.)
+    let at = 0x2000usize;
+    img[at..at + 4].copy_from_slice(&[0xFF, 0xF6, 0x80, 0xAF]);
+    let b = decode_b_cond(&img, at).expect("a blt.w");
+    assert_eq!((b.cond, b.target, b.len), (Cond::Lt, 0x1F04, 4));
+
+    // The J1/J2 order really is different from BL/B.W: reading these same bytes
+    // with the `S:I1:I2:imm10:imm11` rule would give a different target, so the
+    // wide-branch decoders must not claim them.
+    assert_eq!(decode_bl(&img, at), None);
+    assert_eq!(decode_b_wide(&img, at), None);
+}
+
+#[test]
+fn decode_b_cond_rejects_non_branches_and_truncated_reads() {
+    // A 16-bit instruction that is not in the 0xDxxx space and not a 32-bit
+    // prefix: `movs r0, #1`.
+    assert_eq!(decode_b_cond(&0x2001u16.to_le_bytes(), 0), None);
+    // A 32-bit prefix whose hw2 is a BL (0xD000 class), not a T3 conditional.
+    let bl = encode_bl(0, 0x100).unwrap();
+    assert_eq!(decode_b_cond(&bl, 0), None);
+    // …and one whose hw2 is a B.W (0x9000 class).
+    let bw = encode_b_wide(0, 0x100).unwrap();
+    assert_eq!(decode_b_cond(&bw, 0), None);
+    // T3 shape but cond == 0b1110 / 0b1111 (the "related encodings" space:
+    // MSR/MRS, hints, UDF.W, BL) — not a branch.
+    for bits in [0b1110u16, 0b1111] {
+        let hw1 = 0xF000u16 | (bits << 6);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&hw1.to_le_bytes());
+        bytes.extend_from_slice(&0x8000u16.to_le_bytes());
+        assert_eq!(decode_b_cond(&bytes, 0), None, "cond {bits:#06b}");
+    }
+    // Truncated: one halfword of a 32-bit prefix, and an empty image.
+    assert_eq!(decode_b_cond(&0xF000u16.to_le_bytes(), 0), None);
+    assert_eq!(decode_b_cond(&[], 0), None);
+    assert_eq!(decode_b_cond(&[0x0E], 0), None);
+}
+
+#[test]
+fn encode_b_cond_picks_the_narrowest_encoding_and_roundtrips() {
+    // Boundaries from A7.7.12: T1 spans -256..=254, T3 -1048576..=1048574.
+    let site = 0x10_0000usize;
+    let pc = site as u32 + 4;
+    let cases: &[(u32, usize)] = &[
+        (pc, 2),                   // zero displacement
+        (pc + 254, 2),             // widest forward T1
+        (pc.wrapping_sub(256), 2), // widest backward T1
+        (pc + 256, 4),             // one halfword past T1 → T3
+        (pc.wrapping_sub(258), 4),
+        (pc + 1_048_574, 4),             // widest forward T3
+        (pc.wrapping_sub(1_048_576), 4), // widest backward T3
+    ];
+    let mut img = vec![0u8; 0x40_0000];
+    for &(target, len) in cases {
+        for bits in 0u8..=0b1101 {
+            let cond = Cond::from_bits(bits).unwrap();
+            let bytes = encode_b_cond(site, cond, target)
+                .unwrap_or_else(|| panic!("in range: target {target:#x} cond {cond}"));
+            assert_eq!(bytes.len(), len, "width for target {target:#x}");
+            img[site..site + bytes.len()].copy_from_slice(&bytes);
+            let got = decode_b_cond(&img, site).expect("decodes back");
+            assert_eq!(got.cond, cond);
+            assert_eq!(got.target, target, "roundtrip target {target:#x}");
+            assert_eq!(got.len, len);
+        }
+    }
+    // Just outside T3 in both directions.
+    assert_eq!(encode_b_cond(site, Cond::Eq, pc + 1_048_576), None);
+    assert_eq!(
+        encode_b_cond(site, Cond::Eq, pc.wrapping_sub(1_048_578)),
+        None
+    );
+    // Odd displacement: Thumb instructions are halfword aligned.
+    assert_eq!(encode_b_cond(site, Cond::Eq, pc + 1), None);
+    assert_eq!(encode_b_cond(site, Cond::Eq, pc + 0x1001), None);
+    // `AL` has no conditional-branch encoding at either width.
+    assert_eq!(encode_b_cond(site, Cond::Al, pc), None);
+    assert_eq!(encode_b_cond(site, Cond::Al, pc + 0x1000), None);
+}
+
+#[test]
+fn encode_b_cond_matches_the_hand_computed_t1_and_t3_vectors() {
+    assert_eq!(encode_b_cond(0, Cond::Mi, 0x20), Some(vec![0x0E, 0xD4]));
+    assert_eq!(
+        encode_b_cond(0x1000, Cond::Mi, 0x1_1004),
+        Some(vec![0x10, 0xF1, 0x00, 0x80])
+    );
+    // Backward, past T1's -256 floor: site 0x2000, target 0x1E04 → off =
+    // -0x200, imm = -256 = 0xFFF00 over 20 bits, so S=J2=J1=1, imm6 = 0x3F,
+    // imm11 = 0x700 → hw1 = 0xF6FF, hw2 = 0x8000|0x2000|0x800|0x700 = 0xAF00.
+    assert_eq!(
+        encode_b_cond(0x2000, Cond::Lt, 0x1E04),
+        Some(vec![0xFF, 0xF6, 0x00, 0xAF])
+    );
+    // One halfword nearer and T1 reaches, so the narrow form is chosen instead.
+    assert_eq!(
+        encode_b_cond(0x2000, Cond::Lt, 0x1F04),
+        Some(vec![0x80, 0xDB])
+    );
+}
+
+#[test]
+fn branch_kind_dispatches_and_displays() {
+    assert_eq!(BranchKind::Bl.to_string(), "bl");
+    assert_eq!(BranchKind::BWide.to_string(), "b.w");
+
+    let site = 0x1000usize;
+    let target = 0x2000u32;
+    let mut img = vec![0u8; 0x4000];
+    for kind in [BranchKind::Bl, BranchKind::BWide] {
+        let bytes = kind.encode(site, target).expect("in range");
+        img[site..site + 4].copy_from_slice(&bytes);
+        assert_eq!(kind.decode(&img, site), Some(target));
+    }
+    // Each kind rejects the other's bytes: they differ only in hw2 bit 14.
+    let bl = BranchKind::Bl.encode(site, target).unwrap();
+    img[site..site + 4].copy_from_slice(&bl);
+    assert_eq!(BranchKind::BWide.decode(&img, site), None);
+    // Out of range is refused, not truncated.
+    assert_eq!(BranchKind::Bl.encode(0, 0x0200_0000), None);
+    assert_eq!(BranchKind::BWide.encode(0, 0x0200_0000), None);
+}
+
+#[test]
+fn install_branch_writes_and_verifies_both_kinds() {
+    let mut img = vec![0u8; 0x4000];
+    for (site, kind) in [(0x100usize, BranchKind::Bl), (0x200, BranchKind::BWide)] {
+        // Thumb bit set on the way in: masked off before encoding, so this is
+        // the same request as the even address.
+        install_branch(&mut img, site, kind, 0x1001).expect("in range");
+        assert_eq!(kind.decode(&img, site), Some(0x1000));
+        assert!(verify_branch(&img, site, kind, 0x1000).is_ok());
+        assert!(verify_branch(&img, site, kind, 0x1001).is_ok()); // bit 0 ignored
+                                                                  // Re-installing the same detour is idempotent.
+        install_branch(&mut img, site, kind, 0x1000).expect("still in range");
+        assert!(verify_branch(&img, site, kind, 0x1000).is_ok());
+    }
+}
+
+#[test]
+fn verify_branch_reports_a_wrong_target_a_wrong_kind_and_no_branch_at_all() {
+    let mut img = vec![0u8; 0x4000];
+    let site = 0x100usize;
+    install_branch(&mut img, site, BranchKind::Bl, 0x1000).expect("in range");
+
+    // Right kind, wrong target: `found` names what is actually there.
+    let err = verify_branch(&img, site, BranchKind::Bl, 0x2000).unwrap_err();
+    assert_eq!(
+        err,
+        InstallMismatch {
+            site,
+            kind: BranchKind::Bl,
+            expected: 0x2000,
+            found: Some(0x1000),
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "bl at 0x100: expected target 0x00002000, found 0x00001000"
+    );
+    // `expected` is stored masked, so the Thumb-bit form gives the same error.
+    assert_eq!(
+        verify_branch(&img, site, BranchKind::Bl, 0x2001).unwrap_err(),
+        err
+    );
+
+    // Wrong kind at a real branch, and bytes that are no branch at all: both
+    // are `found: None`.
+    let err = verify_branch(&img, site, BranchKind::BWide, 0x1000).unwrap_err();
+    assert_eq!(err.found, None);
+    assert_eq!(
+        err.to_string(),
+        "b.w at 0x100: expected target 0x00001000, but no b.w decodes there"
+    );
+    let err = verify_branch(&img, 0x800, BranchKind::Bl, 0x1000).unwrap_err();
+    assert_eq!(err.found, None);
+    // `Error` is implemented, so this composes with any error framework.
+    let dynamic: &dyn std::error::Error = &err;
+    assert!(dynamic.to_string().contains("no bl decodes there"));
+    assert!(dynamic.source().is_none());
+}
+
+#[test]
+fn install_branch_writes_nothing_when_it_cannot_encode() {
+    // Out of range for BL (> 16 MiB): nothing is written and the error carries
+    // `found: None`.
+    let mut img = vec![0u8; 0x100];
+    let before = img.clone();
+    let err = install_branch(&mut img, 0x10, BranchKind::Bl, 0x0200_0000).unwrap_err();
+    assert_eq!(err.found, None);
+    assert_eq!(err.expected, 0x0200_0000);
+    assert_eq!(img, before, "a failed install must not touch the image");
+
+    // Site too close to the end of the image for four bytes of branch.
+    let mut small = vec![0u8; 6];
+    let err = install_branch(&mut small, 4, BranchKind::BWide, 0x0).unwrap_err();
+    assert_eq!(err.found, None);
+    assert_eq!(err.site, 4);
+    assert_eq!(small, vec![0u8; 6]);
+    // Exactly four bytes of room is enough — the bound is `site + 4 <= len`.
+    let mut exact = vec![0u8; 8];
+    install_branch(&mut exact, 4, BranchKind::BWide, 0x8).expect("fits exactly");
+    assert_eq!(decode_b_wide(&exact, 4), Some(0x8));
+}
+
+#[test]
+fn crate_result_alias_defaults_to_asm_error() {
+    fn build() -> Result<Vec<u8>> {
+        let mut a = Asm::new();
+        a.mov_reg(0, 8); // high register: only MOV (register) T1 can do this
+        a.finish()
+    }
+    // `finish` pads the code to the pool's 4-byte alignment, hence the tail.
+    assert_eq!(build().unwrap(), vec![0x40, 0x46, 0x00, 0x00]);
+
+    // The second parameter is still free.
+    fn check(img: &[u8]) -> Result<(), InstallMismatch> {
+        verify_branch(img, 0, BranchKind::Bl, 0x10)
+    }
+    assert!(check(&[0u8; 8]).is_err());
+}
+
+#[test]
+fn mov_reg_reaches_the_high_registers_and_preserves_the_flag_setting_alias() {
+    let mut a = Asm::new();
+    a.mov_reg(0, 8); // mov r0, r8  — rm's bit 3 rides in the 4-bit Rm field
+    a.mov_reg(9, 1); // mov r9, r1  — rd's bit 3 is the D bit
+    a.mov_reg(15, 14); // mov pc, lr — a branch, but architecturally a MOV
+    a.movs_reg(1, 2); // movs r1, r2
+    a.lsls_imm(1, 2, 0); // the A5-2 footnote alias of the line above
+    let code = a.finish().expect("no fixups");
+    let hw = |i: usize| u16::from_le_bytes([code[i * 2], code[i * 2 + 1]]);
+    assert_eq!(hw(0), 0x4600 | (8 << 3)); // 0x4640
+    assert_eq!(hw(1), 0x4600 | (1 << 7) | (1 << 3) | 1); // 0x4689
+    assert_eq!(hw(2), 0x4600 | (1 << 7) | (14 << 3) | 7); // 0x46F7
+    assert_eq!(hw(3), (2 << 3) | 1); // 0x0011
+    assert_eq!(hw(3), hw(4), "lsls #0 IS movs (A5-2 footnote a)");
+    // The old 0.1.0 lowering (`adds rd, rm, #0`, 0x1C00 class) is gone.
+    assert_eq!(hw(0) & 0xFE00, 0x4600);
+    assert_ne!(hw(0) & 0xFE00, 0x1C00);
+}
+
+#[test]
+fn cond_bits_roundtrip_suffixes_and_inversions() {
+    // `Cond` is part of this crate's public surface (re-exported for
+    // `decode_b_cond`/`encode_b_cond`), so exercise the whole table.
+    let all = [
+        (0b0000u8, Cond::Eq, "eq", Cond::Ne),
+        (0b0001, Cond::Ne, "ne", Cond::Eq),
+        (0b0010, Cond::Hs, "hs", Cond::Lo),
+        (0b0011, Cond::Lo, "lo", Cond::Hs),
+        (0b0100, Cond::Mi, "mi", Cond::Pl),
+        (0b0101, Cond::Pl, "pl", Cond::Mi),
+        (0b0110, Cond::Vs, "vs", Cond::Vc),
+        (0b0111, Cond::Vc, "vc", Cond::Vs),
+        (0b1000, Cond::Hi, "hi", Cond::Ls),
+        (0b1001, Cond::Ls, "ls", Cond::Hi),
+        (0b1010, Cond::Ge, "ge", Cond::Lt),
+        (0b1011, Cond::Lt, "lt", Cond::Ge),
+        (0b1100, Cond::Gt, "gt", Cond::Le),
+        (0b1101, Cond::Le, "le", Cond::Gt),
+        (0b1110, Cond::Al, "", Cond::Al),
+    ];
+    for &(bits, cond, suffix, inverted) in &all {
+        assert_eq!(Cond::from_bits(bits), Some(cond), "from_bits {bits:#06b}");
+        assert_eq!(cond.bits(), bits);
+        assert_eq!(cond.suffix(), suffix);
+        assert_eq!(cond.to_string(), suffix);
+        assert_eq!(cond.invert(), inverted, "invert {suffix}");
+        assert_eq!(cond.invert().invert(), cond);
+    }
+    // `from_bits` masks to four bits, so the high bits of a byte are ignored.
+    assert_eq!(Cond::from_bits(0xF0), Some(Cond::Eq));
+    // 0b1111 is not a condition at all (SVC in the 16-bit space, reserved in
+    // the 32-bit one), so there is no fifteenth variant to invent.
+    assert_eq!(Cond::from_bits(0b1111), None);
+    assert_eq!(Cond::from_bits(0xFF), None);
+}
+
+/// The `try_read_*` family exists so a scan can walk to the end of an image
+/// without the caller hand-rolling the bound. An offset near `usize::MAX`
+/// used to overflow the `at + n` *before* `get` saw it: a panic in debug, and
+/// in release a wrapped range that can land back in bounds and hand back the
+/// wrong bytes. The value is not hypothetical — a handler pointer read out of
+/// erased flash is `0xFFFF_FFFF`, and masked to even that is `0xFFFF_FFFE`,
+/// which is precisely the offset that overflows on a 32-bit target.
+#[test]
+fn try_reads_refuse_an_offset_that_would_overflow_rather_than_panicking() {
+    let img = [0xAAu8; 8];
+    for at in [usize::MAX, usize::MAX - 1, usize::MAX - 3] {
+        assert_eq!(try_read_u8(&img, at), None, "u8 at {at:#x}");
+        assert_eq!(try_read_u16(&img, at), None, "u16 at {at:#x}");
+        assert_eq!(try_read_u32(&img, at), None, "u32 at {at:#x}");
+    }
+    // The in-bounds answers are unchanged.
+    assert_eq!(try_read_u16(&img, 6), Some(0xAAAA));
+    assert_eq!(try_read_u32(&img, 4), Some(0xAAAA_AAAA));
+    assert_eq!(try_read_u32(&img, 5), None);
+}
+
+/// `len` is the caller's number, not the image's, so the free-space scan has to
+/// survive one large enough to overflow the end-of-window calculation. The
+/// honest answer is "no run that big exists", not a panic and not a wrapped
+/// range that appears to fit.
+#[test]
+fn free_space_refuses_a_length_that_would_overflow_the_window() {
+    let img = [0xFFu8; 8];
+    assert_eq!(find_free_space(&img, usize::MAX, 1, 1), None);
+    assert_eq!(find_free_space(&img, usize::MAX, 1, 0), None);
+    assert_eq!(find_free_space(&img, usize::MAX - 1, 4, 4), None);
+    // The ordinary answers are unchanged.
+    assert_eq!(find_free_space(&img, 8, 1, 0), Some(0));
+    assert_eq!(find_free_space(&img, 4, 4, 1), Some(4));
+}
+
+/// `decode_bl` and `decode_b_wide` take an offset a caller may have derived from
+/// image content — a pointer read out of erased flash is `0xFFFF_FFFF` — so the
+/// end-of-read calculation must not wrap. Answering `None` is right; panicking
+/// in debug, or in release reading four bytes from a wrapped offset that happens
+/// to land back in bounds, is not.
+#[test]
+fn branch_decoders_refuse_an_offset_that_would_overflow() {
+    let img = [0u8; 8];
+    for at in [usize::MAX, usize::MAX - 3] {
+        assert_eq!(decode_bl(&img, at), None, "decode_bl at {at:#x}");
+        assert_eq!(decode_b_wide(&img, at), None, "decode_b_wide at {at:#x}");
+    }
+    // A real `bl` at a sane offset still decodes, so the guard has not eaten it.
+    let mut img = vec![0u8; 8];
+    img[0..4].copy_from_slice(&encode_bl(0, 0x40).unwrap());
+    assert_eq!(decode_bl(&img, 0), Some(0x40));
+}
+
+// ---------------------------------------------------------------------------
+// Asm operand validation.
+//
+// Every emitter ORs its arguments into a fixed encoding. Before this was
+// checked, an out-of-range operand did not fail — it overflowed its field and
+// silently assembled to a *different instruction*. `push(0x4000)` produced
+// `0xF400`, which is not a push at all but the first halfword of a 32-bit
+// instruction, so the two following bytes got swallowed as its second halfword
+// and every subsequent instruction decoded from the wrong offset.
+//
+// The contract is: bad operands are reported by `finish()`, never encoded.
+// ---------------------------------------------------------------------------
+
+/// Assemble one instruction with a deliberately bad operand and return the
+/// error `finish` gives back.
+fn rejected(build: impl FnOnce(&mut Asm)) -> String {
+    let mut a = Asm::new();
+    build(&mut a);
+    match a.finish() {
+        Ok(bytes) => panic!("expected rejection, assembled {bytes:02x?}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Assemble and require success, returning just the instruction stream.
+/// `finish` pads to 4 bytes for the literal pool, so a lone halfword comes
+/// back with two zero bytes after it; the tests below are about the encoding.
+fn accepted(build: impl FnOnce(&mut Asm)) -> Vec<u8> {
+    let mut a = Asm::new();
+    build(&mut a);
+    a.finish().expect("expected this to assemble")
+}
+
+/// `accepted`, narrowed to the single halfword the emitter produced.
+fn accepted_hw(build: impl FnOnce(&mut Asm)) -> [u8; 2] {
+    let b = accepted(build);
+    [b[0], b[1]]
+}
+
+#[test]
+fn push_with_a_reglist_that_overflows_its_field_is_rejected_not_encoded() {
+    // The regression case. 0xB400 | 0x4000 == 0xF400: hw1[15:11] == 0b11110,
+    // which is a 32-bit prefix, so this desynchronises the whole stream.
+    let e = rejected(|a| a.push(0x4000));
+    assert!(e.contains("push"), "{e}");
+    assert!(e.contains("outside R0-R7"), "{e}");
+
+    // And the legitimate forms still work, at the values the doc now cites.
+    assert_eq!(accepted_hw(|a| a.push(0x0100)), 0xB500u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| a.push(0x0103)), 0xB503u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| a.pop(0x0100)), 0xBD00u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| a.pop(0x0103)), 0xBD03u16.to_le_bytes());
+}
+
+#[test]
+fn an_empty_push_or_pop_list_is_unpredictable_and_refused() {
+    assert!(rejected(|a| a.push(0)).contains("empty"));
+    assert!(rejected(|a| a.pop(0)).contains("empty"));
+}
+
+#[test]
+fn every_low_register_operand_rejects_a_high_register() {
+    // One case per emitter per low-register field. r8 is the first value that
+    // does not fit a 3-bit field.
+    /// Emitter name paired with a call that gives one of its low-register
+    /// fields a high register.
+    type Case = (&'static str, fn(&mut Asm));
+    let cases: Vec<Case> = vec![
+        ("ldr_lit", |a| a.ldr_lit(8, 0xDEAD)),
+        ("ldrb_imm", |a| a.ldrb_imm(8, 0, 0)),
+        ("ldrb_imm", |a| a.ldrb_imm(0, 8, 0)),
+        ("ldr_imm", |a| a.ldr_imm(8, 0, 0)),
+        ("ldr_imm", |a| a.ldr_imm(0, 8, 0)),
+        ("strh_imm", |a| a.strh_imm(8, 0, 0)),
+        ("strh_imm", |a| a.strh_imm(0, 8, 0)),
+        ("str_imm", |a| a.str_imm(8, 0, 0)),
+        ("str_imm", |a| a.str_imm(0, 8, 0)),
+        ("bics", |a| a.bics(8, 0)),
+        ("bics", |a| a.bics(0, 8)),
+        ("orrs", |a| a.orrs(8, 0)),
+        ("orrs", |a| a.orrs(0, 8)),
+        ("strb_imm", |a| a.strb_imm(8, 0, 0)),
+        ("strb_imm", |a| a.strb_imm(0, 8, 0)),
+        ("cmp_imm", |a| a.cmp_imm(8, 0)),
+        ("cmp_reg", |a| a.cmp_reg(8, 0)),
+        ("cmp_reg", |a| a.cmp_reg(0, 8)),
+        ("movs_imm", |a| a.movs_imm(8, 0)),
+        ("ldrb_reg", |a| a.ldrb_reg(8, 0, 0)),
+        ("ldrb_reg", |a| a.ldrb_reg(0, 8, 0)),
+        ("ldrb_reg", |a| a.ldrb_reg(0, 0, 8)),
+        ("adds_imm", |a| a.adds_imm(8, 0)),
+        ("subs_imm", |a| a.subs_imm(8, 0)),
+        ("lsls_imm", |a| a.lsls_imm(8, 0, 0)),
+        ("lsls_imm", |a| a.lsls_imm(0, 8, 0)),
+        ("lsrs_imm", |a| a.lsrs_imm(8, 0, 1)),
+        ("lsrs_imm", |a| a.lsrs_imm(0, 8, 1)),
+        ("adds_reg", |a| a.adds_reg(8, 0, 0)),
+        ("adds_reg", |a| a.adds_reg(0, 8, 0)),
+        ("adds_reg", |a| a.adds_reg(0, 0, 8)),
+        ("movs_reg", |a| a.movs_reg(8, 0)),
+        ("movs_reg", |a| a.movs_reg(0, 8)),
+        ("adr", |a| a.adr(8, 0)),
+    ];
+    for (name, build) in cases {
+        let e = rejected(build);
+        assert!(
+            e.starts_with(name) && e.contains("low register"),
+            "{name}: unhelpful or missing rejection: {e}"
+        );
+    }
+}
+
+#[test]
+fn immediate_fields_reject_oversized_and_unaligned_values() {
+    // (emitter, just-past-the-maximum, misaligned-but-in-range)
+    assert!(rejected(|a| a.ldrb_imm(0, 1, 32)).contains("exceeds maximum 31"));
+    assert!(rejected(|a| a.strb_imm(0, 1, 32)).contains("exceeds maximum 31"));
+    assert!(rejected(|a| a.lsls_imm(0, 1, 32)).contains("exceeds maximum 31"));
+    assert!(rejected(|a| a.lsrs_imm(0, 1, 32)).contains("exceeds maximum 31"));
+
+    assert!(rejected(|a| a.ldr_imm(0, 1, 128)).contains("exceeds maximum 124"));
+    assert!(rejected(|a| a.ldr_imm(0, 1, 2)).contains("multiple of 4"));
+    assert!(rejected(|a| a.str_imm(0, 1, 128)).contains("exceeds maximum 124"));
+    assert!(rejected(|a| a.str_imm(0, 1, 2)).contains("multiple of 4"));
+
+    assert!(rejected(|a| a.strh_imm(0, 1, 64)).contains("exceeds maximum 62"));
+    assert!(rejected(|a| a.strh_imm(0, 1, 1)).contains("multiple of 2"));
+
+    // The maxima themselves are accepted.
+    accepted(|a| a.ldrb_imm(0, 1, 31));
+    accepted(|a| a.ldr_imm(0, 1, 124));
+    accepted(|a| a.str_imm(0, 1, 124));
+    accepted(|a| a.strh_imm(0, 1, 62));
+    accepted(|a| a.lsls_imm(0, 1, 31));
+    // lsrs #0 is legal and means #32 (DecodeImmShift), so it is not rejected.
+    accepted(|a| a.lsrs_imm(0, 1, 0));
+}
+
+#[test]
+fn full_width_register_operands_reject_only_values_above_r15() {
+    for r in 0..=15u16 {
+        accepted(|a| a.bx(r));
+        accepted(|a| a.mov_reg(r, 0));
+        accepted(|a| a.mov_reg(0, r));
+        if r != 15 {
+            accepted(|a| a.blx(r));
+        }
+    }
+    assert!(rejected(|a| a.bx(16)).contains("R0-R15"));
+    assert!(rejected(|a| a.blx(16)).contains("R0-R15"));
+    assert!(rejected(|a| a.mov_reg(16, 0)).contains("R0-R15"));
+    assert!(rejected(|a| a.mov_reg(0, 16)).contains("R0-R15"));
+    // blx pc is encodable but UNPREDICTABLE, so it is refused by name.
+    assert!(rejected(|a| a.blx(15)).contains("UNPREDICTABLE"));
+}
+
+#[test]
+fn binding_a_label_that_was_never_reserved_is_an_error_not_a_panic() {
+    let e = rejected(|a| {
+        a.bind(7);
+        a.movs_imm(0, 1);
+    });
+    assert!(e.contains("never reserved"), "{e}");
+}
+
+#[test]
+fn the_first_bad_operand_is_the_one_reported() {
+    // A later failure must not displace the one the caller has to fix.
+    let e = rejected(|a| {
+        a.movs_imm(0, 1);
+        a.push(0x4000);
+        a.bx(16);
+    });
+    assert!(e.starts_with("push"), "{e}");
+}
+
+#[test]
+fn a_rejected_operand_never_reaches_the_output() {
+    // The bytes are unobservable through the public API once finish() errors,
+    // which is the point: there is no path that yields the corrupt encoding.
+    let mut a = Asm::new();
+    a.movs_imm(0, 1);
+    a.ldrb_imm(0, 0, 99); // bad
+    assert!(a.finish().is_err());
+}
+
+#[test]
+fn raw16_stays_raw() {
+    // The documented escape hatch: raw16 is the one emitter that promises
+    // nothing, so it must keep accepting any halfword including 0xF400.
+    assert_eq!(accepted_hw(|a| a.raw16(0xF400)), 0xF400u16.to_le_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Asm emitters, checked against the decoder rather than against themselves.
+//
+// Every emitter is a single OR of shifted fields, and a test that recomputes
+// that same expression cannot see a mistake in it — that is precisely how a
+// `Rd << 12` where the manual says `<< 8` survived fourteen tests at 100%
+// coverage elsewhere in this crate. Mutation testing put a number on the gap:
+// 80 surviving mutants in `Asm`, including `<<` flipped to `>>` in `ldr_lit`,
+// `cmp_imm` and `adr` — which drops the register field entirely and silently
+// assembles against `r0`.
+//
+// So the oracle here is the *decoder*, which is corroborated byte-for-byte
+// against LLVM by the conformance suite and shares no code with the emitters.
+// Assemble, decode, and require the instruction that comes back to be the one
+// the call asked for. Operands are chosen so no two fields hold the same
+// value: a test using `r1, r1` cannot tell two swapped register fields apart.
+// ---------------------------------------------------------------------------
+
+/// Assemble one instruction and disassemble the result.
+fn round_trip(build: impl FnOnce(&mut Asm)) -> String {
+    let mut a = Asm::new();
+    build(&mut a);
+    let bytes = a.finish().expect("should assemble");
+    crate::isa::decode_at_with(&bytes, 0, 0, false)
+        .expect("emitted bytes should decode")
+        .to_string()
+}
+
+#[test]
+fn every_emitter_assembles_to_the_instruction_its_name_promises() {
+    type Case = (fn(&mut Asm), &'static str);
+    let cases: Vec<Case> = vec![
+        (|a| a.ldrb_imm(1, 2, 5), "ldrb r1, [r2, #5]"),
+        (|a| a.ldr_imm(1, 2, 8), "ldr r1, [r2, #8]"),
+        (|a| a.strh_imm(1, 2, 6), "strh r1, [r2, #6]"),
+        (|a| a.str_imm(1, 2, 8), "str r1, [r2, #8]"),
+        (|a| a.bics(1, 2), "bics r1, r2"),
+        (|a| a.orrs(1, 2), "orrs r1, r2"),
+        (|a| a.strb_imm(1, 2, 5), "strb r1, [r2, #5]"),
+        (|a| a.cmp_imm(1, 7), "cmp r1, #7"),
+        (|a| a.cmp_reg(1, 2), "cmp r1, r2"),
+        (|a| a.movs_imm(1, 7), "movs r1, #7"),
+        (|a| a.push(0x105), "push {r0, r2, lr}"),
+        (|a| a.pop(0x105), "pop {r0, r2, pc}"),
+        (|a| a.blx(3), "blx r3"),
+        (|a| a.bx(3), "bx r3"),
+        (|a| a.ldrb_reg(1, 2, 3), "ldrb r1, [r2, r3]"),
+        (|a| a.adds_imm(1, 7), "adds r1, #7"),
+        (|a| a.subs_imm(1, 7), "subs r1, #7"),
+        (|a| a.lsls_imm(1, 2, 3), "lsls r1, r2, #3"),
+        (|a| a.lsrs_imm(1, 2, 3), "lsrs r1, r2, #3"),
+        (|a| a.adds_reg(1, 2, 3), "adds r1, r2, r3"),
+        (|a| a.mov_reg(9, 3), "mov r9, r3"),
+        (|a| a.movs_reg(1, 2), "movs r1, r2"),
+    ];
+    for (build, want) in cases {
+        assert_eq!(round_trip(build), want);
+    }
+}
+
+#[test]
+fn the_register_field_of_every_emitter_that_has_one_is_actually_read() {
+    // Sweeping the register across its whole range is what distinguishes a
+    // real shift from a dropped one: `rt >> 8` and `rt << 8` agree only at
+    // `rt == 0`, so a single-register test would pass either way.
+    for r in 0..8u16 {
+        assert_eq!(
+            round_trip(|a| a.ldr_lit(r, 0xDEAD_BEEF)),
+            format!("ldr r{r}, [pc, #0], 0x4")
+        );
+        assert_eq!(round_trip(|a| a.cmp_imm(r, 7)), format!("cmp r{r}, #7"));
+        assert_eq!(round_trip(|a| a.movs_imm(r, 7)), format!("movs r{r}, #7"));
+        assert_eq!(round_trip(|a| a.adds_imm(r, 7)), format!("adds r{r}, #7"));
+        assert_eq!(round_trip(|a| a.subs_imm(r, 7)), format!("subs r{r}, #7"));
+        assert_eq!(round_trip(|a| a.bx(r)), format!("bx r{r}"));
+        assert_eq!(
+            round_trip(|a| a.movs_reg(r, 7 - r)),
+            format!("movs r{r}, r{}", 7 - r)
+        );
+    }
+    // r13/r14/r15 print as `sp`/`lr`/`pc`, which is what UAL calls them.
+    for r in 0..16u16 {
+        let name = match r {
+            13 => "sp".to_string(),
+            14 => "lr".to_string(),
+            15 => "pc".to_string(),
+            n => format!("r{n}"),
+        };
+        assert_eq!(round_trip(|a| a.mov_reg(r, 3)), format!("mov {name}, r3"));
+    }
+}
+
+#[test]
+fn the_literal_pool_and_data_blobs_land_where_the_instruction_points() {
+    // `ldr_lit` is patched at `finish`, so the displacement is computed from
+    // the final layout rather than emitted up front. The pool word itself is
+    // checked, not just the instruction: a correct `ldr` pointing at the wrong
+    // word is the failure mode that matters.
+    let mut a = Asm::new();
+    a.ldr_lit(3, 0xDEAD_BEEF);
+    let bytes = a.finish().unwrap();
+    assert_eq!(bytes, vec![0x00, 0x4B, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE]);
+    assert_eq!(
+        crate::isa::decode_at_with(&bytes, 0, 0, false)
+            .unwrap()
+            .to_string(),
+        "ldr r3, [pc, #0], 0x4"
+    );
+
+    // Two references to the same value share one pool word, in first-reference
+    // order, and both `ldr`s resolve to it.
+    let mut a = Asm::new();
+    a.ldr_lit(0, 0x1111_2222);
+    a.ldr_lit(1, 0x1111_2222);
+    let bytes = a.finish().unwrap();
+    assert_eq!(&bytes[4..], &[0x22, 0x22, 0x11, 0x11], "one word, not two");
+
+    let mut a = Asm::new();
+    let blob = a.data_blob(vec![1, 2, 3, 4]);
+    a.adr(5, blob);
+    let bytes = a.finish().unwrap();
+    assert_eq!(bytes, vec![0x00, 0xA5, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(
+        crate::isa::decode_at_with(&bytes, 0, 0, false)
+            .unwrap()
+            .to_string(),
+        "adr r5, 0x4"
+    );
+}
+
+#[test]
+fn a_bound_label_resolves_to_the_offset_it_was_bound_at() {
+    let mut a = Asm::new();
+    let l = a.label();
+    a.beq(l);
+    a.movs_imm(0, 1);
+    a.bind(l);
+    a.bx(14);
+    let bytes = a.finish().unwrap();
+    assert_eq!(bytes, vec![0x00, 0xD0, 0x01, 0x20, 0x70, 0x47, 0x00, 0x00]);
+    assert_eq!(
+        crate::isa::decode_at_with(&bytes, 0, 0, false)
+            .unwrap()
+            .to_string(),
+        "beq 0x4"
+    );
+    assert_eq!(
+        crate::isa::decode_at_with(&bytes, 4, 4, false)
+            .unwrap()
+            .to_string(),
+        "bx lr"
+    );
+}

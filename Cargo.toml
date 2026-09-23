@@ -1,0 +1,26 @@
+[package]
+name = "thumb-asm"
+version = "0.10.0"
+edition = "2021"
+# 1.56 is the edition-2021 floor. The only other thing this crate's source needs is inline
+# format-string captures (`format!("{x}")`), stabilised in 1.58.0 — used throughout the test
+# suite and in the error type's `Display` impl. Nothing else here (range `.contains()`,
+# `u32::from/to_le_bytes`, `std::mem::take`, `BTreeSet`) needs anything newer than 1.35.
+# Verified by building and testing with `+1.58.1` locally; see CI's msrv job for the standing check.
+rust-version = "1.58"
+authors = ["Matthew Jackson <dev4@getbusbar.com>"]
+description = "An ARM Thumb/Thumb-2 decoder, disassembler, assembler and detour installer in pure safe Rust. Decodes and re-encodes the instruction set against Arm's own architecture reference manuals, relocates instructions, and installs trampolines over live code in a firmware image."
+license = "MIT"
+repository = "https://github.com/MattJackson/thumb-asm"
+homepage = "https://github.com/MattJackson/thumb-asm"
+documentation = "https://docs.rs/thumb-asm"
+readme = "README.md"
+keywords = ["arm", "thumb", "disassembler", "firmware", "reverse-engineering"]
+categories = ["embedded", "development-tools", "parsing"]
+# `spec/` holds Arm's own reference manuals (DDI 0100/0403/0406/0419) and text
+# dumps of them, kept in-tree so every encoding claim in `src/lib.rs` is
+# checkable against its source. They are Arm's copyright, ~35 MB, and no use to
+# a downstream build — so they stay out of the published .crate.
+exclude = ["spec/", ".github/", "mutants.out/", "mutants.out.old/"]
+
+[dependencies]

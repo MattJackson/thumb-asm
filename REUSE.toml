@@ -1,0 +1,134 @@
+version = 1
+
+# REUSE (https://reuse.software) licensing declarations for thumb-asm.
+#
+# REUSE's rule is that *every* file must say who owns it and under what terms.
+# Most projects satisfy that with an SPDX header in each source file; this one
+# cannot, for two separate reasons, so the declarations live here instead:
+#
+#   1. Files that have nowhere to put a comment — a lockfile, `.gitignore`, a
+#      TOML manifest whose comments are already load-bearing documentation, and
+#      above all the PDFs in `spec/`, which are binaries.
+#   2. Files that are not ours to annotate. See the `spec/` block at the bottom:
+#      four Arm architecture reference manuals and the text dumps taken from
+#      them. Writing an SPDX header into those would be asserting authorship of
+#      someone else's specification.
+#
+# `precedence` is the key that decides who wins when a file also has an inline
+# header. It is set deliberately per block and the reasoning is with each one.
+
+# ---------------------------------------------------------------------------
+# Manifests, tool configuration and prose. All first-party, all MIT, none of
+# them a good home for a licence header: a comment at the top of Cargo.toml or
+# README.md is read by humans first and a legal boilerplate block there costs
+# more attention than it earns. `Cargo.lock` is listed although `.gitignore`
+# excludes it (this is a zero-dependency library, so no lockfile is committed);
+# the entry means that if a future binary target makes committing one correct,
+# it is already covered rather than silently non-compliant.
+# ---------------------------------------------------------------------------
+[[annotations]]
+path = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "clippy.toml",
+    "rustfmt.toml",
+    ".gitignore",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Matthew Jackson <dev4@getbusbar.com>"
+SPDX-License-Identifier = "MIT"
+
+# ---------------------------------------------------------------------------
+# CI configuration. The workflows are already densely commented with *why* each
+# gate exists; a licence header at the top would push that explanation below the
+# fold, which is the wrong trade for a file whose first paragraph is the part
+# people actually need to read.
+# ---------------------------------------------------------------------------
+[[annotations]]
+path = [".github/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Matthew Jackson <dev4@getbusbar.com>"
+SPDX-License-Identifier = "MIT"
+
+# ---------------------------------------------------------------------------
+# The crate itself.
+#
+# `precedence = "closest"` (REUSE's default, stated explicitly because it is a
+# decision rather than an accident) means "an inline header in the file wins;
+# fall back to this when there isn't one". Today there isn't one in any of
+# these files and this block is what makes them compliant. When the source
+# files do grow `// SPDX-FileCopyrightText:` / `// SPDX-License-Identifier:`
+# headers — which is the better end state, because the licence then survives a
+# file being copied out of the repository — those headers take over silently,
+# with no window in which a file is declared twice or not at all, and this
+# block can be deleted in the same commit that finishes adding them.
+# ---------------------------------------------------------------------------
+[[annotations]]
+path = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Matthew Jackson <dev4@getbusbar.com>"
+SPDX-License-Identifier = "MIT"
+
+# ---------------------------------------------------------------------------
+# `spec/`, part one: the two Markdown files there are ours.
+#
+# `README.md` describes why the manuals are in the tree and how to grep them;
+# `THUMB-ISA.md` is the coverage map, written by this project by reading those
+# manuals. Reading a specification and writing your own description of what you
+# implemented is first-party work, so these are MIT like everything else.
+# ---------------------------------------------------------------------------
+[[annotations]]
+path = [
+    "spec/README.md",
+    "spec/THUMB-ISA.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Matthew Jackson <dev4@getbusbar.com>"
+SPDX-License-Identifier = "MIT"
+
+# ---------------------------------------------------------------------------
+# `spec/`, part two: Arm's manuals. NOT OURS.
+#
+# Four Arm architecture reference manuals (DDI 0100I, DDI 0403E.e, DDI 0406C,
+# DDI 0419C) and a pypdf text dump of each, kept in-tree so that every encoding
+# claim in `src/` can be checked against the document it came from. They are
+# Arm Limited's copyright. The dumps are not a separate work — extracting the
+# text of a document does not create a new author — so they carry exactly the
+# same status as the PDFs they came from.
+#
+# The licence reference is `LicenseRef-Arm-Documentation`, which is REUSE's
+# mechanism for material whose terms are not an SPDX-listed licence.
+# `LICENSES/LicenseRef-Arm-Documentation.txt` states plainly what these files
+# are, that Arm owns them, and that no licence to them is being granted by this
+# repository. That is the honest declaration: the alternative — listing them as
+# MIT under Matthew Jackson's copyright, which is what a single repo-wide rule
+# would have produced — would be a false claim over a third party's
+# specification, and would also be self-defeating, since it would tell a
+# downstream reader they may relicense Arm's manuals.
+#
+# These files are excluded from the published crate by Cargo.toml's `exclude`
+# (asserted by the `package` job in qa.yml, not merely intended), so nothing
+# here reaches crates.io.
+#
+# `precedence = "aggregate"` rather than "closest": these declarations are
+# authoritative and must not be displaced by text that merely happens to be
+# inside a file. The dumps contain Arm's own copyright lines in their body —
+# true, but incomplete, and a scanner picking one of those up instead of this
+# block would leave the licence side undeclared.
+# ---------------------------------------------------------------------------
+[[annotations]]
+path = [
+    "spec/*.pdf",
+    "spec/*.txt",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Arm Limited"
+SPDX-License-Identifier = "LicenseRef-Arm-Documentation"
