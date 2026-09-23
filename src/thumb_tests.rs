@@ -1735,3 +1735,470 @@ fn classify_branch_agrees_with_verify_branch_wherever_both_have_an_opinion() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 0.11.1: scoped search, order-independent placement, the allocator, and the
+// pre-flight install check.
+// ---------------------------------------------------------------------------
+
+/// Two equal-sized holes: 4..12 and 16..24.
+fn two_equal_holes() -> Vec<u8> {
+    let mut v = vec![0x00; 4];
+    v.extend(std::iter::repeat(0xFF).take(8));
+    v.extend(std::iter::repeat(0x00).take(4));
+    v.extend(std::iter::repeat(0xFF).take(8));
+    v
+}
+
+#[test]
+fn free_space_placement_does_not_depend_on_the_order_the_regions_were_listed() {
+    // The bug this test exists for shipped in 0.11.0 and a full green gate did
+    // not see it, because nothing passed the same regions twice in different
+    // orders. Two callers with identical intent got different stub addresses.
+    let image = two_equal_holes();
+    let a = 0..12;
+    let b = 16..24;
+    for fit in [Fit::First, Fit::Largest] {
+        let forwards = find_free_space_in(&image, 4, 4, &[a.clone(), b.clone()], fit);
+        let backwards = find_free_space_in(&image, 4, 4, &[b.clone(), a.clone()], fit);
+        assert_eq!(forwards, backwards, "{fit:?} depends on region order");
+        // And "first" means lowest address, which is what the name promises.
+        assert_eq!(
+            forwards,
+            Some(4),
+            "{fit:?} should resolve to the lower hole"
+        );
+    }
+}
+
+#[test]
+fn largest_fit_still_prefers_the_bigger_hole_and_breaks_ties_downward() {
+    // 4..12 is 8 bytes; 16..32 is 16. Largest must take the second whichever
+    // order it hears about them, and First must take the first.
+    let image = two_holes();
+    let small = 0..12;
+    let big = 16..32;
+    for order in [[small.clone(), big.clone()], [big.clone(), small.clone()]] {
+        assert_eq!(
+            find_free_space_in(&image, 4, 4, &order, Fit::Largest),
+            Some(16)
+        );
+        assert_eq!(
+            find_free_space_in(&image, 4, 4, &order, Fit::First),
+            Some(4)
+        );
+    }
+}
+
+#[test]
+fn scoping_a_search_is_what_makes_an_ambiguous_signature_unique() {
+    // movs r0,#1 | bx lr | movs r0,#1 | bx lr
+    let image = [0x01, 0x20, 0x70, 0x47, 0x01, 0x20, 0x70, 0x47];
+    let movs = Needle::Bytes(&[0x01, 0x20]);
+
+    assert_eq!(
+        find_one(&image, movs),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
+    assert_eq!(find_one_in(&image, movs, 0..4), Ok(0));
+    assert_eq!(find_one_in(&image, movs, 4..8), Ok(4));
+    assert_eq!(find_one_in(&image, movs, 2..4), Err(FindError::NotFound));
+
+    // A match must lie *entirely* inside the window: one starting at 4 does
+    // not fit in a window ending at 5.
+    assert_eq!(find_in(&image, movs, 4..5), None);
+    assert_eq!(find_in(&image, movs, 4..6), Some(4));
+
+    // An empty or inverted window finds nothing rather than panicking.
+    // Built rather than written as a literal: clippy rejects `6..2` on sight,
+    // which is fair for real code and unhelpful when the reversal is the case
+    // under test.
+    let inverted = core::ops::Range { start: 6, end: 2 };
+    assert_eq!(find_in(&image, movs, 4..4), None);
+    assert_eq!(find_in(&image, movs, inverted), None);
+    // A window past the end is clipped.
+    assert_eq!(find_in(&image, movs, 4..usize::MAX), Some(4));
+    assert_eq!(find_in(&image, movs, 100..200), None);
+}
+
+#[test]
+fn a_window_does_not_move_what_counts_as_an_instruction_boundary() {
+    // The reason `find_in` takes image coordinates rather than leaving callers
+    // to slice: alignment is measured from the image origin. Starting a window
+    // at an odd offset must not make odd offsets into instruction boundaries.
+    let image = [0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF, 0x02, 0x21];
+    let straddling = Needle::Masked(&[(0xFEF7, 0xFFFF)]); // only at odd offset 3
+    assert_eq!(find_in(&image, straddling, 0..8), None);
+    assert_eq!(
+        find_in(&image, straddling, 3..8),
+        None,
+        "an odd window start is not an origin"
+    );
+
+    // And a FreeRun's alignment is likewise the image's, not the window's.
+    let mut free = vec![0x00, 0x00];
+    free.extend(std::iter::repeat(0xFF).take(8)); // free 2..10
+                                                  // 4-aligned placement inside a window starting at 2 is 4, never 2.
+    assert_eq!(
+        find_in(&free, Needle::FreeRun { len: 4, align: 4 }, 2..10),
+        Some(4)
+    );
+}
+
+#[test]
+fn the_allocator_packs_and_never_hands_back_the_same_offset_twice() {
+    let mut image = vec![0u8; 16];
+    image.extend(std::iter::repeat(0xFF).take(64)); // free 16..80
+
+    let mut space = FreeSpace::new(&image, &region(0..image.len()), 4, Straddle::Clip);
+    assert_eq!(space.remaining(), 64);
+    let a = space.alloc(12).unwrap();
+    let b = space.alloc(8).unwrap();
+    let c = space.alloc(4).unwrap();
+    assert_eq!((a, b, c), (16, 28, 36));
+    // Every allocation is 4-aligned and none overlaps its predecessor.
+    for (at, len) in [(a, 12), (b, 8)] {
+        assert_eq!(at % 4, 0);
+        assert!(at + len <= b.max(c));
+    }
+    assert_eq!(space.remaining(), 80 - 40);
+
+    // Nothing was written to the image; packing comes from the cursor, which
+    // is the whole difference from repeating a search.
+    assert!(image[16..80].iter().all(|&b| b == 0xFF));
+
+    // `remaining` accounts for runs already stepped past, not just the
+    // current one.
+    let image2 = two_holes();
+    let mut many = FreeSpace::new(&image2, &[0..12, 16..32], 4, Straddle::Clip);
+    assert_eq!(many.remaining(), 8 + 16);
+    assert_eq!(many.alloc(8), Some(4)); // consumes the whole first run
+    assert_eq!(many.remaining(), 16);
+    assert_eq!(many.alloc(8), Some(16)); // steps into the second
+    assert_eq!(many.remaining(), 8);
+
+    // An absurd request is refused rather than overflowing the offset.
+    assert_eq!(many.alloc(usize::MAX), None);
+    assert_eq!(many.remaining(), 8, "a refused allocation consumes nothing");
+
+    // Exhaustion is reported, not wrapped around.
+    let mut small = FreeSpace::new(&image, &region(0..image.len()), 4, Straddle::Clip);
+    assert_eq!(small.alloc(64), Some(16));
+    assert_eq!(small.alloc(1), None);
+    assert_eq!(small.remaining(), 0);
+}
+
+#[test]
+fn the_allocator_steps_across_runs_and_ignores_region_order() {
+    let image = two_holes(); // free 4..12 and 16..32
+    let holes = [0..12, 16..32];
+    let reversed = [16..32, 0..12];
+
+    let seq = |regions: &[core::ops::Range<usize>]| {
+        let mut sp = FreeSpace::new(&image, regions, 4, Straddle::Clip);
+        (0..4).map(|_| sp.alloc(8)).collect::<Vec<_>>()
+    };
+    // 4..12 gives one 8-byte block; 16..32 gives two.
+    assert_eq!(seq(&holes), vec![Some(4), Some(16), Some(24), None]);
+    assert_eq!(seq(&holes), seq(&reversed), "region order must not matter");
+
+    // Overlapping regions describe the same bytes once, not twice.
+    let overlapping = [0..20, 8..32];
+    assert_eq!(seq(&overlapping), vec![Some(4), Some(16), Some(24), None]);
+}
+
+#[test]
+fn straddle_reject_drops_a_run_that_continues_past_the_region() {
+    // Free 4..28. A region of 4..16 clips it; the erased bytes carry on.
+    let mut image = vec![0x00; 4];
+    image.extend(std::iter::repeat(0xFF).take(24));
+    image.extend(std::iter::repeat(0x00).take(4));
+
+    let clip = FreeSpace::new(&image, &region(4..16), 4, Straddle::Clip);
+    assert_eq!(
+        clip.runs(),
+        region(4..16),
+        "clipping offers the covered part"
+    );
+
+    let reject = FreeSpace::new(&image, &region(4..16), 4, Straddle::Reject);
+    assert!(
+        reject.runs().is_empty(),
+        "the run leaves the region, so it is not offered"
+    );
+
+    // A region that contains the whole run is fine under both.
+    for straddle in [Straddle::Clip, Straddle::Reject] {
+        let whole = FreeSpace::new(&image, &region(0..32), 4, straddle);
+        assert_eq!(whole.runs(), region(4..28), "{straddle:?}");
+    }
+
+    // Straddling off the *front* is caught too.
+    let front = FreeSpace::new(&image, &region(8..32), 4, Straddle::Reject);
+    assert!(front.runs().is_empty(), "the run starts before the region");
+    assert_eq!(
+        FreeSpace::new(&image, &region(8..32), 4, Straddle::Clip).runs(),
+        region(8..28)
+    );
+}
+
+#[test]
+fn free_space_exposes_what_it_was_built_from() {
+    let image = two_holes();
+    let sp = FreeSpace::new(&image, &region(0..image.len()), 4, Straddle::Clip);
+    assert_eq!(sp.image(), &image[..]);
+    assert_eq!(sp.runs(), [4..12, 16..32]);
+    // An empty region list allocates nothing rather than the whole image.
+    let mut none = FreeSpace::new(&image, &[], 4, Straddle::Clip);
+    assert!(none.runs().is_empty());
+    assert_eq!(none.alloc(1), None);
+    assert_eq!(none.remaining(), 0);
+    // Inverted ranges are dropped, not panicked on.
+    let backwards = core::ops::Range { start: 12, end: 4 };
+    let inverted = FreeSpace::new(&image, &[backwards], 4, Straddle::Clip);
+    assert!(inverted.runs().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "alignment must be at least 1 byte")]
+fn the_allocator_rejects_a_zero_alignment() {
+    let image = two_holes();
+    let _ = FreeSpace::new(&image, &region(0..image.len()), 0, Straddle::Clip);
+}
+
+#[test]
+fn can_install_refuses_a_site_where_four_bytes_would_cut_an_instruction() {
+    // Two 16-bit instructions: exactly four bytes, nothing cut.
+    assert!(can_install(&[0x01, 0x20, 0x02, 0x21], 0, BranchKind::Bl).is_ok());
+    // One 32-bit instruction: also exactly four.
+    assert!(can_install(&[0xFF, 0xF7, 0xFE, 0xFF], 0, BranchKind::BWide).is_ok());
+
+    // 16-bit then 32-bit: six bytes, so a four-byte branch leaves half a `bl`
+    // behind. This is the case a `width` check alone does not catch, because
+    // the *first* instruction's width is a perfectly innocent 2.
+    let split = [0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF];
+    assert_eq!(
+        can_install(&split, 0, BranchKind::Bl),
+        Err(InstallHazard::SplitsInstruction {
+            at: 2,
+            displaced: 6
+        })
+    );
+    // classify_branch alone would have said nothing alarming here.
+    assert_eq!(classify_branch(&split, 0), BranchAt::NotABranch);
+
+    // Past the end.
+    assert_eq!(
+        can_install(&[0x01, 0x20], 0, BranchKind::Bl),
+        Err(InstallHazard::OutOfBounds {
+            site: 0,
+            image_len: 2
+        })
+    );
+    assert!(matches!(
+        can_install(&[0x01, 0x20, 0x02, 0x21], usize::MAX, BranchKind::Bl),
+        Err(InstallHazard::OutOfBounds { .. })
+    ));
+
+    // Undecodable bytes are a refusal, not an assumption. `0x4500` is `CMP`
+    // (register) T2 with both registers low, which A7.7.28 calls
+    // UNPREDICTABLE and this crate therefore does not decode — found by sweep
+    // rather than guessed, because the obvious candidate `0xDE00` is `UDF` and
+    // decodes perfectly well.
+    let bad = [0x00, 0x45, 0x00, 0x45];
+    assert!(
+        isa::decode_at(&bad, 0).is_none(),
+        "the premise of this test is that these bytes do not decode"
+    );
+    assert_eq!(
+        can_install(&bad, 0, BranchKind::Bl),
+        Err(InstallHazard::NotAnInstruction { site: 0 })
+    );
+
+    // And undecodable bytes *after* a decodable first instruction are caught
+    // at the offset they are actually at, not reported against the site.
+    let late = [0x01, 0x20, 0x00, 0x45];
+    assert_eq!(
+        can_install(&late, 0, BranchKind::Bl),
+        Err(InstallHazard::NotAnInstruction { site: 2 })
+    );
+}
+
+#[test]
+fn install_hazard_says_what_went_wrong() {
+    assert!(InstallHazard::OutOfBounds {
+        site: 0x10,
+        image_len: 0x12
+    }
+    .to_string()
+    .contains("runs past the end"));
+    assert!(InstallHazard::NotAnInstruction { site: 0x10 }
+        .to_string()
+        .contains("nothing decodes"));
+    assert!(InstallHazard::SplitsInstruction {
+        at: 2,
+        displaced: 6
+    }
+    .to_string()
+    .contains("in half"));
+    fn as_err(e: InstallHazard) -> Box<dyn std::error::Error> {
+        Box::new(e)
+    }
+    assert!(!as_err(InstallHazard::NotAnInstruction { site: 0 })
+        .to_string()
+        .is_empty());
+}
+
+#[test]
+fn can_install_agrees_with_what_detour_would_displace() {
+    // `can_install` is the question `detour`'s planner already answers
+    // internally; where both have an opinion they must not differ, or one of
+    // them is telling a caller something the other contradicts.
+    let mut image = vec![0u8; 0x2000];
+    for b in image[0x1000..].iter_mut() {
+        *b = 0xFF;
+    }
+    // movs r0,#1 · bl +0  — displaces 6, so a bare branch would cut it.
+    image[0x100..0x106].copy_from_slice(&[0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF]);
+    assert!(matches!(
+        can_install(&image, 0x100, BranchKind::Bl),
+        Err(InstallHazard::SplitsInstruction { displaced: 6, .. })
+    ));
+    let d = crate::detour::tramp(&mut image, 0x100, 0x80).unwrap();
+    assert_eq!(
+        d.displaced, 6,
+        "detour relocates exactly what can_install refused to cut"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The encoding digest.
+//
+// A consumer with a byte-exact golden test or a signed image needs to know
+// when emitted bytes change. Finding out because a KAT failed — which is how
+// 0.10.0's `mov_reg` fix reached one — is finding out too late and in the
+// wrong place.
+//
+// So the emitted bytes of the whole 16-bit encoding space are hashed into one
+// number, pinned here, and published in the changelog. A consumer compares two
+// releases' digests instead of building their own corpus, and this test fails
+// the moment any encoding moves, for any instruction, including ones nobody
+// thought to write a test for.
+//
+// A failure here is NOT automatically a bug. It means: decide whether the
+// change is intended, and if it is, update the constant and add the entry to
+// `### Emitted bytes changed` in CHANGELOG.md. The point is that the decision
+// is forced, not that the bytes are frozen.
+//
+// See docs/ENCODING-STABILITY.md.
+// ---------------------------------------------------------------------------
+
+/// FNV-1a, 64-bit. Written out rather than pulled in: the crate has no
+/// dependencies and is to keep none, and a digest only has to be stable and
+/// well-mixed, not cryptographic.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Every 16-bit halfword that decodes, re-encoded, hashed in order.
+///
+/// Both directions are covered: the halfword goes in, and what `isa::encode`
+/// produces from the decoded instruction comes out. A change to either the
+/// decoder's reading or an encoder's writing moves the digest.
+fn encoding_digest() -> (u64, usize) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut decoded = 0usize;
+    for hw in 0x0000u32..=0xFFFF {
+        let hw = hw as u16;
+        if isa::insn_len(hw) != 2 {
+            continue;
+        }
+        let insn = match isa::decode_halfwords(hw, 0, 0, false) {
+            Some(i) => i,
+            None => continue,
+        };
+        decoded += 1;
+        buf.extend_from_slice(&hw.to_le_bytes());
+        match isa::encode(&insn) {
+            Some((a, b)) => {
+                buf.push(1);
+                buf.extend_from_slice(&a.to_le_bytes());
+                buf.extend_from_slice(&b.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+    }
+    (fnv1a(&buf), decoded)
+}
+
+#[test]
+fn the_emitted_encoding_corpus_has_not_moved() {
+    // Update deliberately, and say so in CHANGELOG.md under
+    // `### Emitted bytes changed`. Never update to make a red build green.
+    const DIGEST: u64 = 0x0e06_fda2_5d6b_89e8;
+    const DECODED: usize = 58_233;
+
+    let (digest, decoded) = encoding_digest();
+    assert_eq!(
+        (digest, decoded),
+        (DIGEST, DECODED),
+        "\nEmitted bytes changed.\n\
+         \x20 decoded halfwords: {decoded} (pinned {DECODED})\n\
+         \x20 digest:            {digest:#018x} (pinned {DIGEST:#018x})\n\n\
+         If that was intended, update both constants and add an entry to\n\
+         `### Emitted bytes changed` in CHANGELOG.md naming what moved.\n\
+         Consumers with golden tests or signed images read that section.\n"
+    );
+}
+
+#[test]
+fn a_masked_pattern_compares_each_halfword_at_its_own_offset() {
+    // Mutation found this: `i * 2` became `i / 2`, which compares every pair
+    // against the *first* halfword, and the existing tests still passed —
+    // because their second pair happened to also match the first halfword.
+    // A pattern whose halfwords are genuinely different is what tells them
+    // apart.
+    let image = [0x01, 0x20, 0x70, 0x47]; // movs r0,#1 · bx lr
+    let in_order = [(0x2001u16, 0xFFFFu16), (0x4770u16, 0xFFFFu16)];
+    let reversed = [(0x4770u16, 0xFFFFu16), (0x2001u16, 0xFFFFu16)];
+    assert_eq!(find(&image, Needle::Masked(&in_order), 0), Some(0));
+    assert_eq!(
+        find(&image, Needle::Masked(&reversed), 0),
+        None,
+        "the order of the halfwords in the pattern has to matter"
+    );
+}
+
+#[test]
+fn a_masked_pattern_reaches_the_last_halfword_and_no_further() {
+    // Mutation found this too: `pat.len() * 2` became `pat.len() + 2`, which
+    // agrees for the two-halfword patterns every other test uses. A
+    // one-halfword pattern matching the final instruction is what separates
+    // them — with `+`, the bound is three bytes and the last halfword becomes
+    // unreachable.
+    let image = [0x01, 0x20, 0x70, 0x47];
+    let bx_lr = [(0x4770u16, 0xFFFFu16)];
+    assert_eq!(find(&image, Needle::Masked(&bx_lr), 0), Some(2));
+
+    // And a three-halfword pattern must not read past the end: with `+` the
+    // bound would be five bytes, so this would be attempted against a
+    // four-byte image.
+    let three = [
+        (0x2001u16, 0xFFFFu16),
+        (0x4770u16, 0xFFFFu16),
+        (0x0000u16, 0x0000u16),
+    ];
+    assert_eq!(
+        find(&image, Needle::Masked(&three), 0),
+        None,
+        "six bytes of pattern cannot match in a four-byte image"
+    );
+    // Give it the sixth byte and it matches, which pins the bound at 2*len.
+    let longer = [0x01, 0x20, 0x70, 0x47, 0xAA, 0xBB];
+    assert_eq!(find(&longer, Needle::Masked(&three), 0), Some(0));
+}

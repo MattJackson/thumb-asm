@@ -137,6 +137,48 @@ pub fn find(image: &[u8], needle: Needle, start: usize) -> Option<usize> {
     }
 }
 
+/// [`find`], confined to a window of the image.
+///
+/// Scoping a search is not a convenience, it is how an otherwise-ambiguous
+/// signature becomes usable. A pattern that matches three places in a whole
+/// image may match exactly once inside the region you care about, and without
+/// a bound [`find_one`] can only be used where the pattern happens to be
+/// unique across everything — which is the case that never needed it.
+///
+/// The match must lie **entirely** within `range`: a signature half outside
+/// the window is not in the window.
+///
+/// `range` is half-open (`0x90000..0xb0000` excludes `0xb0000`) and is in
+/// **image coordinates**. That matters, and is why this exists rather than
+/// leaving callers to slice: alignment is measured from the image origin, so
+/// [`Needle::Masked`]'s halfword boundaries and [`Needle::FreeRun`]'s `align`
+/// mean the same thing inside a window as outside one. Slicing the image at an
+/// odd or unaligned offset and searching the slice silently moves that origin.
+///
+/// ```
+/// use thumb_asm::{find, find_in, Needle};
+///
+/// // The same two bytes twice; the window is what tells them apart.
+/// let image = [0x01, 0x20, 0x70, 0x47, 0x01, 0x20];
+/// assert_eq!(find(&image, Needle::Bytes(&[0x01, 0x20]), 0), Some(0));
+/// assert_eq!(find_in(&image, Needle::Bytes(&[0x01, 0x20]), 2..6), Some(4));
+///
+/// // Entirely within: a match starting at 4 does not fit in `0..5`.
+/// assert_eq!(find_in(&image, Needle::Bytes(&[0x01, 0x20]), 4..5), None);
+/// ```
+pub fn find_in(image: &[u8], needle: Needle, range: core::ops::Range<usize>) -> Option<usize> {
+    let (lo, hi) = (range.start, range.end.min(image.len()));
+    if lo >= hi {
+        return None;
+    }
+    match needle {
+        Needle::Bytes(pat) => find_bytes_in(image, pat, lo, hi),
+        Needle::Word(w) => find_bytes_in(image, &w.to_le_bytes(), lo, hi),
+        Needle::FreeRun { len, align } => find_free_run_in(image, len, align, lo, hi),
+        Needle::Masked(pat) => find_masked_in(image, pat, lo, hi),
+    }
+}
+
 /// How many bytes one occurrence of `needle` spans, for advancing past a match.
 fn needle_len(needle: Needle) -> usize {
     match needle {
@@ -206,8 +248,40 @@ impl std::error::Error for FindError {}
 /// assert_eq!(find_one(&image, Needle::Word(0x2001_2001)), Ok(0));
 /// ```
 pub fn find_one(image: &[u8], needle: Needle) -> Result<usize, FindError> {
+    find_one_in(image, needle, 0..image.len())
+}
+
+/// [`find_one`], confined to a window of the image.
+///
+/// This is the pairing that makes either function useful on real firmware.
+/// Uniqueness is a property of a signature *and a region*, not of a signature
+/// alone: scoping to the range you already know the function lives in is what
+/// turns a pattern that matches three times across the image into one that
+/// matches once where it matters. Requiring global uniqueness would restrict
+/// this to signatures strong enough not to need checking.
+///
+/// `range` is half-open and in image coordinates, with the same reasoning as
+/// [`find_in`]; matches must lie entirely inside it.
+///
+/// ```
+/// use thumb_asm::{find_one, find_one_in, FindError, Needle};
+///
+/// let image = [0x01, 0x20, 0x70, 0x47, 0x01, 0x20];
+/// let movs = Needle::Bytes(&[0x01, 0x20]);
+///
+/// // Ambiguous across the whole image...
+/// assert_eq!(find_one(&image, movs), Err(FindError::Ambiguous { count: 2, first: 0 }));
+/// // ...and unique inside the window you meant.
+/// assert_eq!(find_one_in(&image, movs, 2..6), Ok(4));
+/// ```
+pub fn find_one_in(
+    image: &[u8],
+    needle: Needle,
+    range: core::ops::Range<usize>,
+) -> Result<usize, FindError> {
     let step = needle_len(needle).max(1);
-    let first = match find(image, needle, 0) {
+    let hi = range.end.min(image.len());
+    let first = match find_in(image, needle, range.start..hi) {
         Some(p) => p,
         None => return Err(FindError::NotFound),
     };
@@ -215,7 +289,7 @@ pub fn find_one(image: &[u8], needle: Needle) -> Result<usize, FindError> {
     let mut at = first;
     while let Some(next) = at
         .checked_add(step)
-        .and_then(|from| find(image, needle, from))
+        .and_then(|from| find_in(image, needle, from..hi))
     {
         count += 1;
         at = next;
@@ -1496,6 +1570,123 @@ pub enum BranchAt {
     },
 }
 
+/// Why [`can_install`] says a site cannot take a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InstallHazard {
+    /// The four bytes do not fit: `site + 4` is past the end of the image.
+    OutOfBounds {
+        /// The site asked about.
+        site: usize,
+        /// How many bytes the image actually has.
+        image_len: usize,
+    },
+    /// Nothing at `site` decodes as an instruction, so what a branch would
+    /// overwrite is unknown. Either the offset is wrong or it is mid-
+    /// instruction — both are reasons not to write.
+    NotAnInstruction {
+        /// The site asked about.
+        site: usize,
+    },
+    /// The four bytes end in the middle of an instruction.
+    ///
+    /// This is the hazard [`classify_branch`]'s `width` hints at, stated
+    /// outright. A 16-bit instruction followed by a 32-bit one spans six
+    /// bytes, so a four-byte branch leaves the last two halves of a wide
+    /// instruction behind, to be executed as whatever they happen to encode.
+    SplitsInstruction {
+        /// Where the straddled instruction starts.
+        at: usize,
+        /// How many bytes whole instructions actually occupy from the site —
+        /// always more than 4. Displacing that many is what a detour does;
+        /// see [`crate::detour::detour`], which relocates them rather than
+        /// leaving them cut.
+        displaced: usize,
+    },
+}
+
+impl core::fmt::Display for InstallHazard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            InstallHazard::OutOfBounds { site, image_len } => write!(
+                f,
+                "a 4-byte branch at {site:#x} runs past the end of a {image_len:#x}-byte image"
+            ),
+            InstallHazard::NotAnInstruction { site } => {
+                write!(f, "nothing decodes at {site:#x}")
+            }
+            InstallHazard::SplitsInstruction { at, displaced } => write!(
+                f,
+                "a 4-byte branch at this site cuts the instruction at {at:#x} in half; \
+                 whole instructions occupy {displaced} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstallHazard {}
+
+/// Would installing a 4-byte branch here overwrite whole instructions?
+///
+/// [`classify_branch`] reports the width of what is at a site; this answers
+/// the question that width was being consulted for. Leaving callers to do the
+/// arithmetic themselves is leaving them to do the reasoning that goes wrong:
+/// every branch this crate installs is four bytes, and four bytes only land
+/// cleanly when the instructions at the site add up to exactly four.
+///
+/// The hazard is more general than "the site holds a 16-bit branch". Any
+/// 2-byte instruction followed by a 4-byte one spans six, and cutting it
+/// leaves two bytes that will be executed as whatever they encode. That is
+/// the case this catches and a `width` check alone does not.
+///
+/// `kind` is accepted so the signature reads at the call site and so a future
+/// narrow branch kind does not change it; both current kinds are four bytes,
+/// so it does not currently affect the answer.
+///
+/// An `Ok` here does **not** mean the patch is a good idea — only that it
+/// destroys whole instructions rather than half of one. Use
+/// [`crate::detour::detour`] when the displaced instructions still need to
+/// run.
+///
+/// ```
+/// use thumb_asm::{can_install, BranchKind, InstallHazard};
+///
+/// // `movs r0, #1` · `movs r1, #2` — two 16-bit instructions, exactly 4 bytes.
+/// assert!(can_install(&[0x01, 0x20, 0x02, 0x21], 0, BranchKind::Bl).is_ok());
+///
+/// // `movs r0, #1` · `bl +0` — 2 + 4 bytes. A 4-byte branch cuts the `bl`.
+/// let image = [0x01, 0x20, 0xFF, 0xF7, 0xFE, 0xFF];
+/// assert_eq!(
+///     can_install(&image, 0, BranchKind::Bl),
+///     Err(InstallHazard::SplitsInstruction { at: 2, displaced: 6 })
+/// );
+/// ```
+pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), InstallHazard> {
+    let _ = kind; // every kind this crate installs is four bytes.
+    if site.checked_add(4).map_or(true, |end| end > image.len()) {
+        return Err(InstallHazard::OutOfBounds {
+            site,
+            image_len: image.len(),
+        });
+    }
+    let mut at = site;
+    while at < site + 4 {
+        let insn = match isa::decode_at_with(image, at, at as u32, false) {
+            Some(i) => i,
+            None => return Err(InstallHazard::NotAnInstruction { site: at }),
+        };
+        let next = at + insn.len();
+        if next > site + 4 {
+            return Err(InstallHazard::SplitsInstruction {
+                at,
+                displaced: next - site,
+            });
+        }
+        at = next;
+    }
+    Ok(())
+}
+
 /// Ask what branch is already at `at`, before overwriting it.
 ///
 /// [`verify_branch`] checks an *assertion*: you say which kind and target you
@@ -1655,23 +1846,44 @@ pub fn install_branch(
 // --- internal matchers (the actual scans behind `find`) ---
 
 fn find_bytes(image: &[u8], pat: &[u8], start: usize) -> Option<usize> {
-    if pat.is_empty() || start >= image.len() {
+    find_bytes_in(image, pat, start, image.len())
+}
+
+/// `find_bytes`, bounded above: the match must lie entirely within
+/// `[start, end)`.
+fn find_bytes_in(image: &[u8], pat: &[u8], start: usize, end: usize) -> Option<usize> {
+    let end = end.min(image.len());
+    if pat.is_empty() || start >= end || pat.len() > end - start {
         return None;
     }
-    image[start..]
+    image[start..end]
         .windows(pat.len())
         .position(|w| w == pat)
         .map(|p| p + start)
 }
 
 fn find_free_run(image: &[u8], len: usize, align: usize, start: usize) -> Option<usize> {
+    find_free_run_in(image, len, align, start, image.len())
+}
+
+/// `find_free_run`, bounded above. Alignment is still measured from the image
+/// origin, not from `start` — that is the whole reason this takes a window
+/// rather than the caller slicing and searching the slice.
+fn find_free_run_in(
+    image: &[u8],
+    len: usize,
+    align: usize,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
     assert!(align != 0, "alignment must be at least 1 byte");
-    let mut p = round_up(start.min(image.len()), align);
+    let end = end.min(image.len());
+    let mut p = round_up(start.min(end), align);
     loop {
         // `checked_add`, because `len` is the caller's and may be enormous;
         // a saturated `p` fails this test too, which is why `round_up` can
         // saturate rather than report.
-        if p.checked_add(len).map_or(true, |end| end > image.len()) {
+        if p.checked_add(len).map_or(true, |stop| stop > end) {
             return None;
         }
         // Test the whole window at an aligned start, rather than finding a run
@@ -1688,6 +1900,13 @@ fn find_free_run(image: &[u8], len: usize, align: usize, start: usize) -> Option
 
 /// Halfword-aligned masked search. See [`Needle::Masked`].
 fn find_masked(image: &[u8], pat: &[(u16, u16)], start: usize) -> Option<usize> {
+    find_masked_in(image, pat, start, image.len())
+}
+
+/// `find_masked`, bounded above. Halfword alignment is measured from the image
+/// origin: a window starting at an odd offset does not shift what counts as an
+/// instruction boundary.
+fn find_masked_in(image: &[u8], pat: &[(u16, u16)], start: usize, end: usize) -> Option<usize> {
     // An empty pattern is satisfied by every position; reporting `start` would
     // be technically true and useless. See the variant's documentation.
     if pat.is_empty() {
@@ -1697,8 +1916,9 @@ fn find_masked(image: &[u8], pat: &[(u16, u16)], start: usize) -> Option<usize> 
     // its length is at most `usize::MAX / 4` and the product cannot overflow.
     // A `checked_mul` here would add an arm no input can reach.
     let need = pat.len() * 2;
-    let mut p = round_up(start.min(image.len()), 2);
-    while p.checked_add(need).map_or(false, |end| end <= image.len()) {
+    let end = end.min(image.len());
+    let mut p = round_up(start.min(end), 2);
+    while p.checked_add(need).map_or(false, |stop| stop <= end) {
         let hit = pat.iter().enumerate().all(|(i, &(value, mask))| {
             let at = p + i * 2;
             u16::from_le_bytes([image[at], image[at + 1]]) & mask == value & mask
@@ -1716,12 +1936,19 @@ fn find_masked(image: &[u8], pat: &[(u16, u16)], start: usize) -> Option<usize> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fit {
-    /// The lowest usable offset. Cheapest, and what [`find_free_space`] does.
+    /// The lowest usable offset in the image, and what [`find_free_space`]
+    /// does.
+    ///
+    /// "Lowest" means lowest *address*, not first encountered: the order the
+    /// regions are passed in does not change the answer.
     First,
     /// The usable offset inside the longest free run. Prefer this when placing
     /// several stubs: first-fit takes the first hole big enough and leaves the
     /// large one fragmented, whereas this keeps the big hole for the things
     /// that need it.
+    ///
+    /// Ties are broken on the lowest address, so this too is independent of
+    /// the order the regions are passed in.
     Largest,
 }
 
@@ -1737,8 +1964,22 @@ pub enum Fit {
 /// within the image. That is the same failure the `align` parameter exists to
 /// prevent, reintroduced one layer up.
 ///
-/// `within` is in *image* coordinates. Ranges are clipped to the image, may be
-/// given in any order, and need not be disjoint; an empty slice finds nothing.
+/// `within` is in *image* coordinates, and each range is **half-open**:
+/// `0x90000..0xb0000` includes `0x90000` and excludes `0xb0000`, as every
+/// `Range` in Rust does. `a..=b` is deliberately not accepted, so porting from
+/// an inclusive convention is a compile error rather than an off-by-one.
+///
+/// Ranges are clipped to the image, need not be disjoint, and **may be given
+/// in any order without changing the answer** — both [`Fit`] policies resolve
+/// to an address, not to whichever region was looked at first. Two callers
+/// with the same intent get the same offset, which anyone producing
+/// byte-reproducible images depends on. An empty slice finds nothing.
+///
+/// A free run that extends past a region's end is **clipped** to the region,
+/// not rejected: the offset returned is always one where `len` bytes fit
+/// entirely inside a region you named. If you need the stronger rule — refuse
+/// a run that straddles a boundary at all, because your erase granularity is
+/// coarser than your regions — use [`FreeSpace`] with [`Straddle::Reject`].
 ///
 /// # Panics
 ///
@@ -1768,6 +2009,12 @@ pub fn find_free_space_in(
     fit: Fit,
 ) -> Option<usize> {
     assert!(align != 0, "alignment must be at least 1 byte");
+    // `best` is compared, never short-circuited, so the result is a function
+    // of the regions rather than of the order they arrived in. Returning early
+    // on the first hit — which this did until 0.11.1 — makes `Fit::First`
+    // report whichever region was listed first, so the same two regions in the
+    // other order produce a different address and a byte-reproducible build
+    // stops being reproducible with nothing to show for it.
     let mut best: Option<(usize, usize)> = None; // (usable bytes, offset)
     for region in within {
         let lo = region.start.min(image.len());
@@ -1788,19 +2035,216 @@ pub fn find_free_space_in(
             // actually offer.
             let at = round_up(run_start, align);
             if at.checked_add(len).map_or(false, |end| end <= p) {
-                match fit {
-                    Fit::First => return Some(at),
-                    Fit::Largest => {
-                        let usable = p - at;
-                        if best.map_or(true, |(b, _)| usable > b) {
-                            best = Some((usable, at));
-                        }
+                let usable = p - at;
+                let better = match (fit, best) {
+                    (_, None) => true,
+                    // Lowest address wins outright.
+                    (Fit::First, Some((_, b_at))) => at < b_at,
+                    // Largest run wins; equal runs fall back to the lowest
+                    // address so the answer is still total rather than
+                    // dependent on which was seen first.
+                    (Fit::Largest, Some((b_len, b_at))) => {
+                        usable > b_len || (usable == b_len && at < b_at)
                     }
+                };
+                if better {
+                    best = Some((usable, at));
                 }
             }
         }
     }
     best.map(|(_, at)| at)
+}
+
+/// What to do with a free run that crosses out of the regions it was found in.
+///
+/// The two are different safety decisions, not two spellings of one, so this
+/// is explicit rather than defaulted in a way that suits one caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Straddle {
+    /// Truncate the run to the region. The offset handed back always has its
+    /// `len` bytes inside a region you named, so the *placement* is safe even
+    /// though the erased run it came from was not entirely covered.
+    Clip,
+    /// Do not offer a run that extends past the region at all.
+    ///
+    /// Use this when writing near a boundary is unsafe even if the bytes
+    /// written are inside it — most often because erase granularity is coarser
+    /// than the regions, so programming a page that straddles the boundary
+    /// disturbs bytes outside it. Clipping cannot protect against that,
+    /// because the hazard is the write, not the placement.
+    Reject,
+}
+
+/// An allocator over the erased space in an image.
+///
+/// [`find_free_space_in`] answers "where could this go?" once. Placing several
+/// stubs needs a different question — "where does the *next* one go?" — and
+/// repeating the search does not answer it: nothing has been written yet, so
+/// every call returns the same offset. Writing each stub before searching for
+/// the next works, but only by accident of the bytes changing, and it forces
+/// the whole layout to be interleaved with the writing.
+///
+/// This tracks what it has handed out, so allocations pack contiguously and
+/// none is ever returned twice:
+///
+/// ```
+/// use thumb_asm::{FreeSpace, Straddle};
+///
+/// let mut image = vec![0u8; 16];
+/// image.extend(std::iter::repeat(0xFF).take(64));   // free: 16..80
+///
+/// let mut space = FreeSpace::new(&image, &[0..image.len()], 4, Straddle::Clip);
+/// assert_eq!(space.alloc(12), Some(16));
+/// assert_eq!(space.alloc(8),  Some(28));   // packed, nothing written yet
+/// assert_eq!(space.alloc(4),  Some(36));
+/// ```
+///
+/// Regions are half-open, may be given in any order and may overlap: they are
+/// normalised to a sorted, merged set first, so the sequence of offsets is a
+/// function of the region *set* and not of the order they were listed in.
+/// Anyone producing byte-reproducible images depends on that.
+#[derive(Debug, Clone)]
+pub struct FreeSpace<'a> {
+    image: &'a [u8],
+    /// Usable runs, ascending and disjoint.
+    runs: Vec<core::ops::Range<usize>>,
+    align: usize,
+    /// Index into `runs` of the run being handed out of.
+    at: usize,
+    /// Next unallocated offset within `runs[at]`.
+    cursor: usize,
+}
+
+impl<'a> FreeSpace<'a> {
+    /// Collect the erased runs inside `within` that may be allocated from.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is 0, as [`find_free_space`] does.
+    pub fn new(
+        image: &'a [u8],
+        within: &[core::ops::Range<usize>],
+        align: usize,
+        straddle: Straddle,
+    ) -> Self {
+        assert!(align != 0, "alignment must be at least 1 byte");
+
+        // Normalise the regions first — sorted, clipped, and merged where they
+        // touch — so everything below is a function of the set rather than of
+        // the argument order.
+        let mut regions: Vec<core::ops::Range<usize>> = within
+            .iter()
+            .map(|r| r.start.min(image.len())..r.end.min(image.len()))
+            .filter(|r| r.start < r.end)
+            .collect();
+        regions.sort_by_key(|r| r.start);
+        let mut merged: Vec<core::ops::Range<usize>> = Vec::with_capacity(regions.len());
+        for r in regions {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+
+        let mut runs = Vec::new();
+        for region in &merged {
+            let mut p = region.start;
+            while p < region.end {
+                if image[p] != 0xFF {
+                    p += 1;
+                    continue;
+                }
+                let start = p;
+                while p < region.end && image[p] == 0xFF {
+                    p += 1;
+                }
+                // Does the erased run continue outside the region? Looking at
+                // the image rather than the region is the whole point: the run
+                // was clipped by the loop bound above, so its extent here says
+                // nothing about how far the erased bytes actually go.
+                let runs_off_the_front =
+                    start > 0 && start == region.start && image[start - 1] == 0xFF;
+                let runs_off_the_back = p < image.len() && p == region.end && image[p] == 0xFF;
+                if straddle == Straddle::Reject && (runs_off_the_front || runs_off_the_back) {
+                    continue;
+                }
+                runs.push(start..p);
+            }
+        }
+        let cursor = runs.first().map_or(0, |r| r.start);
+        FreeSpace {
+            image,
+            runs,
+            align,
+            at: 0,
+            cursor,
+        }
+    }
+
+    /// Hand out `len` bytes, aligned, from the lowest place they still fit.
+    ///
+    /// Returns the offset, or `None` when no run has room left. Successive
+    /// calls never overlap, and never revisit a run once one has been
+    /// allocated from a later one, so the sequence is monotonically
+    /// increasing.
+    ///
+    /// **A failed allocation changes nothing.** Asking for more than is left
+    /// returns `None` and leaves the allocator exactly as it was, so a caller
+    /// can ask for something smaller afterwards and still get it.
+    pub fn alloc(&mut self, len: usize) -> Option<usize> {
+        // Committed only on success. Advancing the cursor while searching
+        // would mean a request too large for what is left consumes every
+        // remaining run on its way to returning `None` — so one oversized
+        // allocation would silently destroy the capacity for all the small
+        // ones after it, and `remaining` would report zero with the bytes
+        // still there.
+        let mut at = self.at;
+        let mut cursor = self.cursor;
+        while at < self.runs.len() {
+            let run = &self.runs[at];
+            let start = round_up(cursor.max(run.start), self.align);
+            if start.checked_add(len).map_or(false, |end| end <= run.end) {
+                self.at = at;
+                self.cursor = start + len;
+                return Some(start);
+            }
+            at += 1;
+            cursor = self.runs.get(at).map_or(0, |r| r.start);
+        }
+        None
+    }
+
+    /// How many bytes remain unallocated, across every run.
+    ///
+    /// A budget check, not a promise: alignment and the shape of what is asked
+    /// for mean a caller cannot necessarily allocate all of it.
+    pub fn remaining(&self) -> usize {
+        self.runs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match i.cmp(&self.at) {
+                core::cmp::Ordering::Less => 0,
+                core::cmp::Ordering::Equal => r.end.saturating_sub(self.cursor.max(r.start)),
+                core::cmp::Ordering::Greater => r.end - r.start,
+            })
+            .sum()
+    }
+
+    /// The runs this allocator will draw from, ascending and disjoint.
+    ///
+    /// Exposed because the straddle decision is one a caller may want to audit
+    /// rather than trust: under [`Straddle::Reject`] the runs that were
+    /// dropped simply are not here.
+    pub fn runs(&self) -> &[core::ops::Range<usize>] {
+        &self.runs
+    }
+
+    /// The image this was built over.
+    pub fn image(&self) -> &'a [u8] {
+        self.image
+    }
 }
 
 /// `v` rounded up to the next multiple of `align`, saturating.

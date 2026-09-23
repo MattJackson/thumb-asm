@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-23
+
+### Emitted bytes changed
+
+No *instruction encoding* changed: the digest is unchanged from 0.11.0 —
+58,233 decoded 16-bit halfwords, `0x0e06fda25d6b89e8`.
+
+**But placement did.** The `find_free_space_in` fix below changes the address
+returned for callers who pass more than one region, so an image built through
+it can differ byte-for-byte from one built with 0.11.0 even though every
+instruction in it encodes identically. If you pin a whole image or a digest
+over one, expect a diff and check it is only the stub addresses moving.
+
+That is not an instruction-encoding change and the digest cannot see it, which
+is worth being explicit about rather than letting "digest unchanged" be read as
+"your image is unchanged".
+
+This section is now a fixed heading that appears in every release, empty or
+not, so a consumer with a byte-exact golden test can grep for it rather than
+read for it. See `docs/ENCODING-STABILITY.md`, which exists because 0.10.0's
+`mov_reg` fix moved 21 bytes in a consumer's image and they discovered it when
+their known-answer test failed rather than from the release notes. The fix was
+correct; announcing it only in prose was not.
+
+### Fixed
+
+- **`find_free_space_in` returned a different address depending on the order
+  the regions were passed.** `Fit::First` returned whichever region was listed
+  first rather than the lowest address, despite the name, and `Fit::Largest`
+  broke ties the same way. Two callers with identical intent got different stub
+  addresses, which for anyone producing byte-reproducible images is
+  nondeterminism with nothing to show for it. Both policies now resolve to an
+  address: `First` is the lowest offset, `Largest` breaks ties on the lowest
+  offset. Reported by a consumer; it shipped in 0.11.0 through a green gate,
+  because nothing tested the same regions in two orders.
+
+### Added
+
+- **`find_in` and `find_one_in`** — search confined to a window. Scoping is not
+  ergonomics, it is how an otherwise-ambiguous signature becomes usable: a
+  pattern matching three places across an image may match once inside the
+  region you care about, and `find_one` without a bound was usable only where
+  the pattern was globally unique — the case that never needed checking. The
+  range is in **image coordinates** and matches must lie entirely inside it;
+  taking a window rather than letting callers slice is what keeps
+  `Needle::Masked`'s halfword boundaries and `Needle::FreeRun`'s alignment
+  measured from the image origin.
+
+- **`FreeSpace` and `Straddle`** — an allocator over erased space. Placing
+  several stubs is a different question from placing one, and repeating a
+  search does not answer it: nothing has been written yet, so every call
+  returns the same offset. This tracks what it has handed out, so allocations
+  pack contiguously without writing first. Regions are normalised to a sorted,
+  merged set, so the sequence of offsets depends on the region *set* and not
+  the order they were listed. `Straddle::Reject` refuses a free run that
+  continues past the regions it was found in — for callers whose erase
+  granularity is coarser than their integrity regions, where clipping does not
+  help because the hazard is the write, not the placement.
+
+- **`can_install` and `InstallHazard`** — a pre-flight check for a patch site.
+  `classify_branch` reports width; this answers the question width was being
+  consulted for, so the caller is not left doing the reasoning that goes wrong.
+  The hazard is more general than "the site holds a 16-bit branch": any 2-byte
+  instruction followed by a 4-byte one spans six, and a 4-byte branch leaves
+  two bytes to be executed as whatever they encode.
+
+- **`docs/ENCODING-STABILITY.md`** and a pinned encoding digest in the test
+  suite, so a change to emitted bytes fails the build before it reaches a
+  consumer's known-answer test.
+
+### Documentation
+
+- The half-open range convention is stated on every range-taking function.
+  `a..=b` is deliberately not accepted: a `&[Range]` whose elements were built
+  under two conventions cannot be told apart by reading it, so refusing the
+  inclusive form makes a porting error a compile error rather than an
+  off-by-one.
+
 ## [0.11.0] - 2026-09-23
 
 Four additions requested by a consumer patching firmware with this crate, each
