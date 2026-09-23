@@ -79,3 +79,88 @@ configured once by a crate owner; the exact values are in the header comment of
 crate stays dependency-free, and every encoding claim cites its Arm manual
 section (see `spec/`). New public API arrives with tests — the 100% coverage
 floor in `qa` will say so otherwise.
+
+## Coding standards
+
+The standards are short, they are stated here rather than absorbed by reading
+the code, and none of them is a matter of taste on the day — every one is
+machine-checked, on every push and every pull request, and a violation is a red
+build rather than a review comment.
+
+| Standard | Enforced by |
+| --- | --- |
+| One formatting, no debate | `cargo fmt --all --check` (`rustfmt.toml` holds the settings) |
+| No warnings, no lint escapes | `cargo clippy --all-targets --all-features -- -D warnings`, with `clippy.toml` pinning `msrv = "1.58"` so the MSRV-aware lints stay correct |
+| No `unsafe`, anywhere, ever | `#![forbid(unsafe_code)]` in `src/lib.rs` — `forbid`, so no module can opt back in |
+| Every public item documented | `#![deny(missing_docs)]`, plus `cargo doc` with `-D warnings -D rustdoc::broken_intra_doc_links` in the `qa` gate |
+| Zero dependencies | the empty `[dependencies]` table in `Cargo.toml`, and the `dependencies: 0` badge that has to stay true |
+| Every encoding claim cites its Arm manual section | review — this is the one that cannot be automated, and it is the most important one |
+
+That last row is the standard the rest exist to protect. An encoding is not
+"what LLVM does" and it is not "what made the test pass": it is a clause in
+`spec/`, named in the comment or the rustdoc beside the code that implements it.
+If you cannot write the citation, you have not finished reading — and if you are
+adding a conformance divergence, the entry in `tests/support/divergences.rs`
+has to name the clause too. A divergence with no citation is a bug, not a
+divergence.
+
+Beyond the table: comments explain *why*, not what the code does; a refusal is
+preferred to a guess, so an operand that cannot be encoded faithfully returns an
+error rather than something plausible; and nothing is allowed to fail quietly —
+there is no `continue-on-error` in any workflow, because a check that is allowed
+to fail is not a check.
+
+## Testing policy
+
+These are requirements, not aspirations.
+
+- **New functionality arrives with its tests, in the same change.** Not "in a
+  follow-up". An encoder with no test for it is not a contribution to a crate
+  whose entire value is being right about bit patterns.
+- **A bug fix starts with a failing test.** Red before green: write the test
+  that reproduces the defect, watch it fail against the unfixed code, then fix
+  it and watch it pass. A test written after the fix proves only that the code
+  does what it does. A fix with no test that failed beforehand is not a fix, it
+  is a hope — and for a crate whose output gets flashed onto devices, hope is
+  not a review standard. Say in the pull request what was red.
+- **CI enforces 100% line, region and function coverage.** `cargo llvm-cov
+  --fail-under-lines 100 --fail-under-regions 100 --fail-under-functions 100`
+  in the `qa` gate. That is a floor, not a report: an untested branch —
+  including an error path you added and never exercised — fails the build and
+  names the lines. It is a maintainable bar precisely because the crate is a
+  pure function of its inputs, with no I/O and no dependencies.
+- **Pin the sweep counts.** A round-trip sweep over an encoding group asserts
+  its probe count as a literal, so a change in what decodes surfaces as a
+  failing census rather than as a silently different number. If your change
+  moves a count, move the literal and say why.
+- **A test that cannot fail is worse than no test.** Coverage says every line
+  ran, not that any line was checked, and the difference is not academic here:
+  `docs/CONFORMANCE.md` records an encoder writing `Rd` at the wrong bit that
+  survived fourteen tests, because the test helper built its expected halfword
+  with the same formula as the encoder it was checking. Assert against the Arm
+  manual, not against the implementation.
+
+## Developer Certificate of Origin
+
+Contributions are accepted under the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/). There
+is no contributor licence agreement to sign and no copyright to assign: the DCO
+is a statement that you wrote the change, or otherwise have the right to submit
+it under this project's MIT licence.
+
+Certify it by signing off each commit:
+
+```sh
+git commit -s
+```
+
+which appends a line naming you:
+
+```text
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+Use a real name and a reachable address — the sign-off is a statement of
+provenance, so it has to identify someone. If you forget,
+`git commit --amend -s` fixes the last commit and `git rebase --signoff` fixes
+a branch.

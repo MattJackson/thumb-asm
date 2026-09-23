@@ -147,6 +147,8 @@ jobs:
     permissions:
       # Tag push and GitHub Release creation.
       contents: write
+      # Record the SLSA build-provenance attestation against the packaged crate.
+      attestations: write
       # Mint the OIDC token crates.io exchanges for a short-lived publish
       # token. This is the whole reason no CARGO_REGISTRY_TOKEN is needed.
       id-token: write
@@ -280,16 +282,103 @@ jobs:
             tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin "refs/tags/v${VERSION}"
 
+      # ---- Signed, attested release artifacts --------------------------------
+      #
+      # These steps are guarded only on DRY_RUN, not on whether the release
+      # already exists, so re-running the workflow attaches signatures to a
+      # release that was cut before signing was wired up. Re-attesting is sound
+      # because the crates.io artifact is immutable: `cargo package` at the
+      # same tag reproduces the same bytes, and the upload below clobbers.
+      #
+      # crates.io holds the bytes but publishes no signature over them, so the
+      # release carries its own evidence: the exact `.crate` that was packaged,
+      # a SLSA build-provenance attestation binding it to this workflow run and
+      # commit, and a keyless cosign signature. A consumer can check either
+      # independently —
+      #   gh attestation verify thumb-asm-<v>.crate --repo MattJackson/thumb-asm
+      #   cosign verify-blob --bundle thumb-asm-<v>.crate.cosign.bundle \
+      #     --certificate-identity-regexp '^https://github.com/MattJackson/thumb-asm/' \
+      #     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      #     thumb-asm-<v>.crate
+      #
+      # This matters more here than for most libraries: consumers of this crate
+      # write its output into firmware, so "are these the bytes the maintainer
+      # built?" is a question with a device on the end of it.
+      - name: package the crate for signing
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          cargo package
+          crate="target/package/thumb-asm-${VERSION}.crate"
+          test -f "$crate" || { echo "::error::expected $crate after cargo package"; exit 1; }
+          echo "CRATE_PATH=$crate" >> "$GITHUB_ENV"
+
+      - name: attest build provenance (SLSA)
+        id: attest
+        if: env.DRY_RUN != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ env.CRATE_PATH }}
+
+      - name: stage the provenance as a release asset
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          # An `.intoto.jsonl` asset on the release is what OpenSSF Scorecard's
+          # Signed-Releases check looks for; the attestation store alone is
+          # invisible to it.
+          cp "${{ steps.attest.outputs.bundle-path }}" "thumb-asm-${VERSION}.crate.intoto.jsonl"
+          echo "PROVENANCE_PATH=thumb-asm-${VERSION}.crate.intoto.jsonl" >> "$GITHUB_ENV"
+
+      - name: install cosign
+        if: env.DRY_RUN != 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: cosign-sign the crate (keyless)
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          bundle="thumb-asm-${VERSION}.crate.cosign.bundle"
+          sig="thumb-asm-${VERSION}.crate.sig"
+          cert="thumb-asm-${VERSION}.crate.pem"
+
+          # cosign v4 writes the new self-contained bundle format and silently
+          # ignores the deprecated --output-signature/--output-certificate
+          # flags, so the detached `.sig` and `.pem` are derived from the bundle
+          # rather than asked for on the command line.
+          cosign sign-blob --yes --bundle "$bundle" "$CRATE_PATH"
+          jq -r '.messageSignature.signature' "$bundle" > "$sig"
+          jq -r '.verificationMaterial.certificate.rawBytes' "$bundle" \
+            | base64 -d | openssl x509 -inform DER -out "$cert"
+
+          # Verify what was just produced. A signature nobody watched verify is
+          # the unexercised-signing-path bug this step exists to prevent.
+          cosign verify-blob \
+            --signature "$sig" --certificate "$cert" \
+            --certificate-identity-regexp '^https://github.com/MattJackson/thumb-asm/' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$CRATE_PATH"
+
+          echo "BUNDLE_PATH=$bundle" >> "$GITHUB_ENV"
+          echo "SIG_PATH=$sig" >> "$GITHUB_ENV"
+          echo "CERT_PATH=$cert" >> "$GITHUB_ENV"
+
       - name: GitHub release v${{ env.VERSION }}
-        if: steps.state.outputs.released == 'false' && env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true'
         # --verify-tag so this cannot invent a tag of its own: the tag above is
         # the one thing that fixes what "v0.1.0" means.
         run: |
           set -euo pipefail
-          gh release create "v${VERSION}" \
-            --title "v${VERSION}" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            --verify-tag
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" \
+              "$CRATE_PATH" "$BUNDLE_PATH" "$SIG_PATH" "$CERT_PATH" "$PROVENANCE_PATH" --clobber
+          else
+            gh release create "v${VERSION}" \
+              --title "v${VERSION}" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --verify-tag \
+              "$CRATE_PATH" "$BUNDLE_PATH" "$SIG_PATH" "$CERT_PATH" "$PROVENANCE_PATH"
+          fi
 
       - name: what this run actually did
         run: |

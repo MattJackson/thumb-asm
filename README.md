@@ -530,10 +530,40 @@ justifies it; if you cannot write the citation, you have found a bug rather
 than a divergence.
 
 [`CONTRIBUTING.md`](CONTRIBUTING.md) has the detail: what each gate runs, how a
-release is cut, and the conventions to know before touching `.github/`.
+release is cut, the coding standards and the testing policy, and the
+[DCO](https://developercertificate.org/) sign-off contributions are made under.
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) and
+[`GOVERNANCE.md`](GOVERNANCE.md) cover conduct, who decides what, and what
+happens to the project if the maintainer steps away;
+[`ROADMAP.md`](ROADMAP.md) says where it is going.
 [`docs/SETUP.md`](docs/SETUP.md) collects the one-time setup that has to be done
 by a human on someone else's website — crates.io Trusted Publishing, Codecov
 activation, the OpenSSF Best Practices submission — in the order to do it.
+
+## Security
+
+[`SECURITY.md`](SECURITY.md) is the reporting process: report privately through
+[GitHub's private vulnerability reporting](https://github.com/MattJackson/thumb-asm/security/advisories/new)
+rather than as a public issue, expect acknowledgement within 14 days, and
+reporters are credited unless they ask not to be. It also says what is in scope
+and what is not — notably that `read_u8`/`read_u16`/`read_u32` are documented to
+index the slice and panic past the end, which is why `try_read_*` exists for
+untrusted input.
+
+[`docs/ASSURANCE_CASE.md`](docs/ASSURANCE_CASE.md) is the argument that this
+crate is adequately secure for what it does, with the evidence for each claim
+and — just as importantly — the limits of that argument stated plainly. The
+realistic harm here is not a memory-safety exploit in a `forbid(unsafe_code)`
+crate with no dependencies and no I/O; it is a wrong instruction written into
+firmware.
+
+Releases are signed. Every release carries a SLSA build-provenance attestation
+and a keyless cosign signature over the exact `.crate` published to crates.io,
+both attached as release assets:
+
+```sh
+gh attestation verify thumb-asm-0.10.1.crate --repo MattJackson/thumb-asm
+```
 
 ## Changelog
 

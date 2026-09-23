@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-23
+
+No code changes: the library is byte-identical in behaviour to 0.10.0. This
+release exists so that the project's governance, security and assurance
+documentation is published alongside the crate rather than only in the
+repository, and so that there is a release carrying signatures.
+
+### Added
+
+- **`SECURITY.md`** — how to report a vulnerability (privately, through GitHub
+  private vulnerability reporting or by email), what response to expect, and
+  how reporters are credited. It also states scope: the realistic reports are a
+  panic reachable from untrusted input through an API not documented as
+  panicking, a mis-encoded or mis-decoded instruction, or an unbounded loop or
+  allocation driven by input. Explicitly out of scope: `read_u8`/`read_u16`/
+  `read_u32` panicking past the end of the image, which they are documented to
+  do — `try_read_*` returning `Option` is the form for untrusted input.
+
+- **`docs/ASSURANCE_CASE.md`** — the argument that the crate is adequately
+  secure for what it does, with the evidence for each claim and the limits of
+  the argument stated rather than left implied. The realistic harm here is not
+  a memory-safety exploit in a `forbid(unsafe_code)` crate with no dependencies
+  and no I/O; it is a wrong instruction written into firmware.
+
+- **`GOVERNANCE.md`, `CODE_OF_CONDUCT.md`, `ROADMAP.md`** — who decides what,
+  what happens to the project if the maintainer becomes unavailable, the
+  Contributor Covenant, and where the project is going. `GOVERNANCE.md` is
+  honest that this is a single-maintainer project rather than describing a
+  committee that does not exist.
+
+- **`CONTRIBUTING.md` gained coding standards, a testing policy and a DCO
+  section.** The standards were already enforced by CI; they were not written
+  down anywhere a contributor would find them. The testing policy states
+  red-before-green as a requirement and says why a test that cannot fail is
+  worse than no test — both failure modes happened in this project and are in
+  the 0.10.0 entry below.
+
+- **Signed releases.** Every release now carries a SLSA build-provenance
+  attestation and a keyless cosign signature over the exact `.crate` published
+  to crates.io, attached as release assets and verified inside the workflow
+  that produces them. crates.io holds the bytes but publishes no signature over
+  them; consumers of this crate write its output into firmware, so "are these
+  the bytes the maintainer built?" is a question with a device on the end of
+  it. Verify with `gh attestation verify thumb-asm-0.10.1.crate --repo
+  MattJackson/thumb-asm`, or `cosign verify-blob --bundle` against the bundle
+  asset.
+
+- A **`yank` dispatch input** on the release workflow. Trusted Publishing mints
+  a token scoped to publishing, and crates.io refuses it for a yank, so that
+  path takes a separately scoped token and says so rather than failing with an
+  authentication error that looks like a misconfiguration.
+
+### Fixed
+
+- **`CODE_OF_CONDUCT.md` is declared CC BY 4.0, not MIT.** It is the
+  Contributor Covenant reproduced verbatim — someone else's text, under its own
+  licence. Labelling it MIT with this project's copyright would have been the
+  same mistake `LICENSES/LicenseRef-Arm-Documentation.txt` exists to avoid for
+  the Arm manuals.
+
 ## [0.10.0] - 2026-09-22
 
 0.1.0 was a 676-line position-independent assembler and patch-site finder with
