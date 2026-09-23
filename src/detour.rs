@@ -2106,4 +2106,149 @@ mod tests {
         assert_eq!(o.kind, DetourOptions::new().kind);
         assert_eq!(o.convention, DetourOptions::new().convention);
     }
+
+    // ------------------------------------------------- patching-path guards
+    //
+    // Mutation testing found these unexercised. They are ranked here by what
+    // goes wrong, not by how the code looks: this is the only place in the
+    // crate that writes bytes into a live image, so a guard that stops
+    // working here puts them somewhere they should not be.
+
+    /// The space the search asks for must cover the stub that gets written.
+    ///
+    /// `need` is the only thing that guarantees the erased run is long enough.
+    /// Nothing downstream re-checks it — `attempt` bounds the stub against the
+    /// *image*, not against the run it was placed in — so an under-estimate
+    /// puts the stub's tail on top of whatever lives after the run, and the
+    /// write goes to flash.
+    #[test]
+    fn the_space_the_search_asks_for_covers_the_stub_that_gets_written() {
+        let fixtures: [&[u8]; 3] = [
+            &[0x01, 0x20, 0x02, 0x21],             // two narrow, no widening
+            &[0x32, 0x2A, 0x1D, 0xD8],             // cmp · bhi — the bhi widens
+            &[0x01, 0x20, 0x4F, 0xF0, 0x02, 0x01], // 16- then 32-bit: displaces 6
+        ];
+        for code in fixtures {
+            // Both word parities, because one of them costs two bytes of
+            // alignment padding and the other does not.
+            for site in [SITE, SITE + 2] {
+                for (kind, convention) in [
+                    (BranchKind::Bl, Convention::CallThenContinue),
+                    (BranchKind::BWide, Convention::CallThenContinue),
+                    (BranchKind::BWide, Convention::HookDecides),
+                ] {
+                    let mut image = vec![0u8; LEN];
+                    for b in image[FREE..].iter_mut() {
+                        *b = 0xFF;
+                    }
+                    image[site..site + code.len()].copy_from_slice(code);
+                    let opts = DetourOptions::new()
+                        .with_kind(kind)
+                        .with_convention(convention);
+                    let insns = displaced_at(&image, site, None).unwrap();
+                    let need = prologue_len(&opts) + 2 + 4 * insns.len() + 4;
+                    let d = detour(&mut image, site, HOOK, opts).unwrap();
+                    assert!(
+                        d.stub_len <= need,
+                        "site {site:#x} {kind} {convention:?}: stub {} exceeds the \
+                         {need} bytes the search asked for",
+                        d.stub_len
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the consequence, end to end: when the only erased run is shorter
+    /// than the stub, the detour is refused rather than written past it.
+    #[test]
+    fn a_run_shorter_than_the_stub_is_never_written_into() {
+        let mut image = vec![0u8; LEN];
+        // cmp r2, #0x32 · bhi — the `bhi` widens to four bytes in the stub.
+        image[SITE..SITE + 4].copy_from_slice(&[0x32, 0x2A, 0x1D, 0xD8]);
+        // Twelve erased bytes. The stub is fourteen: bl(4) cmp(2) bhi.w(4) b.w(4).
+        for b in image[FREE..FREE + 12].iter_mut() {
+            *b = 0xFF;
+        }
+        let before = image.clone();
+        assert_eq!(
+            tramp(&mut image, SITE, HOOK).unwrap_err().reason(),
+            "no-free-space"
+        );
+        assert_eq!(image, before, "a refusal must leave every byte alone");
+    }
+
+    /// `scan_from == site` is the ordinary case, not a caller error.
+    ///
+    /// The site usually *is* the function entry, and supplying it is the
+    /// documented way to turn off the IT-block blind spot. Rejecting it would
+    /// make the one option that closes that hole unusable exactly where it is
+    /// most wanted.
+    #[test]
+    fn a_decode_start_at_the_site_itself_is_accepted() {
+        let mut image = image_with(&[0x01, 0x20, 0x02, 0x21]);
+        let d = detour(
+            &mut image,
+            SITE,
+            HOOK,
+            DetourOptions::new().with_scan_from(SITE),
+        )
+        .expect("the site is a decode start like any other");
+        assert_eq!(d.displaced, 4);
+
+        // One halfword past it is still a caller error.
+        let mut image = image_with(&[0x01, 0x20, 0x02, 0x21]);
+        assert_eq!(
+            detour(
+                &mut image,
+                SITE,
+                HOOK,
+                DetourOptions::new().with_scan_from(SITE + 2)
+            )
+            .unwrap_err()
+            .reason(),
+            "scan-start-after-site"
+        );
+    }
+
+    /// Both overlap intervals are half-open.
+    ///
+    /// A stub beginning exactly where the displaced region ends does not
+    /// overlap it — and that is the erased space *nearest* the site, which is
+    /// the space a branch is most likely to reach. Refusing it throws away the
+    /// placement a caller most wants.
+    #[test]
+    fn a_stub_that_abuts_the_displaced_region_does_not_overlap_it() {
+        let mut image = vec![0u8; LEN];
+        image[SITE..SITE + 4].copy_from_slice(&[0x01, 0x20, 0x02, 0x21]);
+        for b in image[SITE + 4..].iter_mut() {
+            *b = 0xFF;
+        }
+        let opts = DetourOptions::new()
+            .with_stub_at(SITE as u32 + 4)
+            .with_style(DetourStyle::DiscardAndJumpTo(0x200));
+        let d = detour(&mut image, SITE, HOOK, opts)
+            .expect("abutting the displaced region is not overlapping it");
+        assert_eq!(d.stub, SITE as u32 + 4);
+    }
+
+    /// The planner's image-end bound admits a site with exactly four bytes
+    /// after it, which is what `install_branch` already promises for the same
+    /// offset. The two must not disagree about the same address.
+    #[test]
+    fn the_planner_admits_a_site_that_ends_at_the_image_end() {
+        let mut image = vec![0u8; LEN];
+        for b in image[0x10..0x80].iter_mut() {
+            *b = 0xFF;
+        }
+        image[LEN - 4..].copy_from_slice(&[0x01, 0x20, 0x02, 0x21]);
+        let d = detour(
+            &mut image,
+            LEN - 4,
+            HOOK,
+            DetourOptions::new().with_stub_at(0x10),
+        )
+        .expect("exactly four bytes of room is enough, as install_branch says");
+        assert_eq!(d.resume(), LEN as u32);
+    }
 }

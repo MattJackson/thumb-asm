@@ -12,7 +12,7 @@
 //!
 //! # Why `1101xx` is not simply "the conditional branches"
 //!
-//! Table A5-8 (ARM DDI 0403E.e A5-136, and identically Table A6-8 of DDI 0406C
+//! Table A5-8 (ARM DDI 0403E.e A5-136, and identically Table A6-8 of DDI 0406B
 //! A6.2.6) splits the `1101` space three ways, and the `B` pseudocode on
 //! A7-205 opens by diverting two of them:
 //!
@@ -21,7 +21,7 @@
 //! if cond == '1111' then SEE SVC;
 //! ```
 //!
-//! So `0xDE**` is the *permanently* undefined `UDF #<imm8>` — DDI 0406C adds
+//! So `0xDE**` is the *permanently* undefined `UDF #<imm8>` — DDI 0406B adds
 //! "this space will not be allocated in future", which is what makes it usable
 //! as a deliberate trap — and `0xDF**` is `SVC #<imm8>`. Treating the whole of
 //! `0xD000..=0xDFFF` as `B<cond>` mis-decodes 512 halfwords, and does so in the
@@ -729,11 +729,34 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(encode(&stm), None);
-        // Nor does a base register outside r0-r7.
-        stm.operands = [Operand::Reg(Reg::SP), Operand::RegList(0b110)]
-            .into_iter()
-            .collect();
-        assert_eq!(encode(&stm), None);
+        // Nor does a base register outside r0-r7 — any of them, for either
+        // mnemonic. `Rn` is three bits here and `hw1[11]` above it is the
+        // `L` bit, so `stmia r8, {r1, r2}` shifted straight into the field
+        // would come out as `0xC806`: not a malformed store-multiple but a
+        // valid `ldmia r0!, {r1, r2}`, a load where a store was asked for
+        // and a base register nobody named.
+        //
+        // Two guards say so, and the second says it alone. `is_low` refuses
+        // the register first; then the writeback invariant refuses it again,
+        // and unconditionally. `Rn` reaches that invariant as `r.num()`, so
+        // a high base is 8..=15, `1 << rn` is at least `0x100`, and the list
+        // has already been capped at `0xFF` — `list & (1 << rn)` is zero, so
+        // `expected_wback` is `true`, while a bare `Operand::Reg` means
+        // `wback == false`. Deleting `is_low` therefore changes no answer
+        // this function can give: it is an equivalent mutation, and these
+        // assertions hold with the guard and without it. They are here as
+        // the behaviour written down over the whole of r8-r15 and both
+        // mnemonics, not as a test of the guard.
+        for r in 8u8..16 {
+            for (base, mnemonic) in [(0xC006u16, "stmia"), (0xC806, "ldmia")] {
+                let mut high = dec(base, 0).unwrap();
+                assert_eq!(high.mnemonic, mnemonic);
+                high.operands = [Operand::Reg(Reg(r)), Operand::RegList(0b110)]
+                    .into_iter()
+                    .collect();
+                assert_eq!(encode(&high), None, "{mnemonic} through r{r}");
+            }
+        }
     }
 
     /// Every operand `encode` reads, offered something it cannot read.

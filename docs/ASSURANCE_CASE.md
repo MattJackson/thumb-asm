@@ -149,13 +149,14 @@ that wrote `Rd` at bit 12 where the manual says bit 8 survived fourteen tests,
 because the test helper built its expected halfword with the same formula as
 the encoder it was checking.
 
-*Evidence.* The coverage job in `qa.yml`; 480 library tests, 7 conformance
-tests and 24 doctests. Against that, periodic `cargo-mutants` runs: **7,475
-mutants, 89.0% caught, 96.9% once the provably-equivalent families are set
+*Evidence.* The coverage job in `qa.yml`; 545 library tests, 7 conformance
+tests and 32 doctests. Against that, periodic `cargo-mutants` runs: **7,624
+mutants, 91.1% caught, 99.1% once the provably-equivalent families are set
 aside** (588 survivors are `|` replaced by `^` across disjoint bit-fields,
 which computes the same value — and that the fields really are disjoint is not
-an assumption, it is what the 669,696-probe round-trip sweep proves). The
-remaining **206** survivors are real and are named as such in
+an assumption, it is what the 669,696-probe round-trip sweep proves; 4 more
+are `r.num() < 16`, which `Reg::num` makes unconditionally true). The
+remaining **64** survivors are real and are named as such in
 [`CONFORMANCE.md`](CONFORMANCE.md) and on [`../ROADMAP.md`](../ROADMAP.md),
 rather than rounded away. The run is not decoration: it produced operand
 validation on every `Asm` emitter, tests pinning `first_operand_is_source` and
@@ -236,7 +237,7 @@ property, stated in `README.md`.
 
 *Argument.* Nothing rests on anything hidden. Every encoding claim in `src/`
 cites the Arm architecture reference manual section it came from, and `spec/`
-holds the manuals (DDI 0403E.e and DDI 0406C among them) so a reader can check
+holds the manuals (DDI 0403E.e and DDI 0406B among them) so a reader can check
 rather than trust. `spec/THUMB-ISA.md` walks the encoding space section by
 section and states coverage in counts with the counting method, because a
 percentage on its own is not checkable. Where this crate is deliberately

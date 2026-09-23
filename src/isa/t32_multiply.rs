@@ -1,7 +1,7 @@
 //! 32-bit multiply, multiply-accumulate, absolute difference, long multiply
 //! and divide — `hw1[15:11] == 0b11111` with `hw1[10:4]` of `0110xxx`
 //! (ARM DDI 0403E.e A5.3.16, Table A5-28) or `0111xxx` (A5.3.17,
-//! Table A5-29). Identically ARM DDI 0406C A6.3.16/A6.3.17, Tables A6-27 and
+//! Table A5-29). Identically ARM DDI 0406B A6.3.16/A6.3.17, Tables A6-27 and
 //! A6-28.
 //!
 //! Both sub-tables share the top byte `0xFB`; `hw1[7]` is the only bit that
@@ -32,7 +32,7 @@
 //!
 //! **Table erratum.** The `Ra` column of the `op1 = 111` row is garbled in the
 //! text renderings of *both* manuals in `spec/` — ARM DDI 0403E.e Table A5-28
-//! extracts as `1111 → USADA8`, ARM DDI 0406C Table A6-27 as
+//! extracts as `1111 → USADA8`, ARM DDI 0406B Table A6-27 as
 //! `not 1111 → USAD8`, and the two cannot both be right. The encoding
 //! diagrams settle it: `USAD8` T1 is `11111011 0111 Rn 1111 Rd 0000 Rm`, with
 //! a literal `1111` where `Ra` sits (A7.7.211), and `USADA8` T1 carries a real

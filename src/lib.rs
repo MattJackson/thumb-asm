@@ -29,7 +29,7 @@
 //!
 //! Every encoding claim in this file cites its section in Arm's architecture
 //! reference manuals (`A5.*`/`A7.*` = ARM DDI 0403E.e, Armv7-M; `A6.*` =
-//! ARM DDI 0406C, Armv7-A/R).
+//! ARM DDI 0406B, Armv7-A/R).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -1333,7 +1333,7 @@ pub struct CondBranch {
 /// T3 packs `S:J2:J1:imm6:imm11` — J2 and J1 in the opposite order, used
 /// directly with no inversion, over a 6-bit rather than 10-bit high field.
 /// Reusing [`decode_bl`]'s arithmetic here produces a plausible, wrong target.
-/// (Verified against ARM DDI 0403E.e A7.7.12 and DDI 0406C A8.8.18.)
+/// (Verified against ARM DDI 0403E.e A7.7.12 and DDI 0406B A8.6.16.)
 ///
 /// `cond<3:1> == 0b111` in T3 is "see Related encodings" — `MSR`/`MRS`, hints,
 /// `UDF.W`, `BL` — so, as in T1, both `0b1110` and `0b1111` decode as `None`.

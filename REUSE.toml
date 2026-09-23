@@ -97,7 +97,7 @@ SPDX-License-Identifier = "MIT"
 # ---------------------------------------------------------------------------
 # `spec/`, part two: Arm's manuals. NOT OURS.
 #
-# Four Arm architecture reference manuals (DDI 0100I, DDI 0403E.e, DDI 0406C,
+# Four Arm architecture reference manuals (DDI 0100I, DDI 0403E.e, DDI 0406B,
 # DDI 0419C) and a pypdf text dump of each, kept in-tree so that every encoding
 # claim in `src/` can be checked against the document it came from. They are
 # Arm Limited's copyright. The dumps are not a separate work — extracting the

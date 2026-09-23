@@ -12,7 +12,7 @@ awk '/PDFPAGE 134 /,/PDFPAGE 136 /' spec/ARMv7-M.txt
 | File | Doc | Pages | Why it's here |
 |---|---|---|---|
 | `ARMv7-M_DDI0403E.pdf` | Armv7-M ARM, DDI 0403E.e (ID021621) | 858 | Cleanest full Thumb-only spec. Ch. **A5** = encoding space, **A7.7** = alphabetical instruction detail. The reference for anything Cortex-M. |
-| `ARMv7-AR_DDI0406C.pdf` | ARMv7-A/R ARM, DDI 0406 (B-errata build) | 2158 | The *superset* Thumb: adds SETEND/CPS/RFE/SRS/SMC/BXJ, ThumbEE (ch. A9), coprocessor + Advanced SIMD/VFP in Thumb encodings. Ch. **A6** = Thumb encoding, **A8.6** = instruction detail (ARM + Thumb side by side). |
+| `ARMv7-AR_DDI0406B.pdf` | ARMv7-A/R ARM, DDI 0406B (2011 Q2 errata build) | 2158 | The *superset* Thumb: adds SETEND/CPS/RFE/SRS/SMC/BXJ, ThumbEE (ch. A9), coprocessor + Advanced SIMD/VFP in Thumb encodings. Ch. **A6** = Thumb encoding, **A8.6** = instruction detail (ARM + Thumb side by side). |
 | `ARMv6-M_DDI0419.pdf` | ARMv6-M ARM, DDI 0419C | 436 | The minimal Thumb subset (Cortex-M0). Useful to check "is this encoding legal on the smallest core". |
 | `ARMv5_DDI0100I.pdf` | ARM ARM, DDI 0100I (ARMv5TE) | ~1100 | Original Thumb-1 definition + the ARMv5 `BL`/`BLX` halfword-pair semantics, which is what most pre-Cortex firmware (ARM7TDMI / ARM9) actually is. |
 

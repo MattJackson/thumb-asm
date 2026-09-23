@@ -1,7 +1,7 @@
 //! 32-bit loads and memory hints — `hw1[15:11] == 0b11111` with `hw1[10:4]` in
 //! `00xx001` (byte), `00xx011` (halfword) or `00xx101` (word), that is the
 //! three sibling tables A5-18, A5-19 and A5-20 (ARM DDI 0403E.e A5.3.7,
-//! A5.3.8, A5.3.9; identically ARM DDI 0406C A6.3.7–A6.3.9 and Tables
+//! A5.3.8, A5.3.9; identically ARM DDI 0406B A6.3.7–A6.3.9 and Tables
 //! A6-18–A6-20).
 //!
 //! One file for three tables because they are one table with a size field.
@@ -56,7 +56,7 @@
 //!    decoded as the instructions they are — mnemonic `pld`/`pli`, no `Rt`
 //!    operand, the memory operand alone — and re-encode exactly.
 //! 2. **"Unallocated memory hint, treat as NOP."** These are Table A5-19's
-//!    `Rt == 1111` rows, in the halfword space. Table A6-19 of DDI 0406C
+//!    `Rt == 1111` rows, in the halfword space. Table A6-19 of DDI 0406B
 //!    allocates exactly three of them — `op1 == 01`, and `op1 == 00` with
 //!    `op2` of `1100xx` or `000000`, all with `Rn != 1111` — to `PLDW`,
 //!    preload-with-intent-to-write, under the ARMv7 Multiprocessing
@@ -239,13 +239,13 @@ fn row(
             Form::Unpriv => return None,            // UNPREDICTABLE
         },
         // Table A5-19's hint rows. Unallocated in the M profile; the three
-        // forms DDI 0406C Table A6-19 gives to PLDW are decoded as PLDW, the
+        // forms DDI 0406B Table A6-19 gives to PLDW are decoded as PLDW, the
         // rest are `None` (see this module's header).
         (HALF, false, true) => match form {
             Form::Literal => return None,            // UNPREDICTABLE
-            Form::Imm12 => ("pldw", "T1", false),    // DDI 0406C A8.8.127
-            Form::Imm8 => ("pldw", "T2", false),     // DDI 0406C A8.8.127
-            Form::Register => ("pldw", "T1", false), // DDI 0406C A8.8.128
+            Form::Imm12 => ("pldw", "T1", false),    // DDI 0406B A8.6.117
+            Form::Imm8 => ("pldw", "T2", false),     // DDI 0406B A8.6.117
+            Form::Register => ("pldw", "T1", false), // DDI 0406B A8.6.119
             Form::Unpriv => return None,             // UNPREDICTABLE
         },
         // Signed halfword space with `Rt == 1111`: an unallocated hint in
@@ -526,6 +526,20 @@ pub(crate) fn decode(hw1: u16, hw2: u16, addr: u32) -> Option<Insn> {
 /// `cond` is not consulted. No halfword in this group has a condition field;
 /// an instruction made conditional by an enclosing `IT` block encodes
 /// identically.
+///
+/// One consequence is worth stating, because it decides what is worth
+/// testing here. Every `Some` this function can return leaves through
+/// [`verify`], so the early returns below it are a fast path and a statement
+/// of which shapes this group can express — they are not what makes the
+/// answer right. Disable any one of them — the width and flag check, the
+/// `unpriv`/mode/offset/`add` checks guarding a register index, the `1..=3`
+/// bound on that index's `LSL`, the literal row's mode check, the
+/// unprivileged row's mode/`add`/range check — and the candidate merely
+/// reaches `verify`, which decodes it, finds an `Insn` that is not the one it
+/// was given, and returns `None` anyway. Each of those guards is therefore an
+/// equivalent mutation: no input tells its presence from its absence, and
+/// none of them carries a test of its own. The guards that do change answers
+/// are the ones inside [`decode`], which `verify` is measured against.
 pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
     if insn.width != Width::Wide || insn.sets_flags {
         return None;
@@ -1586,7 +1600,7 @@ mod tests {
 
         // --- `verify` catches an `Insn` whose halfwords decode to nothing ---
         //
-        // `PLDW (literal)` does not exist: DDI 0406C Table A6-19 leaves
+        // `PLDW (literal)` does not exist: DDI 0406B Table A6-19 leaves
         // `Rn == 1111` in the preload-write row UNPREDICTABLE, so [`row`]
         // refuses `(HALF, false, true, Form::Literal)`. Every gate in `encode`
         // passes for it — the mnemonic classifies, the operands are a hint's,

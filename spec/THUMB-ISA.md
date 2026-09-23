@@ -1383,7 +1383,7 @@ each is the kind of mistake that produces code which looks right and is wrong.
   `P == 0 && W == 0`. Every affected page carries both halves of the statement:
   `if P == '1' && U == '1' && W == '0' then SEE LDRT;` and, two lines later,
   `if P == '0' && W == '0' then UNDEFINED;` (A7.7.43, and identically for
-  `LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`STR`/`STRB`/`STRH`; DDI 0406 A8.8.x agrees).
+  `LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`STR`/`STRB`/`STRH`; DDI 0406 A8.6.x agrees).
   Reading `P == 0 && W == 0` as "unprivileged" — which is what the *ARM*
   instruction set's post-indexed encoding would suggest — decodes an UNDEFINED
   pattern as an instruction. It is also why `LDRT` can only ever add.

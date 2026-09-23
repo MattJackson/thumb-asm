@@ -1,6 +1,6 @@
 //! Shift (immediate), add, subtract, move, and compare — the 16-bit encodings
 //! with `hw1[15:14] == 0b00` (ARM DDI 0403E.e A5.2.1, Table A5-2; the A/R
-//! profile view is DDI 0406C A6.2.1 and is bit-for-bit the same).
+//! profile view is DDI 0406B A6.2.1 and is bit-for-bit the same).
 //!
 //! The space is *fully* allocated: every one of the 16384 halfwords in
 //! `0x0000..=0x3FFF` is a defined instruction, so [`decode`] never returns
@@ -619,6 +619,37 @@ mod tests {
                 &[r0, Operand::Imm(1)],
                 true,
                 "CMP has no S bit",
+            ),
+            // …and the same for every other row of the table, because each
+            // carries its own `flags_ok` guard and a missing one is invisible
+            // from the round trip: the decoder only ever *produces*
+            // `sets_flags == true` here, so nothing but a hand-built `Insn`
+            // asks the question. Getting it wrong would hand back a halfword
+            // that sets the flags to a caller who asked for one that does not
+            // — and in a firmware patch the next instruction is quite
+            // possibly a conditional branch reading them.
+            ("mov", "T2", &[r0, r1], false, "MOV T2 sets flags"),
+            (
+                "lsl",
+                "T1",
+                &[r0, r1, Operand::Imm(2)],
+                false,
+                "LSL T1 sets flags",
+            ),
+            ("add", "T1", &[r0, r1, r1], false, "ADD reg T1 sets flags"),
+            (
+                "add",
+                "T2",
+                &[r0, Operand::Imm(1)],
+                false,
+                "ADD imm T2 sets flags",
+            ),
+            (
+                "sub",
+                "T2",
+                &[r0, Operand::Imm(1)],
+                false,
+                "SUB imm T2 sets flags",
             ),
         ];
         for &(mnemonic, encoding, ops, sets_flags, why) in cases {

@@ -1,6 +1,6 @@
 //! 32-bit data processing (shifted register) — `hw1[15:9] == 0b1110101`
 //! (ARM DDI 0403E.e A5.3.11, Tables A5-22 and A5-23; the A/R profile view is
-//! ARM DDI 0406C A6.3.11, Table A6-22, which differs only in naming the
+//! ARM DDI 0406B A6.3.11, Table A6-22, which differs only in naming the
 //! `0110` row `PKH` rather than `PKHBT, PKHTB`).
 //!
 //! The layout is one shape in two halfwords:

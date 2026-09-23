@@ -1,6 +1,6 @@
 //! Data processing (plain binary immediate) — the 32-bit encodings reached
 //! when `hw1[15:11] == 0b11110`, `hw1[9] == 1` and `hw2[15] == 0`
-//! (ARM DDI 0403E.e A5.3.3, Table A5-12; the A/R view is DDI 0406C A6.3.3,
+//! (ARM DDI 0403E.e A5.3.3, Table A5-12; the A/R view is DDI 0406B A6.3.3,
 //! Table A6-12, which allocates exactly the same eleven `op` values).
 //!
 //! The layout is `hw1 = 11110 i 1 op(5) Rn(4)`, `hw2 = 0 imm3 Rd imm8`, the

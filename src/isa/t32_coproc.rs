@@ -1,8 +1,8 @@
 //! Coprocessor, floating-point and Advanced-SIMD-adjacent 32-bit encodings —
 //! `hw1[15:13] == 0b111` with `hw1[11:10] == 0b11`, that is `hw1` in
 //! `0xEC00..=0xEFFF` and `0xFC00..=0xFFFF`
-//! (ARM DDI 0403E.e A5.3.18 and Table A5-30; ARM DDI 0406C A6.3.18 and
-//! Table A6-30, which allocates the same space and names the floating-point
+//! (ARM DDI 0403E.e A5.3.18 and Table A5-30; ARM DDI 0406B A6.3.18 and
+//! Table A6-29, which allocates the same space and names the floating-point
 //! rows Table A5-30 leaves implicit).
 //!
 //! The dispatcher reaches this module from two arms — `op1 == 0b01` and
@@ -56,7 +56,7 @@
 //!
 //! # Where this module stops and `t32_simd` starts
 //!
-//! Advanced SIMD (NEON) data-processing is `op1 == 0b11xxxx` in Table A6-30 —
+//! Advanced SIMD (NEON) data-processing is `op1 == 0b11xxxx` in Table A6-29 —
 //! `hw1[9:8] == 0b11`, that is `111x 1111 …`. Those encodings fall in this
 //! module's halfword range and this module returns `None` for all of them.
 //! Advanced SIMD element and structure load/store (`1111 1001 …`) never
@@ -345,14 +345,14 @@ const FPSCR_REG: u16 = 0b0001;
 /// Whether `VMSR` can write the special register with this `reg` encoding.
 ///
 /// `VMRS` can read five of them, but only `FPSID`, `FPSCR` and `FPEXC` are
-/// listed as `VMSR` destinations (DDI 0406C B6.1.15); `reg` of `0b01xx` — the
+/// listed as `VMSR` destinations (DDI 0406B B6.1.15); `reg` of `0b01xx` — the
 /// media-feature registers, which are read-only — is UNPREDICTABLE there.
 fn writable_sysreg(reg: u16) -> bool {
     matches!(reg, 0b0000 | FPSCR_REG | 0b1000)
 }
 
 /// The floating-point special registers `VMRS`/`VMSR` can name, indexed by
-/// `hw1[3:0]` (ARM DDI 0406C A8.8.346; ARM DDI 0403E.e pins this field to
+/// `hw1[3:0]` (ARM DDI 0406B B6.1.14; ARM DDI 0403E.e pins this field to
 /// `0b0001`, `FPSCR`, and leaves the rest to the A/R profile). `None` is a
 /// reserved encoding.
 const FP_SYSREGS: [Option<&str>; 16] = [
@@ -802,7 +802,7 @@ fn vfp_compress_imm(value: f64, dbl: bool) -> Option<u16> {
 /// to it.
 ///
 /// The three-way split at the top is Table A5-30's, read through
-/// ARM DDI 0406C Table A6-30, which is the same table with the floating-point
+/// ARM DDI 0406B Table A6-29, which is the same table with the floating-point
 /// rows spelled out: `op1 == 0b0xxxxx` (but not `0b000x0x`) is the load/store
 /// row, `0b00010x` the two-core-register row, and `0b10xxxx` the
 /// data-processing and single-core-register rows, split by `op` = `hw2[4]`.
@@ -1373,7 +1373,7 @@ fn fp_transfer(hw1: u16, hw2: u16, addr: u32) -> Option<Insn> {
                 // follows every `VCMP`: the FPSCR's N, Z, C and V move to the
                 // APSR's so that an integer conditional branch can test them.
                 // It means nothing for the other special registers, where
-                // DDI 0406C B6.1.14 makes it UNPREDICTABLE.
+                // DDI 0406B B6.1.14 makes it UNPREDICTABLE.
                 if rt.num() == 15 && vn != FPSCR_REG {
                     return None;
                 }
@@ -1460,6 +1460,16 @@ fn fp_two_core(hw1: u16, hw2: u16, addr: u32) -> Option<Insn> {
 // answer to the caller — this encoding cannot hold that — and splitting them
 // leaves a branch that several of the callers, which check the operand count
 // first, can never take.
+//
+// The `r.num() < 16` guard in `op_reg` below, and the three hand-written
+// copies of it in `encode_mcr`, `parse_base` and `encode_vmrs_vmsr`, are
+// restatements of an invariant rather than tests: `Reg::num` is
+// `self.0 & 0xF` (`isa::insn`), so the predicate is total. They are written
+// out because they keep the four-bit width of `Rt`/`Rn` next to the place the
+// field is built, but no `Reg` can make one of them false. Weakening or
+// deleting any of them — `< 16` to `<= 16`, or the whole guard to `true` —
+// yields an identical program, so no test can pin them and none should be
+// written.
 
 /// The operand at `i`, if it is a core register.
 fn op_reg(insn: &Insn, i: usize) -> Option<Reg> {
@@ -1549,6 +1559,16 @@ fn scaled_imm8(mem: &Mem) -> Option<(u16, u16)> {
 #[derive(Default)]
 struct Words {
     /// `hw1[12]`.
+    ///
+    /// Exactly one literal below — the `VMOV (immediate)` arm of
+    /// [`encode_fp_data_processing`] — writes `t: 0` *and* ends in
+    /// `..Default::default()`; the rest name all ten fields. That one `t: 0`
+    /// is redundant, because `Words` derives `Default` and every field is a
+    /// `u16`, so the catch-all would supply the same zero. It is spelled out
+    /// anyway: `T` is the bit that tells a T1 row from its T2 twin, and
+    /// leaving the field that picks the encoding to a catch-all reads as an
+    /// oversight. Deleting it emits byte-for-byte the same halfwords, so no
+    /// test can distinguish it and none should be written.
     t: u16,
     /// `opc1[3]` = `hw1[7]`.
     hi: u16,
@@ -2971,12 +2991,12 @@ mod tests {
         // floating-point instruction in compiled code after the arithmetic.
         check(0xEEF1, 0xFA10, "vmrs apsr_nzcv, fpscr");
         check(0xEEF1, 0x5A10, "vmrs r5, fpscr");
-        // The A/R profile's other special registers (DDI 0406C A8.8.346);
+        // The A/R profile's other special registers (DDI 0406B B6.1.14);
         // DDI 0403E.e pins this field to FPSCR and leaves the rest reserved.
         check(0xEEF8, 0x0A10, "vmrs r0, fpexc");
         check(0xEEF0, 0x0A10, "vmrs r0, fpsid");
         assert!(decode(0xEEF2, 0x0A10, ADDR).is_none());
-        // `VMSR` writes only FPSID, FPSCR and FPEXC (DDI 0406C B6.1.15), and
+        // `VMSR` writes only FPSID, FPSCR and FPEXC (DDI 0406B B6.1.15), and
         // `APSR_nzcv` is a destination only for FPSCR (B6.1.14).
         check(0xEEE8, 0x0A10, "vmsr fpexc, r0");
         assert!(decode(0xEEE7, 0x0A10, ADDR).is_none());
@@ -3086,17 +3106,30 @@ mod tests {
                 assert_eq!(encode(&bad), None, "offset {offset} add {add}");
             }
         }
-        // `<fbits>` outside the range the field can hold (A7.7.229).
-        let fbits = insn(
-            "vcvt.s32.f32",
-            "T1",
-            &[
-                Operand::FpReg(FpReg::S(0)),
-                Operand::FpReg(FpReg::S(0)),
-                Operand::Imm(33),
-            ],
-        );
-        assert_eq!(encode(&fbits), None);
+        // `<fbits>` outside the range the field can hold (A7.7.229). What
+        // goes in the encoding is `imm4:i == size - <fbits>`, five bits wide,
+        // and `size` is 32 here because `sx == 1` — so the legal range is
+        // `#1` to `#32`, and *both* ends have to be refused. `#33` makes the
+        // field -1. `#0` makes it 32, which is the one that bites: 32 is a
+        // six-bit value, `imm4` takes `hw2[3:0]` and `i` takes `hw2[5]`, so
+        // the carry lands on `hw2[4]` — a should-be-zero bit — and the
+        // halfwords read back as `#32` fraction bits, not `#0`. Note the
+        // asymmetry with the 16-bit forms, where `sx == 0` makes `size` 16 and
+        // `#0` is the legal bottom of the range (pinned in the decode
+        // direction below); the bound is not a property of the mnemonic
+        // alone.
+        for frac in [0i64, 33] {
+            let fbits = insn(
+                "vcvt.s32.f32",
+                "T1",
+                &[
+                    Operand::FpReg(FpReg::S(0)),
+                    Operand::FpReg(FpReg::S(0)),
+                    Operand::Imm(frac),
+                ],
+            );
+            assert_eq!(encode(&fbits), None, "fbits #{frac}");
+        }
         // A doubleword list of seventeen registers: `regs > 16` is
         // UNPREDICTABLE, and the encoding has nowhere to put it.
         let long = insn("vpush", "T1", &[Operand::Text(D_RANGES[0][16])]);
@@ -3243,6 +3276,56 @@ mod tests {
     }
 
     #[test]
+    fn encode_refuses_the_first_number_past_the_end_of_each_field() {
+        // Every one of these operands is carried in a `u8` but named by a
+        // field narrower than a `u8`: `s0`–`s31` and `d0`–`d31` in five bits,
+        // `p0`–`p15` and `c0`–`c15` in four. The interesting value is the
+        // first one past the end, because it is not a wrap-around onto a
+        // neighbouring register — the surplus bit spills sideways into a
+        // *control* bit of the same halfword, and the result is a valid
+        // encoding of a different instruction rather than a rejection.
+        //
+        // `d32` is the sharpest case. A double-precision number splits as
+        // `D:Vd` (Table A6-4), so 32 is `D == 0b10`, `Vd == 0b0000`, and in
+        // `VLDR`/`VSTR` `D` sits at `hw1[6]` with the `U` — add/subtract —
+        // bit immediately above it at `hw1[7]`. Taking `d32` would emit
+        // `vldr d0, [r2, #-8]` for `vldr d32, [r2, #8]`: a load from the
+        // wrong side of the base register.
+        //
+        // The coprocessor numbers spill the same way. `coproc` is `hw2[11:8]`,
+        // so `p16` lands on `hw2[12]`, the bottom of `CRd`/`Rt`, and
+        // `cdp p16, #1, c2, c3, c4, #5` would assemble as
+        // `cdp p0, #1, c3, …`. `CRn` is `hw1[3:0]`, so `c16` lands on
+        // `hw1[4]`, the bottom of `opc1`; `CRm` is `hw2[3:0]`, so `c16` lands
+        // on `hw2[4]`, which is the single bit that tells `CDP` from `MCR`
+        // (A7.7.22 against A7.7.72) — a whole different instruction, sent to
+        // the coprocessor with a core register in place of `CRd`.
+        for (hw1, hw2) in ENCODERS.iter().chain(CONVERSIONS.iter()) {
+            let (hw1, hw2) = (*hw1, *hw2);
+            let insn = dec(hw1, hw2);
+            for i in 0..insn.operands.len() {
+                // The substitution keeps the operand's kind and precision, so
+                // that the refusal can only have come from the number: an
+                // `s`-register stays an `s`-register, a scalar stays a scalar.
+                let past_the_end = match insn.operands.get(i) {
+                    Some(Operand::FpReg(FpReg::S(_))) => Operand::FpReg(FpReg::S(32)),
+                    Some(Operand::FpReg(FpReg::D(_))) => Operand::FpReg(FpReg::D(32)),
+                    Some(Operand::FpScalar(_, lane)) => Operand::FpScalar(FpReg::D(32), lane),
+                    Some(Operand::Coproc(_)) => Operand::Coproc(16),
+                    Some(Operand::CoprocReg(_)) => Operand::CoprocReg(16),
+                    _ => continue,
+                };
+                let mangled = replacing(&insn, i, past_the_end);
+                assert_eq!(
+                    encode(&mangled),
+                    None,
+                    "operand {i} of {hw1:#06x} {hw2:#06x} ({insn}) overflowed its field"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn coprocessor_load_store_encode_refuses_addressing_it_cannot_hold() {
         // `LDC`/`STC` have four addressing forms (A7.7.39) and the encoding
         // holds exactly those. Each case here is a `Mem` or an `<option>` the
@@ -3348,15 +3431,23 @@ mod tests {
     #[test]
     fn special_register_transfers_encode_only_the_named_registers() {
         // `VMRS`/`VMSR` name their special register by a 4-bit `reg` field
-        // with nine reserved values (DDI 0406C A8.8.346), so a name outside
-        // `FP_SYSREGS` has no encoding.
+        // (DDI 0406B B6.1.14). `FP_SYSREGS` names six of the sixteen values,
+        // so ten are reserved and a name outside the table has no encoding.
+        //
+        // Five of those six are the ones B6.1.14 lists. The sixth, `MVFR2` at
+        // `reg == 0b0101`, is not in the shipped A/R manual at all — it is
+        // ARMv8, and the M profile reaches it as a memory-mapped register
+        // (DDI 0403E.e B4-664) rather than through `VMRS`. It is kept because
+        // this decoder implements the union of the profiles, and dropping it
+        // would turn a real ARMv8 encoding into `None`; but it is the one row
+        // of this table a reader cannot check against `spec/`.
         let unknown = insn(
             "vmrs",
             "T1",
             &[Operand::Reg(Reg(5)), Operand::SpecialReg("fpinst")],
         );
         assert_eq!(encode(&unknown), None);
-        // `VMSR` writes only FPSID, FPSCR and FPEXC (DDI 0406C B6.1.15); the
+        // `VMSR` writes only FPSID, FPSCR and FPEXC (DDI 0406B B6.1.15); the
         // media-feature registers are read-only, so `vmsr mvfr0, r0` is not an
         // instruction even though `vmrs r0, mvfr0` is.
         assert_eq!(dec(0xEEF7, 0x0A10).to_string(), "vmrs r0, mvfr0");
@@ -3430,6 +3521,83 @@ mod tests {
             &[Operand::Reg(Reg(2)), Operand::Text(S_RANGES[0][3])],
         );
         assert_eq!(encode(&wrong_enc), None);
+    }
+
+    #[test]
+    fn core_to_single_transfer_refuses_the_two_bits_its_neighbours_use_as_opc2() {
+        // Table A6-8 gives one shape to every 32-bit core/extension transfer:
+        // `1110 1110 A L Vn | Rt 101 C B 1 (0)(0)(0)(0)`, with `B` at
+        // `hw2[6:5]`. `B` is not spare. In the `VMOV (scalar)` rows (`C == 1`)
+        // it is `opc2`, and `opc1:opc2` is what sets the element size — the
+        // 8-bit and 16-bit sizes are Advanced SIMD and belong to `t32_simd`.
+        // Only in the `VMOV (core ↔ single)` row does A7.7.243 mark it
+        // `(0)(0)`.
+        //
+        // So ignoring `B` here is not a harmless leniency: it is this module
+        // claiming halfwords whose format says they are shaped differently,
+        // printing `vmov s7, r4` for them, and then re-encoding to `B == 0` —
+        // two bits of the image rewritten by a decode/encode round trip that
+        // is supposed to be the identity.
+        for b in [0x20u16, 0x40, 0x60] {
+            assert!(
+                decode(0xEE03, 0x4A90 | b, ADDR).is_none(),
+                "vmov s7, r4 with B set by {b:#04x} must not decode"
+            );
+            assert!(
+                decode(0xEE13, 0x4A90 | b, ADDR).is_none(),
+                "vmov r4, s7 with B set by {b:#04x} must not decode"
+            );
+        }
+        // The same halfwords with `B == 0` are the instruction the row names,
+        // so the refusals above are about those two bits and nothing else.
+        check(0xEE03, 0x4A90, "vmov s7, r4");
+        check(0xEE13, 0x4A90, "vmov r4, s7");
+    }
+
+    #[test]
+    fn generic_coprocessor_encode_bounds_every_immediate_field() {
+        // `<opc1>` and `<opc2>` are bare numbers in UAL, with nothing in the
+        // syntax to cap them, so this encoder is the only thing standing
+        // between a caller's arithmetic slip and a halfword pair. The fields
+        // are narrow and they are *not* all the same width: `CDP`'s `<opc1>`
+        // has four bits (A7.7.22) but `MCR`'s has three (A7.7.72), because
+        // `L` takes the fourth; `<opc2>` has three everywhere. `#16` is over
+        // the top of all of them and `#-1` is under the bottom of all of them,
+        // which is what makes one pair of values enough for the whole group.
+        //
+        // The low end matters as much as the high one, because `op_imm` ends
+        // in `v as u16`: an unchecked `#-1` does not stay negative, it becomes
+        // `0xFFFF` and every bit of the halfword it is shifted into comes back
+        // set. For `CDP` that is `opc1`, `CRn` and the `T` bit that tells
+        // `cdp` from `cdp2` — three fields wrong from one bad operand.
+        //
+        // Only the generic coprocessor forms are swept here: they are the
+        // encodings whose immediates go through `op_imm`. `VCVT`'s
+        // `#<fbits>` is bounded against its own `<size>` instead, and is
+        // checked in `encode_rejects_operands_the_encoding_cannot_hold`.
+        for (hw1, hw2) in [
+            (0xEE13u16, 0x27A4u16), // cdp p7, #1, c2, c3, c4, #5
+            (0xFE01, 0x0E02),       // cdp2 p14, #0, c0, c1, c2, #0
+            (0xEE23, 0x27B4),       // mcr p7, #1, r2, c3, c4, #5
+            (0xEE33, 0x27B4),       // mrc p7, #1, r2, c3, c4, #5
+            (0xEC43, 0x2714),       // mcrr p7, #1, r2, r3, c4
+            (0xEC53, 0x2714),       // mrrc p7, #1, r2, r3, c4
+        ] {
+            let insn = dec(hw1, hw2);
+            for i in 0..insn.operands.len() {
+                if !matches!(insn.operands.get(i), Some(Operand::Imm(_))) {
+                    continue;
+                }
+                for value in [-1i64, 16] {
+                    let mangled = replacing(&insn, i, Operand::Imm(value));
+                    assert_eq!(
+                        encode(&mangled),
+                        None,
+                        "operand {i} of {hw1:#06x} {hw2:#06x} ({insn}) accepted #{value}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

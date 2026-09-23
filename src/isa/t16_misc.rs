@@ -1,6 +1,6 @@
 //! Miscellaneous 16-bit instructions — `hw1[15:12] == 0b1011`.
 //!
-//! ARM DDI 0403E.e Table A5-6 (§A5.2.5) for the M profile, ARM DDI 0406C
+//! ARM DDI 0403E.e Table A5-6 (§A5.2.5) for the M profile, ARM DDI 0406B
 //! Table A6-6 (§A6.2.5) for A/R, and the shared sub-table of if-then and hint
 //! encodings (Table A5-7 / Table A6-7). The discriminator is
 //! `opcode = hw1[11:5]`; everything the two tables leave out is UNDEFINED.
@@ -35,7 +35,7 @@
 //!
 //! * `SETEND` (`1011 0110 010 (1) E (0)(0)(0)`) — only `0xB650` and `0xB658`.
 //! * `CPS` (`1011 0110 011 im (0) A I F`) — bit 3 must be zero, and `A:I:F` must
-//!   not be `000`: `<iflags>` is "a sequence of one or more" flags (DDI 0406C
+//!   not be `000`: `<iflags>` is "a sequence of one or more" flags (DDI 0406B
 //!   B6.1.1), and the M-profile definition adds
 //!   `if I == '0' && F == '0' then UNPREDICTABLE` (DDI 0403E.e B5.2.1).
 //! * `IT` with `firstcond == 0b1111`, or with `firstcond == 0b1110` (`AL`) and
@@ -239,7 +239,7 @@ fn decode_push_pop(hw1: u16, addr: u32, mnemonic: &'static str, extra_bit: u8) -
     Some(narrow(mnemonic, "T1", addr, ops([Operand::RegList(list)])))
 }
 
-/// `SETEND` T1 — `1011 0110 010 (1) E (0)(0)(0)`, ARM DDI 0406C A8.6.157.
+/// `SETEND` T1 — `1011 0110 010 (1) E (0)(0)(0)`, ARM DDI 0406B A8.6.157.
 ///
 /// **A/R profile only.** Table A5-6 does not allocate `opcode == 0b0110010`, so
 /// on the M profile this halfword is UNDEFINED; it is decoded here because the
@@ -255,7 +255,7 @@ fn decode_setend(hw1: u16, addr: u32) -> Option<Insn> {
     Some(narrow("setend", "T1", addr, ops([Operand::Text(endian)])))
 }
 
-/// `CPS` T1 — `1011 0110 011 im (0) A I F`, ARM DDI 0406C B6.1.1 and
+/// `CPS` T1 — `1011 0110 011 im (0) A I F`, ARM DDI 0406B B6.1.1 and
 /// DDI 0403E.e B5.2.1.
 ///
 /// `im` selects the mnemonic — `cpsie` enables (clears the mask bits), `cpsid`
@@ -968,6 +968,25 @@ mod tests {
             ..base
         };
         assert_eq!(encode(&alien), None);
+
+        // `add sp, #imm` and `sub sp, #imm` are told from their siblings by
+        // the encoding name alone: the operand list is identical in all of
+        // them. `ADD (SP plus immediate)` is T2 here, T3 (`add.w`) and T4
+        // (`addw`) in the 32-bit space; `SUB (SP minus immediate)` is T1 here
+        // and T2/T3 there (A7.7.5, A7.7.176). The wide ones are four bytes
+        // long, so answering for one of them with this halfword would shrink
+        // an instruction in place and leave two bytes of the old encoding
+        // behind as data — and the mnemonic alone cannot tell them apart.
+        for (hw, mine, theirs) in [(0xB002u16, "T2", "T3"), (0xB082, "T1", "T2")] {
+            let right = decode(hw, 0, ADDR).unwrap();
+            assert_eq!(right.encoding, mine, "`{right}` is {mine}");
+            assert_eq!(encode(&right), Some(hw));
+            let renamed = Insn {
+                encoding: theirs,
+                ..right
+            };
+            assert_eq!(encode(&renamed), None, "`{renamed}` as {theirs} is wide");
+        }
     }
 
     /// The spelling table against the rule it encodes (A7.7.38, Table A7-3):

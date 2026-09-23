@@ -2,7 +2,7 @@
 //!
 //! The module is laid out to mirror Arm's own decode tree, one Rust module per
 //! numbered sub-table of the architecture reference manual (ARM DDI 0403E.e
-//! chapter A5 for the M profile, DDI 0406C chapter A6 for A/R). That mapping
+//! chapter A5 for the M profile, DDI 0406B chapter A6 for A/R). That mapping
 //! is the point: a reviewer checking this crate against the specification can
 //! put one table beside one file, and a decoding bug has exactly one place to
 //! live.
@@ -94,7 +94,7 @@ pub fn decode_at(image: &[u8], at: usize) -> Option<Insn> {
 /// `addr` is what pc-relative operands resolve against, which is what lets a
 /// caller decode a buffer that was loaded somewhere other than its file
 /// offset. `thumbee` selects the ThumbEE variant of the encoding space, in
-/// which part of the 16-bit map is re-used (ARM DDI 0406C chapter A9).
+/// which part of the 16-bit map is re-used (ARM DDI 0406B chapter A9).
 pub fn decode_at_with(image: &[u8], at: usize, addr: u32, thumbee: bool) -> Option<Insn> {
     let hw1 = read_hw(image, at)?;
     let len = insn_len(hw1);
@@ -177,10 +177,29 @@ pub fn decode_halfwords(hw1: u16, hw2: u16, addr: u32, thumbee: bool) -> Option<
         // `0b11`, so this is `0b11` and the match needs no unreachable arm.
         _ => match op2 {
             o if o & 0b111_0001 == 0b000_0000 => t32_store::decode(hw1, hw2, addr),
+            // Writing this row out is a claim about Table A5-9 rather than
+            // about behaviour, and deliberately so: it is `0xF9xx` with
+            // `hw1[4]` clear, `t32_coproc` wants `hw1[11:10] == 0b11` and
+            // these are `0b10`, so the catch-all's `or_else` would hand the
+            // very same halfwords to the very same `t32_simd::decode`.
+            // Deleting the arm is an equivalent mutation and no test can
+            // catch it. It stays because the table should read as the manual
+            // reads, and because a coprocessor row added to the catch-all
+            // later would otherwise silently swallow Advanced SIMD's.
             o if o & 0b111_0001 == 0b001_0000 => t32_simd::decode(hw1, hw2, addr),
             o if o & 0b110_0111 == 0b000_0001 => t32_load::decode(hw1, hw2, addr),
             o if o & 0b110_0111 == 0b000_0011 => t32_load::decode(hw1, hw2, addr),
             o if o & 0b110_0111 == 0b000_0101 => t32_load::decode(hw1, hw2, addr),
+            // Same again, and for the same reason. These four `op2` values
+            // are `0xF87x`, `0xF8Fx`, `0xF97x` and `0xF9Fx`; `t32_coproc`
+            // declines all four on `hw1[11:10]`, `t32_simd` declines the
+            // `0xF8` pair on the top byte and the `0xF9` pair in
+            // `decode_elem`, whose first act is to reject `hw1[4]` as no part
+            // of any encoding in that space. So the catch-all also answers
+            // `None` and deleting this arm changes nothing. It is the
+            // manual's UNDEFINED row written down, so that a row later given
+            // a meaning gets added here rather than discovered by accident in
+            // the fall-through.
             o if o & 0b110_0111 == 0b000_0111 => None, // UNDEFINED
             o if o & 0b111_0000 == 0b010_0000 => t32_dp_reg::decode(hw1, hw2, addr),
             o if o & 0b111_1000 == 0b011_0000 => t32_multiply::decode(hw1, hw2, addr),
@@ -488,11 +507,31 @@ fn faithful(insn: &Insn, hw1: u16, hw2: u16, thumbee: bool) -> bool {
             // fresh decode of the bytes alone reports it set, and neither is
             // wrong. Requiring them to match here would make every conditional
             // narrow instruction unencodable.
+            //
+            // The carve-out runs one way only. `setflags = !InITBlock()`
+            // licenses "the bits say S, the in-IT `Insn` says no S"; it says
+            // nothing about the reverse, and excusing that direction too let
+            // an `Insn` asking for `bkpts` be answered with `0xBE00`, which
+            // sets no flags.
             let flags_ok = back.sets_flags == insn.sets_flags
-                || (insn.cond.is_some() && insn.width == Width::Narrow);
+                || (insn.cond.is_some()
+                    && insn.width == Width::Narrow
+                    && back.sets_flags
+                    && !insn.sets_flags);
+            // An `IT` block supplies a condition the bits do not carry, so a
+            // decode of the bytes alone may report `None` where the `Insn`
+            // has one. A condition the bits *do* carry must match: `beq` is
+            // not `bne`.
+            let cond_ok = back.cond == insn.cond || back.cond.is_none();
             back.mnemonic == insn.mnemonic
+                // `encoding` is compared because `Insn::encoding` promises a
+                // consumer can reproduce the exact bytes. Without this,
+                // `cmp r0, r9` asked for as T1 came back as `0x4548` — which
+                // is CMP T2 — and the caller was told nothing.
+                && back.encoding == insn.encoding
                 && back.width == insn.width
                 && flags_ok
+                && cond_ok
                 && back.explicit_width == insn.explicit_width
                 && back.operands == insn.operands
         }
@@ -671,7 +710,7 @@ mod tests {
     /// A short run walked through [`Decoder`] both ways, to pin where the two
     /// states disagree and — just as important — where they do not.
     ///
-    /// The flag re-assigns `0xC000..=0xCFFF` and nothing else (ARM DDI 0406C
+    /// The flag re-assigns `0xC000..=0xCFFF` and nothing else (ARM DDI 0406B
     /// A9.2.1), so a consumer that sets it wrongly gets a wrong answer for
     /// exactly the halfwords in that range: here a handler branch read as a
     /// store-multiple, and a frame load read as a load-multiple. Every other
@@ -1005,5 +1044,232 @@ mod tests {
         assert!(!ItState::INACTIVE.active());
         assert_eq!(ItState::INACTIVE.current(), None);
         assert_eq!(ItState::INACTIVE.advance(), ItState::INACTIVE);
+    }
+
+    /// One halfword pair from every row of Table A5-9's `op1 == 0b11` half,
+    /// decoded through the dispatcher rather than through a group module.
+    ///
+    /// Every group's own tests call its `decode` directly, so a wrong guard
+    /// in this `match` is invisible to all of them: the row either stops
+    /// decoding or starts decoding as a neighbour's instruction, and the
+    /// group that should have had it never finds out. The last arm makes
+    /// that worse rather than better — it tries `t32_coproc` and then falls
+    /// back to `t32_simd`, so a row mis-routed *into* it can still come out
+    /// right and hide the mistake. `stc2`, `mcr2` and `mrc2` are named here
+    /// because that arm is the only way they are reachable at all: send the
+    /// coprocessor rows anywhere else and every one of them decodes as
+    /// `None`, which a disassembler renders as `.short` — data where an
+    /// instruction is.
+    #[test]
+    fn every_row_of_the_wide_dispatch_table_reaches_its_group() {
+        for (hw1, hw2, text) in [
+            // `op2 == 000xxx0` — store single data item.
+            (0xF841u16, 0x0B04u16, Some("str r0, [r1], #4")),
+            (0xF8C1, 0x0004, Some("str.w r0, [r1, #4]")),
+            // `001xxx0` — Advanced SIMD element or structure load/store.
+            (0xF920, 0x070F, Some("vld1.8 {d0}, [r0]")),
+            // `00xx001`, `00xx011`, `00xx101` — the three load rows.
+            (0xF811, 0x0002, Some("ldrb.w r0, [r1, r2]")),
+            (0xF831, 0x0002, Some("ldrh.w r0, [r1, r2]")),
+            (0xF851, 0x0002, Some("ldr.w r0, [r1, r2]")),
+            // `00xx111` — UNDEFINED, at both ends of the four `op2` values
+            // the row covers.
+            (0xF870, 0x0000, None),
+            (0xF9F0, 0x0000, None),
+            // `010xxxx` — data-processing (register).
+            (0xFAB1, 0xF181, Some("clz r1, r1")),
+            // `0110xxx` and `0111xxx` — multiply, and long multiply/divide.
+            (0xFB01, 0xF002, Some("mul r0, r1, r2")),
+            (0xFB91, 0xF0F2, Some("sdiv r0, r1, r2")),
+            // `1xxxxxx` — the coprocessor rows, through the fall-through arm.
+            (0xFD80, 0x0E01, Some("stc2 p14, c0, [r0, #4]")),
+            (0xFE00, 0x0E10, Some("mcr2 p14, #0, r0, c0, c0, #0")),
+            (0xFE10, 0x0E10, Some("mrc2 p14, #0, r0, c0, c0, #0")),
+        ] {
+            let decoded = decode_halfwords(hw1, hw2, 0x1000, false);
+            // Computed here rather than inline in the message: a format
+            // argument is only evaluated when the assertion fails, so inline
+            // it would be an uncovered region on every passing run.
+            let op2 = (hw1 >> 4) & 0b111_1111;
+            assert_eq!(
+                decoded.map(|i| i.to_string()).as_deref(),
+                text,
+                "{hw1:#06x} {hw2:#06x} (op2 {op2:#09b}) was routed elsewhere"
+            );
+        }
+    }
+
+    /// [`encode`] refuses to answer with bytes that decode back to a
+    /// different instruction, and `sets_flags` is part of "different".
+    ///
+    /// The narrow branch, push, pop and hint encodings have no `S` bit at
+    /// all, and their group encoders have none to check against — they build
+    /// the halfword from the operands and hand it back. So [`faithful`] is
+    /// the only thing standing between a caller who sets `sets_flags` on one
+    /// of them and two bytes that quietly do not set the flags. In a patched
+    /// image that is the worst kind of wrong: the instruction is valid, the
+    /// disassembly looks right, and the conditional branch a few bytes later
+    /// reads flags nobody wrote.
+    ///
+    /// The leniency at the end is the reason `faithful` cannot simply demand
+    /// equality, and it runs one way only: it excuses an `Insn` that carries
+    /// *fewer* flags than the bits do, never more. So each halfword is
+    /// offered with an `IT` block's condition as well as without one — an
+    /// excuse that ran both ways would let `pusheq {r4, lr}` be asked for
+    /// with the `S` set and answered with the plain halfword.
+    #[test]
+    fn encode_refuses_a_flag_the_halfword_cannot_carry() {
+        for hw in [0xB510u16, 0xBD10, 0xE7FE, 0xBF00] {
+            let insn = decode_halfwords(hw, 0, 0x1000, false).expect("a defined halfword");
+            assert!(!insn.sets_flags, "{hw:#06x} has no S bit");
+            assert_eq!(insn.cond, None, "{hw:#06x} is unconditional");
+            assert_eq!(encode(&insn), Some((hw, 0)));
+            for cond in [None, Some(Cond::Eq)] {
+                let mut flagged = insn;
+                flagged.cond = cond;
+                flagged.sets_flags = true;
+                assert_eq!(
+                    encode(&flagged),
+                    None,
+                    "`{flagged}` has no encoding: {hw:#06x} does not set the flags"
+                );
+                // The condition on its own is fine — it comes from an
+                // enclosing `IT` and changes not one bit of the halfword —
+                // so the rejection above is of the flag, not of the `IT`.
+                let mut conditional = insn;
+                conditional.cond = cond;
+                assert_eq!(encode(&conditional), Some((hw, 0)));
+            }
+        }
+
+        // The one disagreement that is allowed, and why: the 16-bit
+        // data-processing encodings specify `setflags = !InITBlock()`, so
+        // `lsleq r0, r1, #2` and `lsls r0, r1, #2` are the same halfword.
+        // A fresh decode of `0x0088` reports the flags it sets outside a
+        // block; an `Insn` that came through an `IT` does not.
+        let bare = decode_halfwords(0x0088, 0, 0x1000, false).expect("lsls r0, r1, #2");
+        assert!(bare.sets_flags);
+        let mut in_it = bare;
+        in_it.cond = Some(Cond::Eq);
+        in_it.sets_flags = false;
+        assert_eq!(
+            encode(&in_it),
+            Some((0x0088, 0)),
+            "a conditional narrow instruction may disagree about the flags"
+        );
+    }
+
+    /// The one disagreement about the flags [`faithful`] excuses, held to
+    /// its exact shape at the verifier itself rather than through [`encode`].
+    ///
+    /// Through `encode` the interesting half is unreachable: every narrow
+    /// group encoder carries its own copy of the rule — `t16_shift`'s
+    /// `flags_ok`, and its siblings' — so an `Insn` with `sets_flags` clear,
+    /// no condition and a flag-setting encoding is refused before a candidate
+    /// halfword is ever built, and this check never sees it. That leaves the
+    /// clause below as the crate's only *statement* of the rule's shape
+    /// rather than a second opinion on it, and a test that calls `faithful`
+    /// directly as the only thing that can hold it to that shape.
+    ///
+    /// The shape: `setflags = !InITBlock()` — the pseudocode of every 16-bit
+    /// data-processing encoding in A5.2 — licenses exactly one direction.
+    /// Bits that set the flags may be described by an `Insn` inside an `IT`
+    /// block that does not. Outside a block the same `Insn` is a different
+    /// instruction: `lsl r0, r1, #2` with the flags left alone is
+    /// `LSL (immediate)` T2, four bytes of `0xEA4F 0x0081`. Answering it with
+    /// the two bytes of `lsls` writes flags the caller asked to preserve, and
+    /// in a patched image the next conditional branch reads them.
+    #[test]
+    fn the_flag_carve_out_excuses_an_it_block_and_nothing_else() {
+        let bits = decode_halfwords(0x0088, 0, 0x1000, false).expect("lsls r0, r1, #2");
+        assert!(bits.sets_flags);
+        assert_eq!(bits.cond, None);
+        assert_eq!(bits.width, Width::Narrow);
+        // The bits described exactly: there is nothing to excuse.
+        assert!(faithful(&bits, 0x0088, 0, false));
+
+        // Inside an `IT` block — the one excused direction.
+        let mut in_it = bits;
+        in_it.cond = Some(Cond::Eq);
+        in_it.sets_flags = false;
+        assert!(faithful(&in_it, 0x0088, 0, false), "`lsleq` is `0x0088`");
+
+        // Outside one, the identical disagreement is a different
+        // instruction, and the condition is the whole of what tells them
+        // apart.
+        let mut bare = bits;
+        bare.sets_flags = false;
+        assert!(
+            !faithful(&bare, 0x0088, 0, false),
+            "no enclosing `IT`, so `0x0088`'s S bit is not excusable"
+        );
+    }
+
+    /// A condition the halfword itself carries is compared; one an `IT` block
+    /// supplied is not.
+    ///
+    /// `B<c>` T1 spells its condition in `hw1[11:8]` (A7.7.12), so `beq` and
+    /// `bne` are different halfwords — excusing a disagreement there would
+    /// let a patched branch be answered with the one that takes the other
+    /// leg. Nothing else in the 16-bit space has a condition field at all, so
+    /// a decode of the bytes alone reports `None` where an `Insn` that walked
+    /// out of a [`Decoder`] inside an `IT` block carries `Some`, which is why
+    /// the check cannot simply be equality.
+    #[test]
+    fn a_condition_in_the_bits_must_match_and_one_from_an_it_block_need_not() {
+        let beq = decode_halfwords(0xD0FE, 0, 0x1000, false).expect("beq .");
+        assert_eq!(beq.cond, Some(Cond::Eq));
+        assert!(faithful(&beq, 0xD0FE, 0, false));
+        let mut bne = beq;
+        bne.cond = Some(Cond::Ne);
+        assert!(
+            !faithful(&bne, 0xD0FE, 0, false),
+            "`bne .` is `0xD1FE`: this halfword carries its own condition"
+        );
+
+        // `nop` has no condition field, so the one an `IT` block supplies is
+        // invisible to a fresh decode and has to be excused.
+        let nop = decode_halfwords(0xBF00, 0, 0x1000, false).expect("nop");
+        assert_eq!(nop.cond, None);
+        let mut nopeq = nop;
+        nopeq.cond = Some(Cond::Eq);
+        assert!(faithful(&nopeq, 0xBF00, 0, false), "`nopeq` is `0xBF00`");
+    }
+
+    /// [`disassemble`] sizes its output from what the image can yield, not
+    /// from the `count` it was asked for.
+    ///
+    /// `count` is routinely a number read *out of* the image — a claimed
+    /// function length, a table size — so it is attacker-shaped input, and a
+    /// four-byte one can ask for four billion lines from a six-byte slice.
+    /// The shortest Thumb instruction is two bytes, so the slice can yield
+    /// at most `len / 2` of them whatever `count` says.
+    ///
+    /// The reservation is what is asserted, because it is the only thing the
+    /// ceiling affects — the lines themselves come out the same either way.
+    /// `Vec` gives at least the capacity asked for and never shrinks, and
+    /// three pushes into a capacity of three do not reallocate, so an exact
+    /// three is the ceiling having been computed: a `count`-sized
+    /// reservation would be larger and a miscomputed ceiling would leave the
+    /// vector to grow on its own to a rounded-up four.
+    #[test]
+    fn disassemble_reserves_no_more_than_the_image_can_yield() {
+        // Three `nop`s — six bytes, so three instructions at the very most.
+        let image = [0x00, 0xBF, 0x00, 0xBF, 0x00, 0xBF];
+        let out = disassemble(&image, 0, 0x1000, 100_000);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "00001000: nop");
+        assert_eq!(out.capacity(), 3, "reserved for `count`, not for the image");
+
+        // The ceiling is measured from `at`, not from the start of the
+        // image: two bytes remain here, so one instruction can come out.
+        let from_middle = disassemble(&image, 4, 0x1004, 100_000);
+        assert_eq!(from_middle.len(), 1);
+        assert_eq!(from_middle.capacity(), 1);
+
+        // And `count` still wins when it is the smaller of the two.
+        let clipped = disassemble(&image, 0, 0x1000, 2);
+        assert_eq!(clipped.len(), 2);
+        assert_eq!(clipped.capacity(), 2);
     }
 }

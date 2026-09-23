@@ -3,7 +3,7 @@
 //! ThumbEE (Thumb Execution Environment) is a variant of the Thumb instruction
 //! set introduced in ARMv7 as a compilation target for managed runtimes: code
 //! generated ahead of, or during, execution from a bytecode or intermediate
-//! form (ARM DDI 0406C A2.10, "Execution environment support"). It buys three
+//! form (ARM DDI 0406B A2.10, "Execution environment support"). It buys three
 //! things a JIT wants and plain Thumb makes expensive — an implicit null check
 //! on every load and store, an array-bounds check (`CHKA`), and a dense call
 //! into a table of runtime handlers (`HB`, `HBL`, `HBP`, `HBLP`) — and pays for
@@ -11,7 +11,7 @@
 //! `BLX (immediate)` and the 16-bit `LDM`/`STM` (A9.1).
 //!
 //! It is an **A/R-profile-only** extension: required in ARMv7-A, optional in
-//! ARMv7-R (DDI 0406C A1.3 and B1.4.2), reported by `ID_ISAR3.ThumbEE_extn`,
+//! ARMv7-R (DDI 0406B A1.3 and B1.4.2), reported by `ID_ISAR3.ThumbEE_extn`,
 //! absent from every M-profile core, and dropped altogether in ARMv8. Arm
 //! deprecated it long before that, so in practice almost no image contains
 //! ThumbEE code.
@@ -158,7 +158,7 @@
 //! `HB`, `HBL`, `HBP` and `HBLP` branch to `TEEHBR + handler:'00000'` — the
 //! handler table based at `HandlerBase`, held in the ThumbEE Handler Base
 //! Register and reachable only through `MRC p14, 6, <Rt>, c1, c0, 0`
-//! (DDI 0406C A2.11.2). A decoder holding one halfword cannot know it, and
+//! (DDI 0406B A2.10.1). A decoder holding one halfword cannot know it, and
 //! neither can a consumer holding a firmware image, so no [`Operand::Target`]
 //! is emitted and [`Insn::branch_target`] correctly answers `None`. The
 //! `handler` field is carried as a plain [`Operand::Imm`] — it is an index into
@@ -459,7 +459,7 @@ fn decode_frame(hw1: u16, addr: u32, mnemonic: &'static str) -> Option<Insn> {
 /// layers guard against it: the `(mnemonic, encoding)` pair must match exactly
 /// (the ThumbEE-only names `chka`/`hb`/`hbl`/`hbp`/`hblp`, or `ldr`/`str` with
 /// one of A9's `E1`/`E2`/`E3` encoding names, which no Thumb encoding uses —
-/// DDI 0406C A6.1 reserves `E<n>` for "ThumbEE encodings that are not also
+/// DDI 0406B A8.1.3 reserves `E<n>` for "ThumbEE encodings that are not also
 /// Thumb encodings"), the operand count must be exact, and every field must fit
 /// the width and scaling its encoding gives it.
 ///

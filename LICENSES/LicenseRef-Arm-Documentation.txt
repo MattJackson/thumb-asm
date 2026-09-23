@@ -9,7 +9,7 @@ WHAT IT COVERS
 
   spec/ARMv5_DDI0100I.pdf      ARM Architecture Reference Manual, DDI 0100I
   spec/ARMv7-M_DDI0403E.pdf    Armv7-M Architecture Reference Manual, DDI 0403E.e
-  spec/ARMv7-AR_DDI0406C.pdf   ARMv7-A/R Architecture Reference Manual, DDI 0406C
+  spec/ARMv7-AR_DDI0406B.pdf   ARMv7-A/R Architecture Reference Manual, DDI 0406B
   spec/ARMv6-M_DDI0419.pdf     Armv6-M Architecture Reference Manual, DDI 0419C
 
   spec/ARMv7-M.txt             plain-text dumps of the above, produced with

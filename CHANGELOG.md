@@ -11,8 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Emitted bytes changed
 
-No *instruction encoding* changed: the digest is unchanged from 0.11.0 —
-58,233 decoded 16-bit halfwords, `0x0e06fda25d6b89e8`.
+**`VLD4` (single 4-element structure to all lanes) with `:128` alignment now
+encodes, and the UNDEFINED spelling of it no longer decodes.** The guard on
+`size == 0b11` was inverted. A8.6.320 says `if size == '11' && a == '0' then
+UNDEFINED`, and its `<align>` list gives 128 as "available only if `<size>` is
+32, encoded as `a = 1, size = 0b11`" — so the `a` bit that asks for 16-byte
+alignment is *required* there. The code required it to be clear. The two
+consequences were opposite and both wrong: `vld4.32 {d0[],d1[],d2[],d3[]},
+[r0:128]` — the only legal 128-bit-aligned form — was refused by `encode`,
+while the UNDEFINED `a == 0` pattern was decoded as though it were that form.
+Anything that round-tripped agreed with itself, which is why no sweep saw it.
+
+The 16-bit digest is unchanged — 58,233 decoded halfwords,
+`0x0e06fda25d6b89e8` — because this is a 32-bit encoding and the digest does
+not cover that space. Do not read "digest unchanged" as "no bytes moved": if
+you emit or decode that VLD4 form, bytes moved.
 
 **But placement did.** The `find_free_space_in` fix below changes the address
 returned for callers who pass more than one region, so an image built through
@@ -42,6 +55,31 @@ correct; announcing it only in prose was not.
   address: `First` is the lowest offset, `Largest` breaks ties on the lowest
   offset. Reported by a consumer; it shipped in 0.11.0 through a green gate,
   because nothing tested the same regions in two orders.
+
+- **`isa::encode` could return bytes for a different encoding than the one
+  asked for.** `faithful`, the check every candidate encoding is put through,
+  compared mnemonic, width, operands, flags and condition — but never
+  `encoding`. So an `Insn` naming `CMP (register)` T1 was answered with
+  `0x4548`, which is T2: the same mnemonic and the same two registers, a
+  different instruction format, and the only encoding of the two that can
+  reach `r9` at all. Anything round-tripping through `decode` was unaffected,
+  because the `Insn` it produced already named the encoding the bits held; the
+  exposure was to callers who build an `Insn` by hand and name an encoding.
+  `faithful` now compares `encoding` as well.
+
+- **Every ARMv7-A/R manual citation pointed at a revision the repository does
+  not ship.** `spec/` carries `ARM DDI 0406B_errata_2011_Q2`, whose own title
+  page says so, while sixty citations labelled it `DDI 0406C` — and revision C
+  renumbers the instruction sections, so nine of them named `A8.8.x` sections
+  that do not exist in the shipped text. The labels are now `0406B` and the
+  numbers are revision B's, resolved by instruction name rather than by
+  arithmetic, since the renumbering is not an offset: `A8.8.127` is PLD/PLDW
+  in C, whereas `A8.6.127` is QASX in B. The file is renamed to
+  `spec/ARMv7-AR_DDI0406B.pdf` to match. Checking this also found four
+  citations that were simply wrong — `Table A6-30` and `A2.11.2` do not exist
+  in revision B, `A8.6.184` is `SSAT16` rather than `STC/STC2`, and the `reg`
+  field of `VMRS` is documented in `B6.1.14`, not in the `VMSR` section — plus
+  a miscount of the reserved `VMRS` encodings, which is ten and not nine.
 
 ### Added
 
@@ -76,6 +114,22 @@ correct; announcing it only in prose was not.
 - **`docs/ENCODING-STABILITY.md`** and a pinned encoding digest in the test
   suite, so a change to emitted bytes fails the build before it reaches a
   consumer's known-answer test.
+
+### Testing
+
+- **A mutation-testing campaign over the whole crate**, on the principle that
+  a surviving mutant in a library that reflashes devices is a potential brick
+  rather than a missing unit test. The score moves from 89.0% to **91.1%** of
+  7,624 mutants, and from 96.9% to **99.1%** once the provably-equivalent
+  families are set aside — roughly 64 real survivors remain, down from 206.
+  It also found the `VLD4` bug above, which is the point: a round trip cannot
+  see a decoder and an encoder that are wrong in the same direction. Mutants that survived were triaged one at a
+  time into "the tests do not notice this" and "no test could notice this,
+  because the change is unobservable at the public boundary" — the second
+  class is recorded in comments beside the code, with the argument, so the
+  next person does not re-derive it. Where a guard turned out to be genuinely
+  unobservable it was left alone rather than given a test asserting an
+  implementation detail.
 
 ### Documentation
 

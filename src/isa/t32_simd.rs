@@ -1,9 +1,9 @@
-//! Advanced SIMD (NEON) in its Thumb encodings — ARM DDI 0406C chapter A7,
+//! Advanced SIMD (NEON) in its Thumb encodings — ARM DDI 0406B chapter A7,
 //! sections A7.4 (data processing) and A7.7 (element or structure load/store).
 //!
 //! This is an **ARMv7-A/R** extension: it does not exist in the M profile, so
 //! nothing here is reachable from ARM DDI 0403E.e and the authority for every
-//! claim below is DDI 0406C (the in-tree text dump `spec/ARMv7-AR.txt` is the
+//! claim below is DDI 0406B (the in-tree text dump `spec/ARMv7-AR.txt` is the
 //! B edition of the same manual; the bit diagrams are identical except that
 //! the B edition predates `VFMA`/`VFMS` and writes the alignment qualifier
 //! `@<align>` where the C edition and every assembler write `:<align>`).
@@ -706,6 +706,14 @@ fn all_lanes_fields(n: u8, size: u16, a: bool) -> Option<(u16, u16)> {
         }
         _ => {
             if size == 3 {
+                // A8.6.320: `if size == '11' && a == '0' then UNDEFINED`, and
+                // `<align>` lists 128 as "available only if <size> is 32,
+                // encoded as a = 1, size = 0b11". So `size == 0b11` is the
+                // 32-bit element size *spelled to ask for 16-byte alignment*,
+                // and the `a` bit that asks for it is required, not forbidden.
+                // Reading the condition the other way round refuses the only
+                // legal `:128` form and decodes the UNDEFINED one as if it
+                // were that form.
                 if !a {
                     return None;
                 }
@@ -2754,6 +2762,217 @@ mod tests {
         assert_eq!(n, 4820, "single-lane and all-lanes forms decoded");
     }
 
+    /// One cell of [`LANE_INDEX_ALIGN`]: the `(index, inc, align)` a single
+    /// `index_align` value names — the lane the transfer touches, the spacing
+    /// between the registers of the list, and the alignment in bits (0 for
+    /// "omitted") — or `None` where the instruction page makes that value
+    /// UNDEFINED. It is [`lane_fields`]' return type, named so that the three
+    /// nesting levels of the table below are readable.
+    type LaneFields = Option<(u8, u8, u16)>;
+
+    /// What `index_align` names in each of the twelve single-lane cells,
+    /// indexed by `[n - 1][size]` and then by the field's own value.
+    ///
+    /// A second reading of the `case size of` blocks of A8.6.308, A8.6.311,
+    /// A8.6.314 and A8.6.317 — the `(index, inc, align)` each of the sixteen
+    /// values names, or `None` where that page makes it UNDEFINED.
+    ///
+    /// It is written out rather than computed because the sweeps above cannot
+    /// see this at all. [`lane_fields`] is *both* directions of the
+    /// single-lane forms: `decode_elem` reads it forward and `encode_elem`
+    /// inverts it by scanning `index_align` for a match, so a cell that hands
+    /// the right `(index, inc, align)` to the wrong bit pattern still
+    /// round-trips, and `sweep_single_lane` still counts 4820 decodes. Only
+    /// the bytes change — and they are the whole product here. `vld1.8
+    /// {d0[3]}, [r0]` is `index_align == 0b0110` and nothing else; an
+    /// assembler that wrote `0b0111` would set the bit A8.6.308 makes
+    /// UNDEFINED, and one that wrote `0b0010` would load lane 1.
+    #[rustfmt::skip]
+    const LANE_INDEX_ALIGN: [[[LaneFields; 16]; 3]; 4] = [
+        [ // VLD1/VST1
+            // `index_align<0>` must be 0 (A8.6.308), and an 8-bit element
+            // needs no alignment: three bits of index and a bit that must be
+            // clear.
+            [ // size = 0b00
+                Some((0, 1, 0)), None, Some((1, 1, 0)), None,
+                Some((2, 1, 0)), None, Some((3, 1, 0)), None,
+                Some((4, 1, 0)), None, Some((5, 1, 0)), None,
+                Some((6, 1, 0)), None, Some((7, 1, 0)), None,
+            ],
+            [ // size = 0b01 — `index_align<1>` must be 0; `<0>` is `:16`.
+                Some((0, 1, 0)), Some((0, 1, 16)), None, None,
+                Some((1, 1, 0)), Some((1, 1, 16)), None, None,
+                Some((2, 1, 0)), Some((2, 1, 16)), None, None,
+                Some((3, 1, 0)), Some((3, 1, 16)), None, None,
+            ],
+            // `<2>` must be 0 and `<1:0>` must be `00` or `11`, so three
+            // quarters of this column is UNDEFINED; `11` is `:32`.
+            [ // size = 0b10
+                Some((0, 1, 0)), None, None, Some((0, 1, 32)),
+                None, None, None, None,
+                Some((1, 1, 0)), None, None, Some((1, 1, 32)),
+                None, None, None, None,
+            ],
+        ],
+        [ // VLD2/VST2
+            [ // size = 0b00 — A8.6.311: nothing here is UNDEFINED. `<0>` is `:16`.
+                Some((0, 1, 0)), Some((0, 1, 16)), Some((1, 1, 0)), Some((1, 1, 16)),
+                Some((2, 1, 0)), Some((2, 1, 16)), Some((3, 1, 0)), Some((3, 1, 16)),
+                Some((4, 1, 0)), Some((4, 1, 16)), Some((5, 1, 0)), Some((5, 1, 16)),
+                Some((6, 1, 0)), Some((6, 1, 16)), Some((7, 1, 0)), Some((7, 1, 16)),
+            ],
+            [ // size = 0b01 — `<1>` doubles the spacing, `<0>` is `:32`.
+                Some((0, 1, 0)), Some((0, 1, 32)), Some((0, 2, 0)), Some((0, 2, 32)),
+                Some((1, 1, 0)), Some((1, 1, 32)), Some((1, 2, 0)), Some((1, 2, 32)),
+                Some((2, 1, 0)), Some((2, 1, 32)), Some((2, 2, 0)), Some((2, 2, 32)),
+                Some((3, 1, 0)), Some((3, 1, 32)), Some((3, 2, 0)), Some((3, 2, 32)),
+            ],
+            [ // size = 0b10 — `<1>` must be 0; `<2>` doubles the spacing and `<0>` is `:64`.
+                Some((0, 1, 0)), Some((0, 1, 64)), None, None,
+                Some((0, 2, 0)), Some((0, 2, 64)), None, None,
+                Some((1, 1, 0)), Some((1, 1, 64)), None, None,
+                Some((1, 2, 0)), Some((1, 2, 64)), None, None,
+            ],
+        ],
+        [ // VLD3/VST3
+            // A8.6.314: a three-register structure is never aligned, so
+            // every alignment bit must be clear.
+            [ // size = 0b00
+                Some((0, 1, 0)), None, Some((1, 1, 0)), None,
+                Some((2, 1, 0)), None, Some((3, 1, 0)), None,
+                Some((4, 1, 0)), None, Some((5, 1, 0)), None,
+                Some((6, 1, 0)), None, Some((7, 1, 0)), None,
+            ],
+            [ // size = 0b01 — `<0>` must be 0; `<1>` doubles the spacing.
+                Some((0, 1, 0)), None, Some((0, 2, 0)), None,
+                Some((1, 1, 0)), None, Some((1, 2, 0)), None,
+                Some((2, 1, 0)), None, Some((2, 2, 0)), None,
+                Some((3, 1, 0)), None, Some((3, 2, 0)), None,
+            ],
+            [ // size = 0b10 — `<1:0>` must be 0; `<2>` doubles the spacing.
+                Some((0, 1, 0)), None, None, None,
+                Some((0, 2, 0)), None, None, None,
+                Some((1, 1, 0)), None, None, None,
+                Some((1, 2, 0)), None, None, None,
+            ],
+        ],
+        [ // VLD4/VST4
+            [ // size = 0b00 — A8.6.317: `<0>` is `:32` and nothing is UNDEFINED.
+                Some((0, 1, 0)), Some((0, 1, 32)), Some((1, 1, 0)), Some((1, 1, 32)),
+                Some((2, 1, 0)), Some((2, 1, 32)), Some((3, 1, 0)), Some((3, 1, 32)),
+                Some((4, 1, 0)), Some((4, 1, 32)), Some((5, 1, 0)), Some((5, 1, 32)),
+                Some((6, 1, 0)), Some((6, 1, 32)), Some((7, 1, 0)), Some((7, 1, 32)),
+            ],
+            [ // size = 0b01 — `<1>` doubles the spacing, `<0>` is `:64`.
+                Some((0, 1, 0)), Some((0, 1, 64)), Some((0, 2, 0)), Some((0, 2, 64)),
+                Some((1, 1, 0)), Some((1, 1, 64)), Some((1, 2, 0)), Some((1, 2, 64)),
+                Some((2, 1, 0)), Some((2, 1, 64)), Some((2, 2, 0)), Some((2, 2, 64)),
+                Some((3, 1, 0)), Some((3, 1, 64)), Some((3, 2, 0)), Some((3, 2, 64)),
+            ],
+            // `<1:0>` is the alignment — `01` is `:64`, `10` is `:128` and
+            // `11` alone is UNDEFINED; `<2>` doubles the spacing.
+            [ // size = 0b10
+                Some((0, 1, 0)), Some((0, 1, 64)), Some((0, 1, 128)), None,
+                Some((0, 2, 0)), Some((0, 2, 64)), Some((0, 2, 128)), None,
+                Some((1, 1, 0)), Some((1, 1, 64)), Some((1, 1, 128)), None,
+                Some((1, 2, 0)), Some((1, 2, 64)), Some((1, 2, 128)), None,
+            ],
+        ],
+    ];
+
+    /// Every `index_align` value of every single-lane cell means what Tables
+    /// A8-5 to A8-11 say it means.
+    #[test]
+    fn index_align_names_the_lane_the_manual_gives_it() {
+        for (i, per_size) in LANE_INDEX_ALIGN.iter().enumerate() {
+            let n = i as u8 + 1;
+            for (size, want) in per_size.iter().enumerate() {
+                for (ia, &expect) in want.iter().enumerate() {
+                    assert_eq!(
+                        lane_fields(n, size as u16, ia as u16),
+                        expect,
+                        "VLD{n} size {size:#04b} index_align {ia:#06b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One cell of [`ALL_LANES`]: the `(size code, alignment in bits)` a
+    /// `(size, a)` pair names in the "to all lanes" forms, or `None` where
+    /// the instruction page makes that pair UNDEFINED. Alignment is 0 for
+    /// "omitted", as everywhere else here.
+    type AllLanesFields = Option<(u16, u16)>;
+
+    /// What every `(size, a)` pair names, indexed by `[n - 1][size][a]`.
+    ///
+    /// A second reading of A8.6.309, A8.6.312, A8.6.315 and A8.6.318, and it
+    /// is needed for the same reason [`LANE_INDEX_ALIGN`] is:
+    /// [`all_lanes_fields`] is inverted by scanning `(size, a)` for the pair
+    /// `encode_elem` wants, so an alignment that is wrong here is wrong in
+    /// both directions at once and every round trip still closes.
+    ///
+    /// What changes is the qualifier this module prints and believes. `a` is
+    /// an assertion about the pointer, not a preference: A8.6.312 says a
+    /// `vld2.32 {d0[], d1[]}, [r0:64]` whose `r0` is not 8-byte aligned takes
+    /// an alignment fault, so printing `:64` where the architecture said
+    /// `:32` invents a promise the original code never made.
+    #[rustfmt::skip]
+    const ALL_LANES: [[[AllLanesFields; 2]; 4]; 4] = [
+        // A8.6.309: an 8-bit element has nothing to align to, so `VLD1`'s
+        // `size == 0b00` with `a` set is the one UNDEFINED pair here.
+        [ // VLD1                    a = 0                 a = 1
+            /* size = 0b00 */ [Some((0, 0)),         None              ],
+            /* size = 0b01 */ [Some((1, 0)),         Some((1, 16))     ],
+            /* size = 0b10 */ [Some((2, 0)),         Some((2, 32))     ],
+            /* size = 0b11 */ [None,                 None              ],
+        ],
+        // A8.6.312: a two-element structure aligns to two elements.
+        [ // VLD2
+            /* size = 0b00 */ [Some((0, 0)),         Some((0, 16))     ],
+            /* size = 0b01 */ [Some((1, 0)),         Some((1, 32))     ],
+            /* size = 0b10 */ [Some((2, 0)),         Some((2, 64))     ],
+            /* size = 0b11 */ [None,                 None              ],
+        ],
+        // A8.6.315: three elements are never a power of two, so `VLD3` has
+        // no alignment at all and `a` set is UNDEFINED in every size.
+        [ // VLD3
+            /* size = 0b00 */ [Some((0, 0)),         None              ],
+            /* size = 0b01 */ [Some((1, 0)),         None              ],
+            /* size = 0b10 */ [Some((2, 0)),         None              ],
+            /* size = 0b11 */ [None,                 None              ],
+        ],
+        // A8.6.318: four elements would align to 128 bits at `.32`, which
+        // does not fit the `a` bit — so `size == 0b11` is not a size here at
+        // all but a second 32-bit row carrying the wider qualifier, and it
+        // exists only with `a` set. That irregularity is why the `.32` row
+        // above it stops at `:64` instead of doubling like the rest.
+        [ // VLD4
+            /* size = 0b00 */ [Some((0, 0)),         Some((0, 32))     ],
+            /* size = 0b01 */ [Some((1, 0)),         Some((1, 64))     ],
+            /* size = 0b10 */ [Some((2, 0)),         Some((2, 64))     ],
+            /* size = 0b11 */ [None,                 Some((2, 128))    ],
+        ],
+    ];
+
+    /// Every `(size, a)` pair of every "to all lanes" form means what its
+    /// instruction page says it means.
+    #[test]
+    fn the_all_lanes_forms_align_where_their_pages_say_they_do() {
+        for (i, per_size) in ALL_LANES.iter().enumerate() {
+            let n = i as u8 + 1;
+            for (size, want) in per_size.iter().enumerate() {
+                for (a, &expect) in want.iter().enumerate() {
+                    assert_eq!(
+                        all_lanes_fields(n, size as u16, a == 1),
+                        expect,
+                        "VLD{n} size {size:#04b} a = {a}"
+                    );
+                }
+            }
+        }
+    }
+
     // -- A7.4.1: three registers of the same length ------------------------
 
     #[test]
@@ -2994,6 +3213,37 @@ mod tests {
             }
         }
         assert_eq!(dup, 154, "VDUP (scalar) forms decoded");
+    }
+
+    /// What each `imm4` of `VDUP (scalar)` names: the element size as an
+    /// index into [`VDUP_NAMES`] and the lane, or `None` where A8.6.302
+    /// leaves the field UNDEFINED.
+    ///
+    /// `imm4` is the one-hot trick `index_align` plays in A7.7 read the other
+    /// way up — the marker is at the bottom and the index above it — and
+    /// [`vdup_fields`] is again both directions, `encode_vdup` inverting it by
+    /// scanning all sixteen values. So a slip in the shift that lifts the
+    /// index off the marker survives every round trip in `sweep_vext_vtbl_vdup`
+    /// and changes only which lane of the source register is broadcast:
+    /// `vdup.8 d0, d5[7]` and `vdup.8 d0, d5[0]` are the same four bytes to a
+    /// sweep and different data to the device.
+    #[rustfmt::skip]
+    const VDUP_IMM4: [Option<(usize, u8)>; 16] = [
+        // `x000` marks nothing and is UNDEFINED; `xxx1` is a byte and keeps
+        // three bits of index, `xx10` a halfword with two, `x100` a word with
+        // one.
+        None,           Some((0, 0)),   Some((1, 0)),   Some((0, 1)),
+        Some((2, 0)),   Some((0, 2)),   Some((1, 1)),   Some((0, 3)),
+        None,           Some((0, 4)),   Some((1, 2)),   Some((0, 5)),
+        Some((2, 1)),   Some((0, 6)),   Some((1, 3)),   Some((0, 7)),
+    ];
+
+    /// Every `imm4` of `VDUP (scalar)` names the lane A8.6.302 gives it.
+    #[test]
+    fn vdup_reads_its_element_size_off_the_bottom_of_imm4() {
+        for (imm4, &expect) in VDUP_IMM4.iter().enumerate() {
+            assert_eq!(vdup_fields(imm4 as u16), expect, "imm4 {imm4:#06b}");
+        }
     }
 
     // -- The quadword numbering rule ---------------------------------------
@@ -3249,6 +3499,15 @@ mod tests {
         assert_eq!(row(2, 1, 30, 1), "{d30[], d31[]}");
         assert_eq!(row(1, 1, 9, 2), "{d9[0]}");
         assert_eq!(row(3, 1, 1, 9), "{d1[7], d2[7], d3[7]}");
+        // `d10` is where [`put_num`] starts printing two digits, and the one
+        // number the sweeps never reach: `DREGS` steps 0, 1, 15, 16, 31 and
+        // skips the whole decade. A tens digit dropped here would not fail
+        // any round trip — `list_fields` scans the same table back — it would
+        // quietly put `{d10}`'s spelling and `{d0}`'s in two rows reading
+        // `{d0}`, and the scan would answer `d0` for both.
+        assert_eq!(row(1, 1, 9, 0), "{d9}");
+        assert_eq!(row(1, 1, 10, 0), "{d10}");
+        assert_eq!(row(2, 1, 10, 0), "{d10, d11}");
         // The longest spelling the table can produce — the claim [`TEXT_W`] is
         // sized against.
         let longest = row(4, 2, 24, 9);
@@ -3649,7 +3908,39 @@ mod tests {
     /// an odd doubleword where a quadword must start, an immediate out of
     /// every range this module encodes, a lane no element size has, a list of
     /// the wrong length or spacing, and addresses A7.7.1 cannot spell.
-    const WRONG: [Operand; 21] = [
+    /// Operands to substitute into every slot of every sample.
+    ///
+    /// The boundary entries at the end were added after mutation testing
+    /// showed the shape guards were thoroughly exercised and the *range*
+    /// guards were not at all. `FpReg::D`/`Q` and `FpScalar` carry bare
+    /// `u8`s with no range invariant, so a caller can name a register or a
+    /// lane that does not exist — and each one fails in a different and
+    /// quiet way rather than by being out of range:
+    ///
+    /// * `D(32)` / `Q(16)`: `D:Vd` is five bits, so the number is truncated
+    ///   and `d32` assembles to the bytes of `d16`.
+    /// * `FpScalar(D(0), 4)`: a 16-bit scalar's lane is two bits and the
+    ///   third is already ORed in as a fixed 1, so `d0[4]` assembles to the
+    ///   bytes of `d0[0]` — a silently relabelled lane with every other
+    ///   field intact.
+    /// * `FpScalar(D(8), 0)`: a 16-bit scalar's register is three bits and
+    ///   the fourth is the low lane bit, so `d8[0]` becomes `d0[1]`.
+    /// * `FpScalar(D(16), 0)`: a 32-bit scalar's register is four bits and
+    ///   the fifth is Table A7-8's `C<0>`, which moves the halfwords out of
+    ///   the by-scalar block entirely.
+    /// * `Imm(1 << 32)`: the shift scan works in `u32`, and `as u32` turns
+    ///   this into a shift of zero — which is a real encoding (`VSHLL` by
+    ///   zero is `VMOVL`).
+    /// * the `align: 128` memory operand: `MULT_ROWS` carries an `align_ok`
+    ///   column because a three-register transfer cannot promise 128-bit
+    ///   alignment, and an over-aligned list encodes an `align` field the
+    ///   architecture leaves UNDEFINED.
+    ///
+    /// Putting them here rather than in one assertion each is deliberate:
+    /// the sweep substitutes every entry into every slot of all 29 samples,
+    /// so one row covers every encoder in the module instead of one call
+    /// site.
+    const WRONG: [Operand; 28] = [
         Operand::Reg(Reg(0)),
         Operand::RegList(0b11),
         Operand::FpReg(FpReg::S(0)),
@@ -3669,6 +3960,20 @@ mod tests {
         Operand::Text("{d0[]}"),
         Operand::Text("{d0[0]}"),
         Operand::Text("not a register list"),
+        Operand::FpReg(FpReg::D(32)),
+        Operand::FpReg(FpReg::Q(16)),
+        Operand::FpScalar(FpReg::D(8), 0),
+        Operand::FpScalar(FpReg::D(0), 4),
+        Operand::FpScalar(FpReg::D(16), 0),
+        Operand::Imm(1 << 32),
+        Operand::Mem(Mem {
+            base: Reg(0),
+            index: None,
+            offset: 0,
+            add: true,
+            align: 128,
+            mode: AddrMode::Offset,
+        }),
         Operand::Mem(Mem {
             base: Reg(0),
             index: None,
@@ -3754,5 +4059,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `Insn` header this module produces is part of its contract.
+    ///
+    /// Nothing in Advanced SIMD is narrow, sets flags, or carries an explicit
+    /// width qualifier — `simd` builds every instruction in the group the same
+    /// way, so no sweep here ever varies the header and the guard at the top
+    /// of `encode` had no coverage at all. A caller can still hand-build an
+    /// `Insn` that claims otherwise, and accepting one would return two
+    /// halfwords for something asking to be narrow, or silently drop an `s`
+    /// that has no bit to live in.
+    #[test]
+    fn encode_declines_headers_this_group_never_produces() {
+        let ok = built("vadd.i32", &[dr(0), dr(1), dr(2)]);
+        assert!(encode(&ok).is_some(), "the unmodified header must encode");
+
+        let narrow = Insn {
+            width: Width::Narrow,
+            ..ok
+        };
+        assert_eq!(
+            encode(&narrow),
+            None,
+            "no Advanced SIMD instruction is narrow"
+        );
+
+        let flagged = Insn {
+            sets_flags: true,
+            ..ok
+        };
+        assert_eq!(encode(&flagged), None, "Advanced SIMD writes no APSR flags");
+
+        let suffixed = Insn {
+            explicit_width: true,
+            ..ok
+        };
+        assert_eq!(
+            encode(&suffixed),
+            None,
+            "nothing here has a narrow sibling, so `.w` names no instruction"
+        );
     }
 }

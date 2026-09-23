@@ -1763,4 +1763,96 @@ mod tests {
         // instruction relocates: `pop {r4, pc}` is a return.
         assert!(!reads_pc(&list("pop", (1 << 15) | (1 << 4))));
     }
+
+    // --- byte reproducibility at the zero displacement ---
+    //
+    // `Mem` carries the displacement as a magnitude plus the architecture's
+    // `U` bit precisely because `#0` and `#-0` are distinct encodings. Two
+    // guards decide which form comes out at a displacement of exactly zero,
+    // and mutation found neither exercised: relocating an instruction that
+    // lands on its own literal would change the bytes without changing what
+    // it does, which is exactly what the encoding digest exists to notice.
+
+    /// A wide literal load whose `U` is already clear keeps it when the
+    /// displacement works out to zero.
+    #[test]
+    fn a_zero_displacement_keeps_the_u_bit_it_arrived_with() {
+        // `ldr.w r0, [pc, #-0]` at 0x1000 — hw1 0xF85F, so `U` is clear.
+        let insn = at(&[0x5F, 0xF8, 0x00, 0x00], 0x1000);
+        assert!(!pc_mem(&insn).expect("a pc-based memory operand").add);
+        // 0x1000 and 0x1002 share `Align(PC, 4)`, so the displacement is zero
+        // at both and neither may invent an adding form.
+        for to in [0x1000u32, 0x1002] {
+            let moved = relocate(&insn, to).expect("address-independent");
+            let m = pc_mem(&moved).expect("still a pc-based operand");
+            assert_eq!(m.displacement(), 0, "from {to:#x}");
+            assert!(!m.add, "U must survive relocation to {to:#x}");
+            assert_eq!(
+                isa::encode_bytes(&moved).expect("re-encodable"),
+                vec![0x5F, 0xF8, 0x00, 0x00],
+                "the same four bytes, from {to:#x}"
+            );
+        }
+    }
+
+    /// A wide `adr` that lands exactly on its label stays the adding form.
+    ///
+    /// T3 adds and T2 subtracts, and at a zero displacement either spells the
+    /// same address — so the choice has to be pinned, or the same `adr`
+    /// assembles to different bytes depending only on how far it moved.
+    #[test]
+    fn a_wide_adr_that_lands_exactly_on_its_label_stays_the_adding_form() {
+        // `adr.w r0, <pc+0>` at 0x1000, T3 with imm12 == 0.
+        let insn = at(&[0x0F, 0xF2, 0x00, 0x00], 0x1000);
+        assert_eq!(insn.encoding, "T3");
+        let label = insn.branch_target().expect("a resolved label");
+        for to in [0x1000u32, 0x1002] {
+            let moved = relocate(&insn, to).expect("address-independent");
+            assert_eq!(moved.branch_target(), Some(label), "from {to:#x}");
+            assert_eq!(moved.encoding, "T3", "the adding form, from {to:#x}");
+            assert_eq!(
+                isa::encode_bytes(&moved).expect("re-encodable"),
+                vec![0x0F, 0xF2, 0x00, 0x00],
+                "the same four bytes, from {to:#x}"
+            );
+        }
+    }
+
+    /// Only a *pc-based* memory operand is a literal access.
+    ///
+    /// `pc_mem` and `replace_pc_mem` both key on `m.base == Reg::PC`, and
+    /// mutation showed neither guard exercised with an ordinary base. With
+    /// them disabled every memory operand is treated as a literal and has its
+    /// displacement re-resolved against the new address — so `ldr r0, [r1,
+    /// #4]` would come out of a relocation pointing somewhere else entirely,
+    /// while still naming `r1`.
+    #[test]
+    fn only_a_pc_based_memory_operand_is_a_literal_access() {
+        // `ldr r0, [r1, #4]` — an ordinary base register.
+        let ordinary = at(&[0x48, 0x68], 0x1000);
+        assert!(
+            ordinary
+                .operands
+                .as_slice()
+                .any(|o| matches!(o, Operand::Mem(_))),
+            "{ordinary} does carry a memory operand"
+        );
+        assert!(
+            pc_mem(&ordinary).is_none(),
+            "{ordinary} is not a literal access"
+        );
+        // So it is address-independent: the same four bytes wherever it goes.
+        for to in [0x9000u32, 0x2, 0x1_0000] {
+            assert_eq!(
+                bytes_at(&ordinary, to),
+                vec![0x48, 0x68],
+                "{ordinary} moved to {to:#x}"
+            );
+        }
+
+        // `ldr r0, [pc, #4]` — the same shape with `pc` as the base, and this
+        // one *is* a literal access whose displacement has to move.
+        let literal = at(&[0x01, 0x48], 0x1000);
+        assert!(pc_mem(&literal).is_some(), "{literal} is a literal access");
+    }
 }

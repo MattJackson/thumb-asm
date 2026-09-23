@@ -1,5 +1,5 @@
 //! 16-bit data processing — `hw1[15:10] == 0b010000` (ARM DDI 0403E.e A5.2.2,
-//! Table A5-3; identically ARM DDI 0406C A6.2.2, Table A6-3).
+//! Table A5-3; identically ARM DDI 0406B A6.2.2, Table A6-3).
 //!
 //! The whole group is one shape: `0100 00 opcode(4) Rm(3) Rdn(3)`, so the
 //! halfword is `0x4000 | opcode << 6 | Rm << 3 | Rdn` and the space

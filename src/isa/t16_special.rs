@@ -1,5 +1,5 @@
 //! Special data instructions and branch and exchange — `hw1[15:10] == 0b010001`
-//! (ARM DDI 0403E.e A5.2.3, Table A5-4; ARM DDI 0406C A6.2.3, Table A6-4).
+//! (ARM DDI 0403E.e A5.2.3, Table A5-4; ARM DDI 0406B A6.2.3, Table A6-4).
 //!
 //! This is the one corner of the 16-bit space that can name `r8`–`r15`, and it
 //! pays for that with the most irregular field layout in Thumb. Every encoding
@@ -85,7 +85,7 @@
 //!
 //! # Availability
 //!
-//! Table A6-4 in ARM DDI 0406C carries the variant column the M-profile manual
+//! Table A6-4 in ARM DDI 0406B carries the variant column the M-profile manual
 //! omits, and two rows of it matter to anyone reading pre-Cortex firmware:
 //!
 //! | opcode | form | from |
@@ -417,6 +417,32 @@ mod tests {
         let mut wide = dec(0x4698);
         wide.width = Width::Wide;
         assert_eq!(encode(&wide), None);
+
+        // `ADD (SP plus register)` T1 (A7.7.6) has one four-bit register
+        // field and reads it twice: `Rdm` is both the destination and the
+        // added register, and the second operand is the SP implicitly, with
+        // no field of its own. So all three operand slots are pinned, and a
+        // three-register `add` that is not `<Rdm>, sp, <Rdm>` has no encoding
+        // here — it is A5.2.1's `ADD (register)` T1 or the wide form.
+        //
+        // The formula below the guard reads `d` for every field and ignores
+        // `n` and `m` entirely, which is exactly why the guard has to hold:
+        // `add r0, r1, r2` would come back as the halfword for
+        // `add r0, sp, r0`, reading the stack pointer instead of `r1` and
+        // discarding `r2`. Both halves matter — a wrong `Rn` substitutes the
+        // SP, a wrong `Rm` substitutes `Rd` — so each is mangled on its own.
+        let sp_add = dec(0x4468);
+        assert_eq!(sp_add.to_string(), "add r0, sp, r0");
+        assert_eq!(encode(&sp_add), Some(0x4468));
+        for (ops, why) in [
+            ([Reg(0), Reg(1), Reg(0)], "Rn is not the SP"),
+            ([Reg(0), Reg::SP, Reg(1)], "Rm is not Rd"),
+            ([Reg(0), Reg(1), Reg(2)], "neither holds"),
+        ] {
+            let mut mangled = sp_add;
+            mangled.operands = ops.iter().map(|&r| Operand::Reg(r)).collect();
+            assert_eq!(encode(&mangled), None, "{why}: `{mangled}`");
+        }
     }
 
     #[test]

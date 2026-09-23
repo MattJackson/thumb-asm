@@ -288,7 +288,7 @@ const DIVERGENCES: &[Divergence] = &[
         mnemonic: None,
         llvm_prefix: None,
         budget: 340,
-        citation: "DDI 0406B A8.6.51 LDC/LDC2 (immediate) and A8.6.184 STC/STC2 — \
+        citation: "DDI 0406B A8.6.51 LDC/LDC2 (immediate) and A8.6.188 STC/STC2 — \
                    `if coproc == '101x' then SEE \
                    Advanced SIMD and Floating-point`",
         why: "An `LDC2`/`STC2` naming coprocessor 10 or 11, which the architecture \

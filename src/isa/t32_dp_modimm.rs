@@ -1,6 +1,6 @@
 //! 32-bit data processing (modified immediate) — `hw1[15:11] == 0b11110`,
 //! `hw1[9] == 0`, `hw2[15] == 0` (ARM DDI 0403E.e A5.3.1, Table A5-10;
-//! identically ARM DDI 0406C A6.3.1, Table A6-10).
+//! identically ARM DDI 0406B A6.3.1, Table A6-10).
 //!
 //! # The field layout, and the `op`-versus-`S` question
 //!

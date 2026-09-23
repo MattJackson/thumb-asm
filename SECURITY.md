@@ -38,7 +38,7 @@ Please include, as far as you can:
 - the exact bytes, or the exact `Insn`, that triggers it — this is an encoding
   library, so a hex halfword pair is worth a page of description,
 - what you expected and what you got, with the Arm architecture reference manual
-  section you believe is being violated (DDI 0403E.e and DDI 0406C are the two
+  section you believe is being violated (DDI 0403E.e and DDI 0406B are the two
   this crate works from; `spec/` holds both),
 - for a panic, the offset and the API that was called.
 

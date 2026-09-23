@@ -1,6 +1,6 @@
 //! Data processing (register), the two parallel add/subtract tables, and the
 //! miscellaneous operations — `hw1[15:8] == 0b1111_1010` (ARM DDI 0403E.e
-//! A5.3.12–A5.3.15, Tables A5-24 to A5-27; identically ARM DDI 0406C
+//! A5.3.12–A5.3.15, Tables A5-24 to A5-27; identically ARM DDI 0406B
 //! A6.3.12–A6.3.15, Tables A6-23 to A6-26).
 //!
 //! Four numbered sub-tables share one dispatch arm because they share one
@@ -42,7 +42,7 @@
 //!
 //! The extends encode `hw2 = 1111 Rd 1 (0) rotate Rm`. Bit 6 is a
 //! *should-be-zero* bit, and an encoding diagram's `(0)` means exactly one
-//! thing (DDI 0406C A6.1.1, and Appendix I.1 for the diagram convention
+//! thing (DDI 0406B A6.1.1, and Appendix I.1 for the diagram convention
 //! itself): a Thumb instruction is UNPREDICTABLE if a bit marked `(0)` is not
 //! `0`. This decoder declines those encodings rather than decoding them and
 //! silently dropping a bit it could never put back — an instruction that
@@ -1244,6 +1244,56 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(encode(&short_shift), None);
+
+        // [`Reg`] is a byte-wide newtype and [`Reg::num`] masks it to four
+        // bits, so `Reg(16)` is indistinguishable from `r0` once it reaches a
+        // register field — it even prints as `r0`. The `r.0 < 16` reads are
+        // the only thing between an `Insn` built by hand from the public
+        // fields and two different instructions encoding to the same bytes,
+        // which would break the round trip in the other direction. Each of
+        // the three reads is its own guard, so each is offered one.
+        let mut wide_reg = base;
+        wide_reg.operands = [
+            Operand::Reg(Reg(0)),
+            Operand::Reg(Reg(1)),
+            Operand::Reg(Reg(16)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(encode(&wide_reg), None, "Rm of a shift is four bits");
+
+        // The extends read their source through `rotated_operand` instead,
+        // bare or with the `ROR` that becomes the two-bit `rotate` field.
+        let (h1, h2) = hw(0b0000, RN_NONE.into(), 0, 0b1000, 1); // sxth.w r0, r1
+        let sxth = decode(h1, h2, 0).unwrap();
+        assert_eq!(sxth.to_string(), "sxth.w r0, r1");
+        assert_eq!(encode(&sxth), Some((h1, h2)));
+        let ror8 = Shift {
+            kind: ShiftKind::Ror,
+            amount: ShiftAmount::Imm(8),
+        };
+        for (operands, why) in [
+            (
+                [Operand::Reg(Reg(0)), Operand::Reg(Reg(16))],
+                "a bare Rm is four bits",
+            ),
+            (
+                [Operand::Reg(Reg(0)), Operand::RegShifted(Reg(16), ror8)],
+                "a rotated Rm is four bits",
+            ),
+        ] {
+            let mut bad = sxth;
+            bad.operands = operands.into_iter().collect();
+            assert_eq!(encode(&bad), None, "{why}");
+        }
+        // …and the same two shapes with a register that does fit, so the
+        // rejections above are rejections of `Reg(16)` and not of the form.
+        let mut rotated = sxth;
+        rotated.operands = [Operand::Reg(Reg(0)), Operand::RegShifted(Reg(1), ror8)]
+            .into_iter()
+            .collect();
+        assert_eq!(rotated.to_string(), "sxth.w r0, r1, ror #8");
+        assert_eq!(encode(&rotated), Some((h1, h2 | 0x0010)));
 
         let (h1, h2) = hw(0b1011, 2, 0, 0b1000, 2); // clz r0, r2
         let mut clz = decode(h1, h2, 0).unwrap();

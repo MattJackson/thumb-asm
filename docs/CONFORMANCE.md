@@ -308,17 +308,26 @@ to this crate's behaviour that the entire suite ran straight past.
 
 ### Result
 
-`cargo-mutants` generates 7,475 mutants across the crate. The run was
-sharded across four 64-vCPU machines and took about 18 minutes of wall time.
+`cargo-mutants` generates 7,624 mutants across the crate. The run is sharded
+across two large spot machines and takes about 20 minutes of wall time. It
+runs the library tests only (`-- --lib`): the LLVM differential suite costs
+47 seconds per invocation and is a separate gate that runs once per push, and
+running it once per mutant turns a 20-minute job into a 7-hour one. That
+exclusion costs nothing measurable — a run with LLVM present and one with it
+excluded returned identical per-shard counts.
 
 | outcome | count |
 |---|---:|
-| caught | 6,411 |
-| **missed** | **794** |
-| timeout | 32 |
-| unviable (did not compile) | 238 |
+| caught | 6,669 |
+| **missed** | **656** |
+| timeout | 53 |
+| unviable (did not compile) | 246 |
 
-That is a mutation score of **89.0%**.
+That is a mutation score of **91.1%**, counting a timeout as detected: a
+mutation that makes a search loop spin forever is a difference the suite
+notices, even though it notices it by hanging rather than by failing. The 53
+are all in `lib.rs`'s search and allocator loops, which is where an off-by-one
+in a loop bound has exactly that effect.
 
 ### Not every survivor is a gap
 
@@ -332,7 +341,10 @@ could not hold if any field collided. A second family is a value written and
 then unconditionally overwritten by a later fix-up pass; mutating a
 placeholder that is always patched is unobservable by construction.
 
-Setting those aside leaves **206** survivors — a score of **96.9%** —
+A third family is `r.num() < 16`, which is unconditionally true because
+`Reg::num` is `self.0 & 0xF`; 4 survivors are that guard.
+
+Setting those aside leaves roughly **64** survivors — a score of **99.1%** —
 and those are real, in the sense that each is a change to behaviour nothing
 asserts. They are concentrated in `encode` guard clauses (the `if
 insn.encoding != … { return None }` checks that refuse operand shapes a group
@@ -410,7 +422,7 @@ the manual refuses to define means inventing a meaning for it.
 | `t32-vmsr-vmrs-reserved-system-register` | `0xEE00`–`0xEFFF` | A7.7.244 VMSR, A7.7.243 VMRS, A7.7.229 VMOV (imm) | a VFP system register the architecture does not define as writable (`FPSID` is read-only), or an Advanced SIMD `cmode`/`op` pair with no meaning. |
 | `t32-modified-immediate-unpredictable-constant` | `0xF000`–`0xF1FF`, `0xF400`–`0xF5FF` | A5.3.2 `ThumbExpandImm` | a replication pattern is selected but the byte is zero, which the expansion pseudocode calls UNPREDICTABLE. LLVM evaluates it to `#0`. |
 | `t32-plain-immediate-unpredictable` | `0xF200`–`0xF3FF`, `0xF600`–`0xF7FF` | A7.7.13 BFI, A7.7.82 MSR, A7.7.81 MRS | `msbit < lsbit`; `MSR` with `mask == '00'`; `MRS`/`MSR` with a should-be-one field wrong. |
-| `t32-branch-misc-smc-hvc` | `0xF7E0`–`0xF7FF` | DDI 0406C B1.5 SMC, B1.6 HVC | `SMC`/`HVC` with should-be-zero bits set, and `HVC` itself (Virtualization Extensions, not decoded here). |
+| `t32-branch-misc-smc-hvc` | `0xF7E0`–`0xF7FF` | DDI 0406B B6.1.9 SMC; HVC is Virtualization Extensions, DDI 0406C only | `SMC`/`HVC` with should-be-zero bits set, and `HVC` itself (Virtualization Extensions, not decoded here). |
 | `t32-load-store-single-rt-is-pc` | `0xF800`–`0xF9FF` | A7.7.162 STRB, A7.7.46 LDRB, A7.7.60 LDRSB, A7.7.63 LDRSH and the `…T` forms | transfer register is PC or SP, which no such encoding permits. |
 | `t32-dp-register-pc-operand` | `0xFA00`–`0xFBFF` | A7.7.156 SXTAH, A7.7.172 UXTAH, A7.7.120 SDIV, … (A5.3.12) | an extend, reverse, shift or divide naming PC or SP. |
 | `t32-ldc-stc-vfp-coprocessor-space` | `0xFC00`–`0xFDFF` | A7.7.29 LDC/LDC2 | `LDC2`/`STC2` naming coprocessor 10 or 11, which the architecture reserves for the Advanced SIMD and floating-point space. |

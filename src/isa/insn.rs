@@ -603,7 +603,7 @@ impl Insn {
     /// raise an exception: the destination is a vector this crate cannot see,
     /// the transfer is the exception mechanism rather than a branch, and the
     /// architecture's own list of instructions that "branch to a value written
-    /// to the PC" (ARM DDI 0406C B1.3.2, *Writing to the PC*) excludes them.
+    /// to the PC" (ARM DDI 0406B B1.3.2, *Writing to the PC*) excludes them.
     /// A consumer that wants them must test the mnemonic itself.
     pub fn is_branch(&self) -> bool {
         matches!(
@@ -614,7 +614,7 @@ impl Insn {
             // `branch_target()` returns `None` for them.
             //
             // `chka` is the ThumbEE bounds check, and it is here for the same
-            // reason `cbz` is: it is a *conditional* branch. DDI 0406C A9.5.1
+            // reason `cbz` is: it is a *conditional* branch. DDI 0406B A9.5.1
             // ends `if UInt(R[n]) <= UInt(R[m]) then … BranchWritePC(TEEHBR -
             // 8)`, and B1.3.2's list of instructions that branch to a value
             // written to the PC reads "B, BL, CBNZ, CBZ, CHKA, HB, HBL, HBLP,
@@ -646,7 +646,7 @@ impl Insn {
     ///
     /// `bl` and `blx` in both their forms, and — in ThumbEE state — `hbl` and
     /// `hblp`, whose operation is `next_instr_addr = PC - 2; LR =
-    /// next_instr_addr<31:1>:'1'` before the branch (ARM DDI 0406C A9.5.2 and
+    /// next_instr_addr<31:1>:'1'` before the branch (ARM DDI 0406B A9.5.2 and
     /// A9.5.3). That is exactly `bl`'s contract with a handler table standing
     /// in for a label. `hb` and `hbp` are *not* calls: A9.5.2 writes `LR` only
     /// when `generate_link` (the `L` bit) is set, and A9.5.4's `HBP` has no
@@ -849,7 +849,7 @@ mod tests {
     }
 
     /// The ThumbEE handler-branch family: all four branch, and exactly the two
-    /// with `L` in their name write `lr` (ARM DDI 0406C A9.5.2–A9.5.4).
+    /// with `L` in their name write `lr` (ARM DDI 0406B A9.5.2–A9.5.4).
     ///
     /// None of them writes `pc` in this method's sense — the destination is
     /// `TEEHBR + handler:'00000'`, a system register this crate cannot read —

@@ -149,6 +149,55 @@ fn prologue_check_accepts_push_lr_rejects_data() {
 }
 
 #[test]
+fn prologue_check_looks_past_the_first_halfword_of_its_window() {
+    // A real entry does not always push on its very first instruction: an
+    // alignment nop or a cheap register setup often comes ahead of the frame
+    // save. The window exists so those still count as function entries; a
+    // check that only ever looked at `off` itself would reject every one of
+    // them, and a handler pointer resolving to this address would be thrown
+    // away as a coincidence.
+    let mut img = vec![0u8; 16];
+    img[0..2].copy_from_slice(&0x46C0u16.to_le_bytes()); // mov r8, r8 (nop)
+    img[2..4].copy_from_slice(&0x46C0u16.to_le_bytes()); // mov r8, r8 (nop)
+    img[4..6].copy_from_slice(&0xB5F0u16.to_le_bytes()); // push {r4-r7, lr}
+    assert!(
+        prologue_is_push_lr(&img, 0, 4),
+        "the push two halfwords in is inside a four-halfword window"
+    );
+    // ...and a window that stops before it really does stop before it.
+    assert!(!prologue_is_push_lr(&img, 0, 2));
+}
+
+#[test]
+fn prologue_check_ignores_a_push_pattern_that_is_off_the_instruction_grid() {
+    // Bytes `20 B5` are `push {r5, lr}` — but only when they start on a
+    // halfword boundary. Here they sit at offset 1, so the halfwords the CPU
+    // actually decodes are 0x2000 (`movs r0, #0`) and 0x00B5, neither of which
+    // is a push. This is precisely the mid-instruction byte coincidence the
+    // check exists to reject: accepting it confirms a bogus handler pointer as
+    // a function entry, and the patch gets aimed one byte off.
+    let mut img = vec![0u8; 16];
+    img[1] = 0x20;
+    img[2] = 0xB5;
+    assert!(!prologue_is_push_lr(&img, 0, 4));
+}
+
+#[test]
+fn prologue_check_reaches_the_last_halfword_and_reads_no_further() {
+    // The function being cross-checked is the last thing in the dump, so its
+    // prologue is the image's final two bytes. Requiring a halfword *past* the
+    // prologue would make the last function in an image invisible.
+    let mut img = vec![0u8; 6];
+    img[4..6].copy_from_slice(&0xB500u16.to_le_bytes()); // push {lr}
+    assert!(prologue_is_push_lr(&img, 4, 4));
+
+    // The same window over an image with nothing in it: candidates 6, 8 and 10
+    // run off the end and must simply not be read. The bound is on the end of
+    // the halfword, not its start.
+    assert!(!prologue_is_push_lr(&[0u8; 6], 4, 4));
+}
+
+#[test]
 fn read_modify_insert() {
     let mut img = vec![0xFFu8; 16];
     write(&mut img, 4, &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -490,6 +539,18 @@ fn asm_b_cond_always_lowers_to_the_unconditional_branch() {
     assert_ne!(hw & 0xFF00, 0xDE00);
 }
 
+// The placeholder halfword `ldr_lit` emits, `0x4800 | (rt << 8)`, is not
+// observable and deliberately so: `ldr_lit` also records `(pos, value, rt)`,
+// and `finish` overwrites the whole halfword at `pos` with
+// `0x4800 | (rt << 8) | imm8` built from that recorded `rt` — it never reads
+// the placeholder bytes back, unlike the b<cond> and adr fixups, which do
+// recover the register field from what was emitted. `Asm` hands out no view of
+// `code` before `finish` (`pos()` returns only its length), and every path
+// that skips the patching step returns `Err` and drops the buffer. So the
+// placeholder's `|` and its `<< 8` cannot be checked by any test: they are
+// overwritten before anyone can see them. Verified 2026-09-23; this stops
+// being true only if `finish` starts reading the placeholder or `Asm` grows an
+// accessor for the code buffer.
 #[test]
 fn asm_ldr_lit_dedups_repeated_literal_values() {
     // Loading the same value twice must reuse one pool slot (the `Some` arm of
@@ -578,6 +639,164 @@ fn command_table_find_returns_none_when_run_exceeds_image_bounds() {
         max_records: 8,
     };
     assert_eq!(t.find(&img, 0xAA), None);
+}
+
+#[test]
+fn command_table_find_sees_a_record_that_ends_exactly_at_the_image_end() {
+    // The table is the last thing in the dump, so the final record's handler
+    // word is the image's final four bytes. An off-by-one on the bounds check
+    // reports the opcode as absent, and a caller told "absent" goes looking for
+    // somewhere to add a new record instead of repointing the one that is
+    // already there.
+    let mut img = vec![0u8; 16];
+    img[0] = 0x10;
+    img[1] = 0x01;
+    img[4..8].copy_from_slice(&0xAAAAu32.to_le_bytes());
+    img[8] = 0x2A;
+    img[9] = 0x01;
+    img[12..16].copy_from_slice(&0xBEEFu32.to_le_bytes());
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    assert_eq!(
+        t.find(&img, 0x2A),
+        Some(CommandRecord {
+            off: 8,
+            opcode: 0x2A,
+            flags: 0x01,
+            handler: 0xBEEF,
+        }),
+        "a record ending on the last byte of the image is still a record"
+    );
+}
+
+#[test]
+fn command_table_find_refuses_a_first_record_the_image_is_too_short_to_hold() {
+    // A truncated dump: the base is inside the image but the record it points
+    // at is not all there. The bounds check has to cover the *first* record as
+    // well as the later ones — otherwise reading its handler word runs off the
+    // end of the buffer.
+    let mut img = vec![0u8; 4]; // one record needs 8
+    img[0] = 0x10;
+    img[1] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    assert_eq!(t.find(&img, 0x10), None);
+}
+
+/// A two-record table whose geometry is deliberately *not* the worked example
+/// in the docs: it starts at offset 8, the flags byte comes before the opcode,
+/// and the opcode is the record's third byte. Firmwares lay records out
+/// however they like, so every field has to be read from its own offset.
+///
+/// ```text
+/// off  8: [ pad | flags 01 | opcode 11 | pad | handler = 0x1111 (LE) ]
+/// off 16: [ pad | flags 01 | opcode 22 | pad | handler = 0x2222 (LE) ]
+/// off 24: [ pad | flags 03 = terminator | ...                      ]
+/// ```
+fn table_with_the_opcode_inside_the_record() -> (Vec<u8>, CommandTable) {
+    let mut img = vec![0u8; 40];
+    img[9] = 0x01;
+    img[10] = 0x11;
+    img[12..16].copy_from_slice(&0x1111u32.to_le_bytes());
+    img[17] = 0x01;
+    img[18] = 0x22;
+    img[20..24].copy_from_slice(&0x2222u32.to_le_bytes());
+    img[25] = 0x03;
+    let t = CommandTable {
+        base: 8,
+        stride: 8,
+        opcode_off: 2,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 8,
+    };
+    (img, t)
+}
+
+#[test]
+fn command_table_find_steps_one_stride_and_reads_the_opcode_from_inside_the_record() {
+    let (img, t) = table_with_the_opcode_inside_the_record();
+    assert_eq!(
+        t.find(&img, 0x22),
+        Some(CommandRecord {
+            off: 16,
+            opcode: 0x22,
+            flags: 0x01,
+            handler: 0x2222,
+        }),
+        "the second record is exactly one stride past the base"
+    );
+    assert_eq!(t.find(&img, 0x11).map(|r| r.off), Some(8));
+    // 0x00 is what every padding byte in this table holds, including the bytes
+    // either side of each opcode slot. A scan that matches it is reading the
+    // opcode from the wrong byte of the record, and repointing the record it
+    // returns hijacks a command nobody asked about.
+    assert_eq!(t.find(&img, 0x00), None);
+}
+
+#[test]
+fn command_table_walk_reads_each_opcode_from_inside_its_own_record() {
+    // walk() and find() have to agree about which byte of a record is the
+    // opcode. A walk that reports the padding byte instead hands the caller an
+    // inventory in which every command is 0x00.
+    let (img, t) = table_with_the_opcode_inside_the_record();
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(recs.len(), 2);
+    assert_eq!(
+        (recs[0].off, recs[0].opcode, recs[0].handler),
+        (8, 0x11, 0x1111)
+    );
+    assert_eq!(
+        (recs[1].off, recs[1].opcode, recs[1].handler),
+        (16, 0x22, 0x2222)
+    );
+}
+
+#[test]
+fn command_table_walk_spends_one_budget_across_the_whole_scan() {
+    // A table whose terminator was overwritten: no record ever says "stop".
+    // `max_records` is the budget for the whole walk, so the scan gives up
+    // after two records even though three more sit within the image. Without
+    // that countdown the walk runs to the end of the dump and every byte
+    // pattern past the real table comes back as a dispatch record.
+    let mut img = vec![0u8; 40]; // five 8-byte records, no terminator anywhere
+    img[0] = 0x10;
+    img[1] = 0x01;
+    img[8] = 0x11;
+    img[9] = 0x01;
+    img[16] = 0x12;
+    img[17] = 0x01;
+    img[24] = 0x13;
+    img[25] = 0x01;
+    img[32] = 0x14;
+    img[33] = 0x01;
+    let t = CommandTable {
+        base: 0,
+        stride: 8,
+        opcode_off: 0,
+        flags_off: 1,
+        handler_off: 4,
+        term_flag: 0x03,
+        max_records: 2,
+    };
+    let recs = t.walk(&img, 0x04);
+    assert_eq!(recs.len(), 2, "max_records caps the whole walk");
+    assert_eq!((recs[0].opcode, recs[1].opcode), (0x10, 0x11));
 }
 
 // --- coverage: finish() success paths not reached by the bail-out tests -------
@@ -1150,6 +1369,20 @@ fn push_with_a_reglist_that_overflows_its_field_is_rejected_not_encoded() {
 }
 
 #[test]
+fn push_and_pop_accept_the_widest_list_the_encoding_can_hold() {
+    // 0x1FF is every bit the 16-bit encoding has: `push {r0-r7, lr}` /
+    // `pop {r0-r7, pc}`, which is the frame save and return of any handler that
+    // uses all the low registers — the most common prologue there is. The
+    // bound is inclusive; rejecting the maximum itself would make that
+    // prologue unassemblable, so a stub could not be built at all.
+    assert_eq!(accepted_hw(|a| a.push(0x01FF)), 0xB5FFu16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| a.pop(0x01FF)), 0xBDFFu16.to_le_bytes());
+    // One bit past the field is still refused.
+    assert!(rejected(|a| a.push(0x0200)).contains("outside R0-R7"));
+    assert!(rejected(|a| a.pop(0x0200)).contains("outside R0-R7"));
+}
+
+#[test]
 fn an_empty_push_or_pop_list_is_unpredictable_and_refused() {
     assert!(rejected(|a| a.push(0)).contains("empty"));
     assert!(rejected(|a| a.pop(0)).contains("empty"));
@@ -1207,6 +1440,11 @@ fn every_low_register_operand_rejects_a_high_register() {
     }
 }
 
+// `Asm::imm`'s second guard, `step > 1 && v % step != 0`, cannot be tested at
+// `step == 1`: admitting 1 into the branch changes nothing, because `v % 1` is
+// 0 for every `v`. The only step values any emitter passes are 1, 2 and 4, and
+// 0 is refused by the `step > 1` test either way, so no call can reach a
+// modulo by zero. There is nothing here to cover beyond the steps below.
 #[test]
 fn immediate_fields_reject_oversized_and_unaligned_values() {
     // (emitter, just-past-the-maximum, misaligned-but-in-range)
@@ -2201,4 +2439,151 @@ fn a_masked_pattern_reaches_the_last_halfword_and_no_further() {
     // Give it the sixth byte and it matches, which pins the bound at 2*len.
     let longer = [0x01, 0x20, 0x70, 0x47, 0xAA, 0xBB];
     assert_eq!(find(&longer, Needle::Masked(&three), 0), Some(0));
+}
+
+// ---------------------------------------------------------------------------
+// `Asm::finish`'s range checks.
+//
+// Mutation found these unexercised: the `ldr` literal displacement bound, the
+// `adr` bound, and the arithmetic computing both. They matter more than most
+// guards in this crate because they run at *layout* time — the point where the
+// assembler decides what bytes come out — and the failure is silent: an
+// out-of-range displacement that is not refused becomes a truncated one, so
+// the emitted `ldr` reads from the wrong pool word and the code runs against a
+// constant nobody chose.
+// ---------------------------------------------------------------------------
+
+/// An `Asm` holding one `ldr_lit` followed by `pad` filler halfwords, so the
+/// pool sits a controlled distance away.
+fn ldr_at_distance(pad: usize) -> Result<Vec<u8>, AsmError> {
+    let mut a = Asm::new();
+    a.ldr_lit(0, 0xDEAD_BEEF);
+    for _ in 0..pad {
+        a.raw16(0x46C0); // nop (mov r8, r8)
+    }
+    a.finish()
+}
+
+#[test]
+fn the_ldr_literal_displacement_is_bounded_exactly_at_the_field() {
+    // `LDR (literal)` T1 holds `imm8:'00'`, so the furthest reachable word is
+    // `Align(pc,4) + 1020`. One word further has to be an error, not a
+    // truncated displacement pointing at the wrong constant.
+    let ok = ldr_at_distance(511).expect("1020 bytes away is the last reachable word");
+    // The `ldr` encodes the maximum displacement, and the pool word is there.
+    assert_eq!(
+        u16::from_le_bytes([ok[0], ok[1]]),
+        0x48FF,
+        "imm8 should be 0xff"
+    );
+    assert_eq!(&ok[1024..1028], &0xDEAD_BEEFu32.to_le_bytes());
+
+    let err = ldr_at_distance(512).expect_err("one word further cannot be encoded");
+    assert!(
+        err.to_string().contains("ldr literal out of range"),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("256"),
+        "the message should name the imm8: {err}"
+    );
+}
+
+#[test]
+fn the_adr_displacement_is_bounded_too() {
+    // `ADR` T1 is the same `imm8:'00'` field measured from `Align(pc,4)`, and
+    // a blob placed past it must be refused rather than wrapped.
+    let build = |pad: usize| -> Result<Vec<u8>, AsmError> {
+        let mut a = Asm::new();
+        let blob = a.data_blob(vec![0xAA; 4]);
+        a.adr(0, blob);
+        for _ in 0..pad {
+            a.raw16(0x46C0);
+        }
+        a.finish()
+    };
+    // Reachable: the blob lands within 1020 bytes of `Align(pc,4)`.
+    let ok = build(500).expect("a near blob is reachable");
+    assert_eq!(ok[1] & 0xF8, 0xA0, "should still be an adr");
+
+    let err = build(520).expect_err("a blob past the field cannot be addressed");
+    assert!(err.to_string().contains("adr target out of range"), "{err}");
+
+    // And the displacement it encodes is pinned, not merely bounded. The
+    // subtraction and the division are separate mutations and a layout where
+    // `base == target` agrees with both of them by accident, so this uses one
+    // where it does not: `adr r3, blob` at 0 with five filler halfwords puts
+    // the blob at 12, `Align(pc,4)` at 4, and `(12 - 4) / 4 == 2`.
+    let mut a = Asm::new();
+    let blob = a.data_blob(vec![0x11, 0x22, 0x33, 0x44]);
+    a.adr(3, blob);
+    for _ in 0..5 {
+        a.raw16(0x46C0);
+    }
+    let bytes = a.finish().unwrap();
+    assert_eq!(
+        &bytes[12..16],
+        &[0x11, 0x22, 0x33, 0x44],
+        "blob lands at 12"
+    );
+    assert_eq!(
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+        0xA302,
+        "adr r3, #8 — rd in bits 10:8, (target - Align(pc,4)) / 4 in the imm8"
+    );
+}
+
+#[test]
+fn a_literal_pool_word_is_shared_and_the_displacement_follows_the_layout() {
+    // Two references to one value share a word, so the *second* `ldr` has a
+    // shorter displacement than the first — which is the arithmetic
+    // (`(off - pc) / 4`) that mutation flagged. Pinning both encodings pins
+    // the subtraction and the division together.
+    let mut a = Asm::new();
+    a.ldr_lit(0, 0x1111_2222);
+    a.raw16(0x46C0);
+    a.ldr_lit(1, 0x1111_2222);
+    let bytes = a.finish().unwrap();
+
+    let first = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let second = u16::from_le_bytes([bytes[4], bytes[5]]);
+    // Code is 6 bytes, padded to 8; the single pool word sits at 8.
+    assert_eq!(&bytes[8..12], &0x1111_2222u32.to_le_bytes());
+    // `LDR (literal)` T1 is `0x4800 | rt<<8 | imm8`; spelling both halves the
+    // same way keeps the rt/imm8 split visible instead of pre-folding a zero.
+    let ldr_lit = |rt: u16, imm8: u16| 0x4800 | (rt << 8) | imm8;
+    // First `ldr` at 0: Align(0+4,4) = 4, (8-4)/4 = 1.
+    assert_eq!(first, ldr_lit(0, 1), "first ldr: rt=r0, imm8=1");
+    // Second at 4: Align(4+4,4) = 8, (8-8)/4 = 0.
+    assert_eq!(second, ldr_lit(1, 0), "second ldr: rt=r1, imm8=0");
+}
+
+#[test]
+fn the_masked_needle_step_is_two_bytes_per_halfword() {
+    // `needle_len` feeds `find_one`'s non-overlapping advance. Mutation
+    // changed `pat.len() * 2` to `+ 2` and `/ 2`, both of which agree with the
+    // truth at the two-halfword patterns every other test uses. A
+    // one-halfword and a three-halfword pattern are what separate them.
+    // Six identical halfwords. The image has to be this long for the counts
+    // to separate: with three halfwords a wrong step still lands on the same
+    // answer by accident, which is how the mutant survived in the first place.
+    let image = [0xAAu8, 0xBB].repeat(6);
+    assert_eq!(image.len(), 12);
+
+    // One halfword: step 2, so all six occurrences are found. With `+ 2` the
+    // step would be 3, which rounds up to the next even offset and skips
+    // every other one — three occurrences, not six.
+    assert_eq!(
+        find_one(&image, Needle::Masked(&[(0xBBAA, 0xFFFF)])),
+        Err(FindError::Ambiguous { count: 6, first: 0 })
+    );
+
+    // Three halfwords: step 6, so two non-overlapping occurrences at 0 and 6.
+    // With `/ 2` the step would be 1, and the scan would count every even
+    // offset that still has six bytes after it — four, not two.
+    let three = [(0xBBAAu16, 0xFFFFu16); 3];
+    assert_eq!(
+        find_one(&image, Needle::Masked(&three)),
+        Err(FindError::Ambiguous { count: 2, first: 0 })
+    );
 }

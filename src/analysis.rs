@@ -626,6 +626,13 @@ pub fn reachable(image: &[u8], entry: usize, limit: usize) -> Reach {
             // Indexed directly rather than through `get`: the offset just
             // decoded, so both bytes are in range, and a `None` arm here
             // would be a branch no input can reach.
+            //
+            // Mutation reports `at + 1` -> `at * 1` as a survivor here and it
+            // is an *equivalent* mutant, not a gap: `it_state_from` reads the
+            // condition from `hw1[7:4]` and the mask from `hw1[3:0]`, both of
+            // which live in the low byte. The high byte it would stop reading
+            // is `1011 1111`, the opcode, which the function never looks at.
+            // No test can distinguish the two programs.
             isa::it_state_from(u16::from_le_bytes([image[at], image[at + 1]]))
         } else {
             it.advance()
@@ -1589,5 +1596,77 @@ mod tests {
         );
         assert_eq!(r.end, 8);
         assert_eq!(r.unresolved, vec![2, 4, 6]);
+    }
+
+    // --- the walks must reach the end of the image ---
+    //
+    // Mutation testing found both `xrefs` scans able to stop early with no
+    // error. That failure is quiet and it is the worst shape this function
+    // has: `xrefs` is the "find every reference to this handler" verb, so a
+    // truncated walk returns a *shorter list*, not a failure. A consumer
+    // repointing every call site patches the ones it was shown and leaves the
+    // rest calling the original — half-patched firmware, reported as success.
+
+    /// A branch in the image's final halfword is still a reference.
+    #[test]
+    fn xrefs_reaches_a_branch_in_the_final_halfword() {
+        let mut image = live(0x80);
+        // `b` T2 at 0x7E targeting 0x40: off = (0x40 - (0x7E + 4)) / 2 = -0x21,
+        // so imm11 = 0x7DF.
+        let at = image.len() - 2;
+        crate::write(&mut image, at, &(0xE000u16 | 0x7DF).to_le_bytes());
+        let found = xrefs(&image, 0x40);
+        assert_eq!(found.len(), 1, "the last halfword is inside the image");
+        assert_eq!(found[0].at, at);
+        assert_eq!(found[0].kind, XrefKind::Branch);
+    }
+
+    /// A stored handler pointer in the image's final word is still a
+    /// reference — the off-by-one `find_bl_sites` had before 0.2.0, one scan
+    /// over.
+    #[test]
+    fn xrefs_finds_a_stored_pointer_in_the_last_word_of_the_image() {
+        let mut image = live(0x40);
+        let at = image.len() - 4;
+        // Stored with the Thumb bit set, as a handler pointer really is.
+        crate::write(&mut image, at, &0x41u32.to_le_bytes());
+        let found = xrefs(&image, 0x40);
+        assert!(
+            found
+                .iter()
+                .any(|x| x.at == at && x.kind == XrefKind::LiteralPool),
+            "a pointer in the final word must be reported: {found:?}"
+        );
+    }
+
+    /// Both scans walk the *whole* image, not a fraction of it.
+    ///
+    /// `at + 2` becoming `at * 2` stops the instruction walk half way, and
+    /// `p + 4` becoming `p * 4` stops the pointer scan at a quarter. Neither
+    /// shows up unless a reference lives past the truncation point, so this
+    /// puts one near the end of a large image deliberately.
+    #[test]
+    fn both_xref_scans_cover_the_whole_image_not_a_fraction_of_it() {
+        let mut image = live(0x400);
+        let branch_at = 0x300;
+        // `bl` to 0x40 from 0x300.
+        let bl = crate::encode_bl(branch_at, 0x40).expect("in range");
+        crate::write(&mut image, branch_at, &bl);
+        let pointer_at = 0x380;
+        crate::write(&mut image, pointer_at, &0x41u32.to_le_bytes());
+
+        let found = xrefs(&image, 0x40);
+        assert!(
+            found
+                .iter()
+                .any(|x| x.at == branch_at && x.kind == XrefKind::Call),
+            "the call at {branch_at:#x} is past the half-way point: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|x| x.at == pointer_at && x.kind == XrefKind::LiteralPool),
+            "the pointer at {pointer_at:#x} is past the quarter-way point: {found:?}"
+        );
     }
 }

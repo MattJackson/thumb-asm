@@ -1,7 +1,7 @@
 //! 16-bit load/store of a single data item — `hw1[15:10]` in
 //! `0b010010..=0b100111` and `0b101000..=0b101011`, that is `hw1` in
 //! `0x4800..=0xAFFF` (ARM DDI 0403E.e A5.2.4 and Table A5-5; identically
-//! ARM DDI 0406C A6.2.4 and Table A6-5, which allocate the same sixteen rows).
+//! ARM DDI 0406B A6.2.4 and Table A6-5, which allocate the same sixteen rows).
 //!
 //! A5.2.4 proper is `opA` of `0b0101`, `0b011x` and `0b100x`. The dispatcher
 //! folds in the three single-encoding rows of Table A5-1 that share this file's
@@ -887,6 +887,22 @@ mod tests {
             assert_eq!(encode(&bad), None, "`{bad}`: {why}");
         }
 
+        // The encoding name and the operand count are two separate
+        // conditions, and neither is implied by the other. `ADD (SP plus
+        // immediate)` also has a T3 (`add.w <Rd>,SP,#<const>`) and a T4
+        // (`addw`), both of which spell the same three operands and both of
+        // which are four bytes long: answering for one of them with this
+        // two-byte halfword would shorten the instruction in place and leave
+        // two bytes of the old one behind as data. A fourth operand is the
+        // other way round — the encoding name is right, the shape is not —
+        // and must not be silently dropped.
+        let mut renamed = add_sp;
+        renamed.encoding = "T3";
+        assert_eq!(encode(&renamed), None, "T3 is `add.w`, four bytes");
+        let mut trailing = add_sp;
+        trailing.operands = ops(&[r0, sp, Operand::Imm(4), Operand::Imm(0)]);
+        assert_eq!(encode(&trailing), None, "a fourth operand is not ours");
+
         // The register-offset row: `[<Rn>,<Rm>]`, both low, no shift, and only
         // for the eight mnemonics of Table A5-5's `0101` row.
         let reg_off = decode(0x5088, 0, 0).unwrap(); // str r0, [r1, r2]
@@ -944,6 +960,39 @@ mod tests {
             let bad = Insn {
                 mnemonic,
                 encoding,
+                operands,
+                ..reg_off
+            };
+            assert_eq!(encode(&bad), None, "`{bad}`: {why}");
+        }
+
+        // The rest of the memory operand, one field at a time. Table A5-5's
+        // `0101` row is `0101 opB Rm Rn Rt` and that is the whole halfword:
+        // there is no displacement field beside `Rm` and no `U` bit, so a
+        // `Mem` that carries either has no encoding here. Both would
+        // otherwise come back as the plain `str r0, [r1, r2]` — the first
+        // storing four bytes below where it was asked to, the second at
+        // `r1 + r2` instead of `r1 - r2`.
+        let indexed_mem = |offset, add| {
+            ops(&[
+                r0,
+                Operand::Mem(Mem {
+                    index: Some((Reg(2), None)),
+                    ..mem(Reg(1), offset, add, AddrMode::Offset)
+                }),
+            ])
+        };
+        for (operands, why) in [
+            (
+                indexed_mem(4, true),
+                "no field holds a displacement beside Rm",
+            ),
+            (
+                indexed_mem(0, false),
+                "no U bit: a register index is always added",
+            ),
+        ] {
+            let bad = Insn {
                 operands,
                 ..reg_off
             };

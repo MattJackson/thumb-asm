@@ -21,13 +21,19 @@ not, is counted section by section in
 ## Near term
 
 - **Close the remaining real mutation survivors.** `cargo-mutants` generates
-  7,475 mutants; 89.0% are caught, and 96.9% once the provably-equivalent
-  families are set aside. The **206** that remain are real — each is a change to
-  behaviour that nothing asserts. They are concentrated in `encode` guard
-  clauses, the `if insn.encoding != … { return None }` checks that refuse
-  operand shapes a group cannot hold, and the round-trip sweeps miss them by
-  construction because a sweep only ever hands `encode` an instruction that
-  already decoded. Killing them means tests that feed `encode` deliberately
+  7,624 mutants, of which 7,378 are viable. 6,669 are caught outright and a
+  further 53 hang a loop until the run times out, which is a detected
+  difference — 91.1% between them. Of the 656 that survive, 588 are `|`
+  replaced by `^` over *disjoint* bit-fields and 4 are `r.num() < 16`, which
+  `Reg::num` makes unconditionally true; both families are equivalent by
+  construction and no test can kill them. Setting those aside gives **99.1%**,
+  and roughly **64** real survivors remain.
+
+  They are concentrated in `encode` guard clauses, the
+  `if insn.encoding != … { return None }` checks that refuse operand shapes a
+  group cannot hold, and the round-trip sweeps miss them by construction
+  because a sweep only ever hands `encode` an instruction that already
+  decoded. Killing them means tests that feed `encode` deliberately
   wrong-shaped input. See `docs/CONFORMANCE.md`, "Mutation testing".
 
 - **Fuzz the decoder.** There is no fuzzer today. That is why the OpenSSF

@@ -52,34 +52,32 @@ dependencies beyond `std`, and no Cargo features to choose between.
 
 ```toml
 [dependencies]
-thumb-asm = "0.10"
+thumb-asm = "0.11"
 ```
 
 ## Status
 
-**Pre-1.0, and 0.10.0 is a large release.** 0.1.0 was a 676-line assembler and
-patch-site finder with 26 instruction encodings. 0.10.0 is roughly twenty
-thousand lines: a decoder and encoder for essentially the whole Thumb and
-Thumb-2 instruction set, an instruction relocator built on it, and a
-trampoline installer built on that.
+**Pre-1.0.** Roughly twenty thousand lines: a decoder and encoder for
+essentially the whole Thumb and Thumb-2 instruction set, an instruction
+relocator built on it, and a trampoline installer built on that. What it is
+for is patching firmware that then gets flashed to hardware, where a wrong
+encoding is a brick rather than an exception — so the bar is that emitting
+wrong bytes should be impossible, not merely unlikely, and
+[How it is checked](#how-it-is-checked) is the argument that it is.
 
-**The API is not frozen, and a minor bump may break it.** Three things that
-shipped in 0.1.0 break here: `find_free_space` takes a required `align`
-parameter, `Needle::FreeRun` became a struct variant, and `Asm::mov_reg` no
-longer writes the condition flags, because it no longer lowers to
-`adds rd, rm, #0`. The first two are compile errors; the third is a behaviour
-change and is the one to read about before upgrading — it is in
-[Design](#design-and-what-this-is-not) and, with the rest,
-in [`CHANGELOG.md`](CHANGELOG.md).
+**The API is not frozen, and a minor bump may break it.** Before 1.0 the minor
+slot is where breaking changes go; `cargo-semver-checks` runs in CI and fails
+a release whose version bump is too small for what the API did. What broke in
+any given release is in [`CHANGELOG.md`](CHANGELOG.md).
 
 **What is covered, and what is not.**
 [`spec/THUMB-ISA.md`](https://github.com/MattJackson/thumb-asm/blob/main/spec/THUMB-ISA.md)
 is the coverage map: it walks the 16-bit and 32-bit encoding spaces section by
 section against Arm's own architecture reference manuals (DDI 0403E.e and DDI
-0406C), one file of `src/isa/` per numbered sub-table, and states coverage in
+0406B), one file of `src/isa/` per numbered sub-table, and states coverage in
 counts rather than adjectives — see [ISA coverage](#isa-coverage) below for the
 figures and how they are counted. The honest summary: the 16-bit space is
-covered bar 1,157 halfwords that are named one at a time, the 32-bit space is
+covered bar 1,159 halfwords that are named one at a time, the 32-bit space is
 covered broadly but unevenly, and §5 and §6 of that document list the places
 where the manual, or this crate, is not what a reader would assume. In
 particular `Insn` has no channel for "this encoding is UNPREDICTABLE", so
@@ -296,18 +294,20 @@ pool assuming the code will be placed at a 4-byte-aligned address, because
 requires the alignment you need — `find_free_space(&image, len, 4, 0)` for
 anything you are about to assemble, `1` for raw data — and the scan honours it
 while searching rather than rounding up a run it already found, which would move
-the start without moving the end. Through 0.1.0 this was documented rather than
-enforced, and the one known consumer worked around it by over-asking for
-`len + 16` bytes.
+the start without moving the end. Documenting the requirement instead of taking
+it as a parameter is not equivalent: the caller's workaround is to over-ask for
+`len + 16` bytes and align by hand, which silently fails when the extra 16 bytes
+are the reason no run is large enough.
 
 **Encoding hazards are named, not hidden.** Each of these is in the rustdoc for
 the item it affects, with the manual section it comes from:
 
 - `mov_reg` emits `MOV (register)` T1 (`0x4600`): it leaves the flags alone and
-  reaches R8–R15, which is what a register move should do. Through 0.1.0 it
-  emitted `adds rd, rm, #0` instead and wrote N, Z, C and V, so a move between
-  a `cmp` and its `b<cond>` was silently miscompiled. The flag-setting move now
-  has to be asked for by name, as `movs_reg`.
+  reaches R8–R15, which is what a register move should do. The tempting 16-bit
+  lowering, `adds rd, rm, #0`, writes N, Z, C and V and reaches only R0–R7, so a
+  move inserted between a `cmp` and its `b<cond>` silently changes which way the
+  branch goes. The flag-setting move has to be asked for by name, as
+  `movs_reg`.
 - `movs_reg` and `lsls_imm(rd, rm, 0)` are the same instruction — `MOV
   (register)` T2 — because that is how the architecture defines it.
 - `b_cond(Cond::Al, label)` emits the *unconditional* `b`, not a condition
@@ -441,11 +441,12 @@ than a tag or a branch, and none of them uses `continue-on-error` anywhere.
   - **mutation testing**, periodically rather than in CI: `cargo-mutants`
     rewrites the source in small mechanical ways and reruns the suite, so a
     surviving mutant is a change to behaviour no test noticed. The latest run
-    is 7,475 mutants, **89.0% caught** — or **96.9%** once the 588 survivors
+    is 7,624 mutants, **91.1% caught** — or **99.1%** once the 592 survivors
     that are provably equivalent (`|` swapped for `^` across disjoint
-    bit-fields) are set aside. It is not decoration: it is what produced the
-    `Asm` operand validation and the tests pinning `writes_pc` and
-    `first_operand_is_source`. See
+    bit-fields, and `r.num() < 16`, which is always true) are set aside. It is
+    not decoration: it is what produced the `Asm` operand validation, the
+    tests pinning `writes_pc` and `first_operand_is_source`, and an inverted
+    `VLD4` alignment guard that no round trip could see. See
     [`docs/CONFORMANCE.md`](https://github.com/MattJackson/thumb-asm/blob/main/docs/CONFORMANCE.md#mutation-testing-what-the-coverage-number-does-not-say);
   - **`cargo semver-checks` against the crate already published on crates.io**,
     guarded only by whether a published baseline exists yet — so a breaking
@@ -562,7 +563,7 @@ and a keyless cosign signature over the exact `.crate` published to crates.io,
 both attached as release assets:
 
 ```sh
-gh attestation verify thumb-asm-0.10.1.crate --repo MattJackson/thumb-asm
+gh attestation verify thumb-asm-0.11.1.crate --repo MattJackson/thumb-asm
 ```
 
 ## Changelog

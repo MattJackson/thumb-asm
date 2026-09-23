@@ -1,5 +1,5 @@
 //! Store single data item — `hw1[15:11] == 0b11111`, `hw1[10:4]` matching
-//! `000xxx0` (ARM DDI 0403E.e A5.3.10, Table A5-21; ARM DDI 0406C A6.3.10,
+//! `000xxx0` (ARM DDI 0403E.e A5.3.10, Table A5-21; ARM DDI 0406B A6.3.10,
 //! Table A6-21).
 //!
 //! ```text
@@ -31,7 +31,7 @@
 //!
 //! The unprivileged corner is therefore `P == 1 && U == 1 && W == 0`, not
 //! `P == 0 && W == 0`: the redirect is *`if P == '1' && U == '1' && W == '0'
-//! then SEE STRT`* (A7.7.161, A7.7.163, A7.7.170; ARM DDI 0406C A8.8.203 and
+//! then SEE STRT`* (A7.7.161, A7.7.163, A7.7.170; ARM DDI 0406B A8.6.193 and
 //! friends agree). Both manuals, both profiles.
 //!
 //! # `P`, `U`, `W` and [`AddrMode`]

@@ -1457,6 +1457,55 @@ mod tests {
         assert_eq!(ual(0xF3EF, 0x8100), "mrs r1, APSR");
         assert_eq!(ual(0xF3EF, 0x8512), "mrs r5, BASEPRI_MAX");
 
+        // Table B5-1 entire, in both directions: every `SYSm` the M profile
+        // allocates, and — for the four xPSR composites — every `mask` that
+        // carries a `_<bits>` qualifier (Table B5-2). Exhaustive rather than
+        // representative, because a row that is missing here is an `MSR`/`MRS`
+        // a firmware disassembly drops on the floor instead of naming, and
+        // one that [`encode`] could never put back.
+        #[rustfmt::skip]
+        let m_profile: [(u16, u16, &str); 36] = [
+            (0xF380, 0x8400, "msr APSR_g, r0"),
+            (0xF380, 0x8800, "msr APSR_nzcvq, r0"),
+            (0xF380, 0x8C00, "msr APSR_nzcvqg, r0"),
+            (0xF380, 0x8401, "msr IAPSR_g, r0"),
+            (0xF380, 0x8801, "msr IAPSR_nzcvq, r0"),
+            (0xF380, 0x8C01, "msr IAPSR_nzcvqg, r0"),
+            (0xF380, 0x8402, "msr EAPSR_g, r0"),
+            (0xF380, 0x8802, "msr EAPSR_nzcvq, r0"),
+            (0xF380, 0x8C02, "msr EAPSR_nzcvqg, r0"),
+            (0xF380, 0x8403, "msr XPSR_g, r0"),
+            (0xF380, 0x8803, "msr XPSR_nzcvq, r0"),
+            (0xF380, 0x8C03, "msr XPSR_nzcvqg, r0"),
+            (0xF380, 0x8805, "msr IPSR, r0"),
+            (0xF380, 0x8806, "msr EPSR, r0"),
+            (0xF380, 0x8807, "msr IEPSR, r0"),
+            (0xF380, 0x8808, "msr MSP, r0"),
+            (0xF380, 0x8809, "msr PSP, r0"),
+            (0xF380, 0x8810, "msr PRIMASK, r0"),
+            (0xF380, 0x8811, "msr BASEPRI, r0"),
+            (0xF380, 0x8812, "msr BASEPRI_MAX, r0"),
+            (0xF380, 0x8813, "msr FAULTMASK, r0"),
+            (0xF380, 0x8814, "msr CONTROL, r0"),
+            (0xF3EF, 0x8000, "mrs r0, APSR"),
+            (0xF3EF, 0x8001, "mrs r0, IAPSR"),
+            (0xF3EF, 0x8002, "mrs r0, EAPSR"),
+            (0xF3EF, 0x8003, "mrs r0, XPSR"),
+            (0xF3EF, 0x8005, "mrs r0, IPSR"),
+            (0xF3EF, 0x8006, "mrs r0, EPSR"),
+            (0xF3EF, 0x8007, "mrs r0, IEPSR"),
+            (0xF3EF, 0x8008, "mrs r0, MSP"),
+            (0xF3EF, 0x8009, "mrs r0, PSP"),
+            (0xF3EF, 0x8010, "mrs r0, PRIMASK"),
+            (0xF3EF, 0x8011, "mrs r0, BASEPRI"),
+            (0xF3EF, 0x8012, "mrs r0, BASEPRI_MAX"),
+            (0xF3EF, 0x8013, "mrs r0, FAULTMASK"),
+            (0xF3EF, 0x8014, "mrs r0, CONTROL"),
+        ];
+        for (hw1, hw2, text) in m_profile {
+            assert_eq!(round_trip(hw1, hw2, 0).to_string(), text);
+        }
+
         // A/R, B6.1.7 — `<fields>` is any subset of `c`, `x`, `s`, `f`.
         assert_eq!(ual(0xF380, 0x8900), "msr CPSR_fc, r0", "mask 1001");
         assert_eq!(ual(0xF384, 0x8F00), "msr CPSR_fsxc, r4");
@@ -1488,6 +1537,16 @@ mod tests {
         assert_eq!(ual(0xF3AF, 0x8014), "csdb.w");
         assert_eq!(ual(0xF3AF, 0x80F0), "dbg #0");
         assert_eq!(ual(0xF3AF, 0x80FF), "dbg #0xf");
+        // Which architectural encoding each hint *is* — not decoration, and
+        // not derivable from the printed form. The five NOP-compatible hints
+        // have a 16-bit T1 to be told apart from, so their wide form is T2
+        // (A7.7.88); `CSDB` has no 16-bit encoding at all, so its wide form
+        // is T1 (A7.7.31). Naming them alike, or swapping the two, would let
+        // `encode` accept an `Insn` this module never decoded.
+        assert_eq!(dec(0xF3AF, 0x8000, 0).encoding, "T2", "nop.w");
+        assert_eq!(dec(0xF3AF, 0x8004, 0).encoding, "T2", "sev.w");
+        assert_eq!(dec(0xF3AF, 0x8014, 0).encoding, "T1", "csdb.w");
+        assert_eq!(dec(0xF3AF, 0x80F0, 0).encoding, "T1", "dbg #0");
         for (hw1, hw2) in [
             (0xF3AFu16, 0x8000u16),
             (0xF3AF, 0x8004),
@@ -1563,6 +1622,13 @@ mod tests {
         assert!(decode(0xF3AF, 0x8260, 0).is_none());
         assert!(decode(0xF3AF, 0x8400, 0).is_none());
         assert!(decode(0xF3AF, 0x8160, 0).is_none());
+        // Each of `A`, `I` and `F` on its own, not only two at a time: the
+        // `CPS #<mode>` syntax line has nowhere to print an interrupt flag,
+        // so one set bit is already an encoding that cannot round-trip —
+        // decoding it would print `cps #0x10` and throw the flag away.
+        assert!(decode(0xF3AF, 0x8190, 0).is_none(), "A set");
+        assert!(decode(0xF3AF, 0x8150, 0).is_none(), "I set");
+        assert!(decode(0xF3AF, 0x8130, 0).is_none(), "F set");
         // `BXJ`/`SUBS PC,LR` have fixed bits that must hold.
         assert!(decode(0xF3C5, 0x8F01, 0).is_none());
         assert!(decode(0xF3DD, 0x8F00, 0).is_none());
@@ -1605,6 +1671,18 @@ mod tests {
         let mut renamed = bl;
         renamed.encoding = "T2";
         assert_eq!(encode(&renamed), None);
+
+        // The hints are named the same way. `CSDB` has no 16-bit form, so its
+        // wide encoding is T1 where the five NOP-compatible hints are T2
+        // (A7.7.31, A7.7.88) — and the pairing is part of the identity, not a
+        // label: a `nop` claiming T1 is an encoding this module never decoded,
+        // and re-encoding it would emit `0xF3AF 0x8000`, which is `nop.w` T2.
+        let mut nop_as_t1 = decode(0xF3AF, 0x8000, 0).unwrap();
+        nop_as_t1.encoding = "T1";
+        assert_eq!(encode(&nop_as_t1), None);
+        let mut csdb_as_t2 = decode(0xF3AF, 0x8014, 0).unwrap();
+        csdb_as_t2.encoding = "T2";
+        assert_eq!(encode(&csdb_as_t2), None);
 
         // The narrow encodings of `b` and `nop` belong to other modules.
         let mut narrow = bl;
@@ -1678,6 +1756,11 @@ mod tests {
         let mut ssbb_as_dsb = decode(0xF3BF, 0x8F4F, 0).unwrap();
         ssbb_as_dsb.operands = one(Operand::Imm(0));
         assert_eq!(encode(&ssbb_as_dsb), None);
+        // Both of them, not just `#0`: `dsb #4` would emit `0xF3BF 0x8F44`,
+        // which Table A5-15 reads back as `pssbb`.
+        let mut pssbb_as_dsb = decode(0xF3BF, 0x8F4F, 0).unwrap();
+        pssbb_as_dsb.operands = one(Operand::Imm(4));
+        assert_eq!(encode(&pssbb_as_dsb), None);
     }
 
     #[test]
@@ -1691,16 +1774,35 @@ mod tests {
         // syntax line has nowhere to put.
         let reg = Operand::Reg(Reg(0));
         let imm = Operand::Imm(0);
+        let neg = Operand::Imm(-1);
+        let pc = Operand::Reg(Reg::PC);
+        let lr = Operand::Reg(Reg::LR);
         let primask = Operand::SpecialReg("PRIMASK");
-        let cases: [(u16, u16, &[Operand], &str); 16] = [
+        let cases: [(u16, u16, &[Operand], &str); 25] = [
             // `UDF<c>.W #<imm16>` (A7.7.194) — exactly one immediate.
             (0xF7F0, 0xA000, &[imm, imm], "udf.w takes one immediate"),
+            // Every immediate field in this group is unsigned in its own
+            // syntax line, and [`Operand::Imm`] is signed, so the low end of
+            // each range is load-bearing: `-1` narrowed to the field width is
+            // all ones, which would silently assemble `udf.w #-1` as
+            // `udf.w #0xffff`, `smc #-1` as `smc #0xf` and `dbg #-1` as
+            // `dbg #0xf` — a different instruction with a valid-looking
+            // encoding.
+            (0xF7F0, 0xA000, &[neg], "udf.w's #<imm16> is unsigned"),
             // `SMC{<c>}{<q>} #<imm4>` (B6.1.9).
             (0xF7F0, 0x8000, &[], "smc takes one immediate"),
+            (0xF7F0, 0x8000, &[imm, imm], "smc takes one, not two"),
+            (0xF7F0, 0x8000, &[neg], "smc's #<imm4> is unsigned"),
             // `MSR<c> <spec_reg>, <Rn>` (A7.7.83, B6.1.7).
             (0xF383, 0x8810, &[primask], "msr takes two operands"),
             (0xF383, 0x8810, &[reg, reg], "msr writes a special register"),
             (0xF383, 0x8810, &[primask, imm], "msr reads a core register"),
+            (
+                0xF383,
+                0x8810,
+                &[primask, reg, imm],
+                "msr takes two operands",
+            ),
             (
                 0xF383,
                 0x8810,
@@ -1729,29 +1831,29 @@ mod tests {
             ),
             // `BXJ<c> <Rm>` (A8.6.26).
             (0xF3C5, 0x8F00, &[], "bxj takes one register"),
+            (0xF3C5, 0x8F00, &[reg, reg], "bxj takes one, not two"),
             (0xF3C5, 0x8F00, &[imm], "bxj branches to a register"),
             // `SUBS<c><q> PC, LR, #<const>` (B6.1.13) — and nothing else that
             // happens to be spelled `sub` and to set flags.
+            (0xF3DE, 0x8F04, &[reg, lr, imm], "the destination is pc"),
+            (0xF3DE, 0x8F04, &[pc, reg, imm], "the source is lr"),
             (
                 0xF3DE,
                 0x8F04,
-                &[reg, Operand::Reg(Reg::LR), imm],
-                "the destination is pc",
+                &[pc, lr, imm, imm],
+                "subs pc, lr takes three, not four",
             ),
-            (
-                0xF3DE,
-                0x8F04,
-                &[Operand::Reg(Reg::PC), reg, imm],
-                "the source is lr",
-            ),
+            (0xF3DE, 0x8F04, &[pc, lr, neg], "the #<const> is unsigned"),
             // `DBG<c> #<option>` (A7.7.32) — one four-bit immediate.
             (0xF3AF, 0x80F0, &[], "dbg takes one immediate"),
+            (0xF3AF, 0x80F0, &[imm, imm], "dbg takes one, not two"),
             (
                 0xF3AF,
                 0x80F0,
                 &[Operand::Imm(16)],
                 "dbg's option is four bits",
             ),
+            (0xF3AF, 0x80F0, &[neg], "dbg's option is unsigned"),
         ];
         for (hw1, hw2, operands, why) in cases {
             let insn = with_operands(hw1, hw2, operands);
@@ -1762,6 +1864,12 @@ mod tests {
         // through `encode_branch`, so its operand check needs its own case.
         let beq = with_operands(0xF000, 0x8000, &[imm]);
         assert_eq!(encode(&beq), None, "b<cond>.w branches to a target");
+        // A *surplus* operand is the only way to reach that length check —
+        // with too few, the slot read refuses first — and `beq.w 0x4, #0` is
+        // not a syntax line: encoding it would drop the second operand and
+        // write a branch the caller never asked for.
+        let beq_plus = with_operands(0xF000, 0x8000, &[Operand::Target(4), imm]);
+        assert_eq!(encode(&beq_plus), None, "b<cond>.w takes one target");
 
         // The `.w` suffix is part of the syntax line, not decoration: `NOP.W`
         // (A7.7.88) and `UDF.W` (A7.7.194) print it because their 16-bit
@@ -1829,6 +1937,9 @@ mod tests {
         // …and `DSB`/`DMB`/`ISB` take exactly one.
         let bare_dsb = with_operands(0xF3BF, 0x8F4F, &[]);
         assert_eq!(encode(&bare_dsb), None, "dsb takes one <option>");
+        let sy = Operand::Option("sy");
+        let wordy_dsb = with_operands(0xF3BF, 0x8F4F, &[sy, sy]);
+        assert_eq!(encode(&wordy_dsb), None, "dsb takes one <option>, not two");
     }
 
     #[test]
@@ -1848,7 +1959,7 @@ mod tests {
         assert_eq!(ual(0xF3AF, 0x8561), "cpsie.w if, #1");
 
         let a = Operand::Text("a");
-        let cases: [(u16, &[Operand], &str); 8] = [
+        let cases: [(u16, &[Operand], &str); 9] = [
             // `CPS #<mode>` — exactly one immediate, five bits wide.
             (0x8110, &[], "cps takes one mode"),
             (
@@ -1858,6 +1969,7 @@ mod tests {
             ),
             (0x8110, &[a], "cps' mode is an immediate"),
             (0x8110, &[Operand::Imm(0x20)], "mode is five bits"),
+            (0x8110, &[Operand::Imm(-1)], "mode is unsigned"),
             // `CPSIE`/`CPSID` — an `<iflags>` spelling, then an optional mode.
             (0x8680, &[Operand::Imm(0)], "the first operand is <iflags>"),
             (

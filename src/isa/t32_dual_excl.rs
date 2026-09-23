@@ -2,7 +2,7 @@
 //! `hw1[15:11] == 0b11101` and `hw1[10:4]` matching `00xx1xx` (ARM DDI 0403E.e
 //! A5.3.6 and Table A5-17).
 //!
-//! ARM DDI 0406C A6.3.6 and Table A6-17 allocate exactly the same rows and add
+//! ARM DDI 0406B A6.3.6 and Table A6-17 allocate exactly the same rows and add
 //! two of their own — `LDREXD` and `STREXD`, the doubleword exclusives, which
 //! no M-profile core implements. This module decodes the union, because a
 //! decoder that refused them would misreport an A/R image, and each row below
@@ -1516,6 +1516,29 @@ mod tests {
             assert_eq!(encode(&bad), None, "{mem}");
         }
 
+        // `STREX`/`LDREX` scale their `imm8` by four, so the top of the range
+        // is 1020 and 1024 is the first offset that does not fit. Nothing
+        // else refuses it: `1024 % 4` is zero, and `1024 / 4` is 256, which
+        // would be truncated into the eight-bit field as zero — `[r2, #1024]`
+        // silently re-encoded as `[r2]`, a store a kilobyte away from where
+        // it was asked for.
+        let mut far = strex;
+        let mut operands = Operands::new();
+        operands.push(Operand::Reg(Reg(0)));
+        operands.push(Operand::Reg(Reg(1)));
+        operands.push(Operand::Mem(offset_mem(Reg(2), 1024)));
+        far.operands = operands;
+        assert_eq!(encode(&far), None, "imm8:'00' stops at 1020");
+        // …and 1020 itself, so the rejection above is of the value and not of
+        // the shape.
+        let mut top = strex;
+        let mut operands = Operands::new();
+        operands.push(Operand::Reg(Reg(0)));
+        operands.push(Operand::Reg(Reg(1)));
+        operands.push(Operand::Mem(offset_mem(Reg(2), 1020)));
+        top.operands = operands;
+        assert_eq!(encode(&top), Some((0xE842, 0x10FF)));
+
         // The sized exclusives take no offset at all.
         let mut strexb = decode(0xE8C2, 0x1F40, 0).unwrap();
         assert_eq!(encode(&strexb), Some((0xE8C2, 0x1F40)));
@@ -1525,6 +1548,37 @@ mod tests {
         operands.push(Operand::Mem(offset_mem(Reg(2), 4)));
         strexb.operands = operands;
         assert_eq!(encode(&strexb), None);
+
+        // …nor a `U` bit, nor a writeback bit: `hw2[7:4]` is `op3` and
+        // `hw2[3:0]` is `Rd`, so there is nowhere for either to go. Both of
+        // these have a zero offset and no index, so the `offset != 0` clause
+        // above says nothing about them — and both would otherwise come back
+        // as the plain `[r2]` form, one throwing away the sign of a `#-0` and
+        // the other throwing away the base-register update.
+        for (mem, why) in [
+            (
+                Mem {
+                    add: false,
+                    ..offset_mem(Reg(2), 0)
+                },
+                "`#-0` is a real and distinct addressing mode",
+            ),
+            (
+                Mem {
+                    mode: AddrMode::PreIndex,
+                    ..offset_mem(Reg(2), 0)
+                },
+                "there is no W bit to carry the writeback",
+            ),
+        ] {
+            let mut bad = decode(0xE8C2, 0x1F40, 0).unwrap();
+            let mut operands = Operands::new();
+            operands.push(Operand::Reg(Reg(0)));
+            operands.push(Operand::Reg(Reg(1)));
+            operands.push(Operand::Mem(mem));
+            bad.operands = operands;
+            assert_eq!(encode(&bad), None, "{why}");
+        }
 
         // A `TBH` whose mandatory `LSL #1` has gone missing, and a `TBB` that
         // has acquired one.

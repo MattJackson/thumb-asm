@@ -1,5 +1,5 @@
 //! Load Multiple and Store Multiple — `hw1[15:11] == 0b11101`, `hw1[10:4]`
-//! matching `00xx0xx` (ARM DDI 0403E.e A5.3.5, Table A5-16; ARM DDI 0406C
+//! matching `00xx0xx` (ARM DDI 0403E.e A5.3.5, Table A5-16; ARM DDI 0406B
 //! A6.3.5, Table A6-16).
 //!
 //! ```text
@@ -25,7 +25,7 @@
 //! | `11` | 1 | — | `RFE` (A/R profile only) | T2 |
 //!
 //! The last four rows are Table A6-16's and not Table A5-16's: `SRS` (Store
-//! Return State, ARM DDI 0406C B6.1.10) and `RFE` (Return From Exception,
+//! Return State, ARM DDI 0406B B6.1.10) and `RFE` (Return From Exception,
 //! B6.1.8) need banked registers and an SPSR, neither of which an M-profile
 //! core has, so `op == 00` and `op == 11` are simply UNDEFINED on Armv7-M.
 //! This module decodes the union of the two profiles, as the crate does
@@ -782,6 +782,31 @@ mod tests {
         // `W`, which is `op2[2]` in Table A5-9's `00xx0xx` pattern.
         assert!(decode(0xE8C0 | 0x0040, 0x0011, 0).is_none());
         assert!(decode(0xE8A0 | 0x0040, 0x0011, 0).is_none());
+
+        // The three tests above are each one clause of the same `if`, and the
+        // halfwords they use fail the other two clauses as well — so none of
+        // them shows that a clause is doing any work on its own. These do:
+        // each fails exactly one clause, and each has `op == 01` and a
+        // register list that would otherwise decode as a perfectly ordinary
+        // `ldm.w r0, {r1, r2}`.
+        //
+        // `0xEA90 0x0006` is `eors.w r0, r0, r6`, from Table A5-9's
+        // data-processing (shifted register) row — the group's own `op1`,
+        // the wrong `op2`. `0xF090 0x0006` is `eors r0, r0, #6`, from
+        // data-processing (modified immediate) — the wrong `op1` entirely,
+        // but `op2[1:0]` and `hw1[6]` that this group would accept. Neither
+        // is a load-multiple, and neither would be noticed if this module
+        // claimed it, because `mod.rs` never routes them here.
+        for (hw1, what) in [(0xEA90u16, "eors.w"), (0xF090, "eors")] {
+            assert!(
+                decode(hw1, 0x0006, 0).is_none(),
+                "{hw1:#06x} is `{what}`, not a load/store-multiple"
+            );
+        }
+        // …and the same `op`/`W`/`L`/`Rn` bits under the group's own prefix
+        // do decode, so the rejections above are of the prefix and the `op2`
+        // row, not of the rest of the halfword.
+        assert_eq!(dec(0xE890, 0x0006).to_string(), "ldm.w r0, {r1, r2}");
     }
 
     /// The A/R-only rows carry fixed second halfwords, and every deviation
