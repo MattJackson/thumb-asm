@@ -676,6 +676,7 @@ fn verify(insn: &Insn, hw1: u16, hw2: u16) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::Target;
 
     /// A 4-aligned address: `Align(PC,4)` changes nothing here.
     const ALIGNED: u32 = 0x1000;
@@ -1714,7 +1715,7 @@ mod tests {
         for &addr in &[ALIGNED, UNALIGNED] {
             for (hw1, hw2) in cases {
                 let mine = decode(hw1, hw2, addr).expect("this module decodes it");
-                let theirs = crate::isa::decode_halfwords(hw1, hw2, addr, false);
+                let theirs = crate::isa::decode_halfwords(hw1, hw2, addr, Target::Union);
                 assert_eq!(theirs, Some(mine), "dispatch of {hw1:#06x} {hw2:#06x}");
                 assert_eq!(
                     crate::isa::encode(&mine),

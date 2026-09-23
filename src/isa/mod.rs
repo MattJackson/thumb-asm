@@ -37,6 +37,7 @@ pub use insn::{
 use crate::Cond;
 
 // One module per encoding group, named for the sub-table it implements.
+mod cmse;
 mod t16_branch;
 mod t16_dataproc;
 mod t16_loadstore;
@@ -77,6 +78,74 @@ pub fn insn_len(hw1: u16) -> usize {
     }
 }
 
+/// Which architecture the bytes are meant for.
+///
+/// Thumb halfwords do not carry their own profile, and the profiles disagree:
+/// a pattern that is a defined instruction on one is UNDEFINED on another, and
+/// a few patterns are *different instructions* on different profiles. A
+/// decoder that is not told which one it is reading has to guess, and for
+/// firmware patching a plausible wrong answer is worse than a refusal.
+///
+/// Most of this crate still decodes the union, deliberately — see
+/// [`Union`](Target::Union). `Target` exists for the cases where the union is
+/// not a coherent answer.
+///
+/// # Choosing one
+///
+/// [`Union`](Target::Union) is the default and reproduces this crate's
+/// behaviour from before `Target` existed, byte for byte. Pick a specific
+/// target when you know it and want the decoder to hold you to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[non_exhaustive]
+pub enum Target {
+    /// Every profile at once: decode anything any profile defines.
+    ///
+    /// This is the right default for reverse-engineering an image whose
+    /// provenance you do not know, and it is what this crate did before
+    /// `Target` existed. Where two profiles give the same pattern *different*
+    /// instructions, the union keeps the Armv7 reading — so an Armv8-M
+    /// `SG` still decodes here as the `LDRD` Armv7 calls it. Use
+    /// [`V8M`](Target::V8M) on an image you know is Armv8-M.
+    Union,
+    /// Armv7-M and Armv7E-M — the Cortex-M profile.
+    V7M,
+    /// Armv7-A and Armv7-R — the application and real-time profiles.
+    V7AR,
+    /// Armv8-M Mainline with the Security Extension.
+    ///
+    /// Adds `SG`, `BXNS`, `BLXNS` and the `TT` family, each of which occupies
+    /// a pattern Armv7 gives to something else. Without this, every
+    /// TrustZone-M secure gateway in an image decodes as a pc-relative
+    /// `LDRD` carrying a literal target that does not exist.
+    V8M,
+    /// ThumbEE state (Armv7-A/R only).
+    ///
+    /// Not a profile but an execution state: `0xC000..=0xCFFF` means
+    /// something entirely different here, and only the processor's
+    /// `CPSR.{J,T}` says which — so a caller that knows a region runs in
+    /// ThumbEE state has to say so. See [`thumbee`](crate::isa) for why
+    /// getting it wrong invents register traffic where the hardware branches.
+    ThumbEE,
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Target::Union
+    }
+}
+
+impl Target {
+    /// Whether the ThumbEE re-assignment of the 16-bit map applies.
+    fn thumbee(self) -> bool {
+        matches!(self, Target::ThumbEE)
+    }
+
+    /// Whether the Armv8-M Security Extension's encodings are decodable.
+    fn cmse(self) -> bool {
+        matches!(self, Target::V8M)
+    }
+}
+
 /// Decode the single instruction at byte offset `at`, treating `at` as its
 /// address.
 ///
@@ -86,27 +155,37 @@ pub fn insn_len(hw1: u16) -> usize {
 /// preceding `IT` comes back with [`Insn::cond`] of `None`. Use [`Decoder`]
 /// when walking a run of instructions.
 pub fn decode_at(image: &[u8], at: usize) -> Option<Insn> {
-    decode_at_with(image, at, at as u32, false)
+    decode_at_with(image, at, at as u32, Target::Union)
 }
 
 /// Decode one instruction, stating its address explicitly.
 ///
 /// `addr` is what pc-relative operands resolve against, which is what lets a
 /// caller decode a buffer that was loaded somewhere other than its file
-/// offset. `thumbee` selects the ThumbEE variant of the encoding space, in
-/// which part of the 16-bit map is re-used (ARM DDI 0406B chapter A9).
-pub fn decode_at_with(image: &[u8], at: usize, addr: u32, thumbee: bool) -> Option<Insn> {
+/// offset. `target` says which architecture the bytes are meant for; pass
+/// [`Target::Union`] for this crate's historical behaviour, which decodes
+/// every profile at once.
+pub fn decode_at_with(image: &[u8], at: usize, addr: u32, target: Target) -> Option<Insn> {
     let hw1 = read_hw(image, at)?;
     let len = insn_len(hw1);
     let hw2 = if len == 4 { read_hw(image, at + 2)? } else { 0 };
-    decode_halfwords(hw1, hw2, addr, thumbee)
+    decode_halfwords(hw1, hw2, addr, target)
 }
 
 /// Decode from halfwords already in hand.
 ///
 /// Exposed because a consumer that has its own stream reader should not have
 /// to marshal bytes back into a slice to use this crate's decoder.
-pub fn decode_halfwords(hw1: u16, hw2: u16, addr: u32, thumbee: bool) -> Option<Insn> {
+pub fn decode_halfwords(hw1: u16, hw2: u16, addr: u32, target: Target) -> Option<Insn> {
+    // The Armv8-M Security Extension reassigns patterns Armv7 has already
+    // allocated, so it must be asked *before* the ordinary groups rather than
+    // after: by the time a group has answered, the wrong answer has been
+    // chosen. Like `thumbee` below, `cmse::owns` makes this final — including
+    // its `None`, which means "mine, and UNDEFINED", not "try Armv7".
+    if target.cmse() && cmse::owns(hw1, hw2) {
+        return cmse::decode(hw1, hw2, addr);
+    }
+    let thumbee = target.thumbee();
     if insn_len(hw1) == 2 {
         // ThumbEE does not *extend* the 16-bit map, it re-assigns a slice of
         // it: `0xC000..=0xCFFF` is `STM`/`LDM` T1 in Thumb state and chapter
@@ -311,7 +390,7 @@ pub struct Decoder<'a> {
     pos: usize,
     base: u32,
     it: ItState,
-    thumbee: bool,
+    target: Target,
 }
 
 impl<'a> Decoder<'a> {
@@ -322,7 +401,7 @@ impl<'a> Decoder<'a> {
             pos: 0,
             base: 0,
             it: ItState::INACTIVE,
-            thumbee: false,
+            target: Target::Union,
         }
     }
 
@@ -333,13 +412,19 @@ impl<'a> Decoder<'a> {
             pos: at,
             base: addr.wrapping_sub(at as u32),
             it: ItState::INACTIVE,
-            thumbee: false,
+            target: Target::Union,
         }
     }
 
-    /// Decode in ThumbEE state rather than ordinary Thumb state.
-    pub fn thumbee(mut self, yes: bool) -> Self {
-        self.thumbee = yes;
+    /// Decode for a specific architecture rather than the union of them.
+    ///
+    /// The union is the default and is usually what you want when reading an
+    /// image of unknown provenance. Set this when you know the target and
+    /// want the decoder held to it — most sharply for
+    /// [`Target::V8M`], without which every TrustZone-M secure gateway
+    /// decodes as a pc-relative `LDRD` that is not there.
+    pub fn target(mut self, target: Target) -> Self {
+        self.target = target;
         self
     }
 
@@ -379,7 +464,7 @@ impl Iterator for Decoder<'_> {
         } else {
             0
         };
-        let mut insn = decode_halfwords(hw1, hw2, addr, self.thumbee)?;
+        let mut insn = decode_halfwords(hw1, hw2, addr, self.target)?;
 
         // An instruction inside an IT block carries no condition of its own.
         if insn.cond.is_none() && self.it.active() {
@@ -439,11 +524,27 @@ pub fn encode(insn: &Insn) -> Option<(u16, u16)> {
     // collision only shows up through this function. Verifying centrally means
     // a greedy group can waste work but cannot produce a wrong answer.
     //
+    // The Security Extension is tried first and verified in `Target::V8M`,
+    // for the same reason ThumbEE is verified in ThumbEE state: its encodings
+    // shadow Armv7 ones, so verifying in the union would decode `sg` back as
+    // the `ldrd` Armv7 reads there and reject a correct answer.
+    //
+    // No `target` parameter is needed to decide this. Every mnemonic in the
+    // group — `sg`, `bxns`, `blxns`, `tt`, `ttt`, `tta`, `ttat` — is unique to
+    // Armv8-M; no Armv7 encoding shares one. So an `Insn` naming one of them
+    // can only have meant the Armv8-M instruction, and an `Insn` naming
+    // anything else never reaches `cmse::encode`'s match arms.
+    if let Some((hw1, hw2)) = cmse::encode(insn) {
+        if faithful(insn, hw1, hw2, Target::V8M) {
+            return Some((hw1, hw2));
+        }
+    }
+
     // ThumbEE is tried first among the narrow groups and verified in ThumbEE
     // state, because its encodings deliberately shadow ordinary ones.
     if insn.width == Width::Narrow {
         if let Some(hw) = thumbee::encode(insn) {
-            if faithful(insn, hw, 0, true) {
+            if faithful(insn, hw, 0, Target::ThumbEE) {
                 return Some((hw, 0));
             }
         }
@@ -481,11 +582,11 @@ pub fn encode(insn: &Insn) -> Option<(u16, u16)> {
             .iter()
             .filter_map(|f| f(insn))
             .map(|hw| (hw, 0))
-            .find(|&(hw1, hw2)| faithful(insn, hw1, hw2, false)),
+            .find(|&(hw1, hw2)| faithful(insn, hw1, hw2, Target::Union)),
         Width::Wide => WIDE
             .iter()
             .filter_map(|f| f(insn))
-            .find(|&(hw1, hw2)| faithful(insn, hw1, hw2, false)),
+            .find(|&(hw1, hw2)| faithful(insn, hw1, hw2, Target::Union)),
     }
 }
 
@@ -496,8 +597,8 @@ pub fn encode(insn: &Insn) -> Option<(u16, u16)> {
 /// an enclosing `IT` block rather than from the instruction's own encoding, so
 /// neither is recoverable from the halfwords alone. Everything that *is* in the
 /// bits must match exactly.
-fn faithful(insn: &Insn, hw1: u16, hw2: u16, thumbee: bool) -> bool {
-    match decode_halfwords(hw1, hw2, insn.addr, thumbee) {
+fn faithful(insn: &Insn, hw1: u16, hw2: u16, target: Target) -> bool {
+    match decode_halfwords(hw1, hw2, insn.addr, target) {
         Some(back) => {
             // A conditional narrow instruction is allowed to disagree about
             // flag-setting, and must be: the 16-bit data-processing encodings
@@ -685,11 +786,11 @@ mod tests {
     fn thumbee_undefined_row_is_undefined_only_in_thumbee_state() {
         for hw in 0xC100..=0xC1FFu16 {
             assert_eq!(
-                decode_halfwords(hw, 0, 0x1000, true),
+                decode_halfwords(hw, 0, 0x1000, Target::ThumbEE),
                 None,
                 "{hw:#06x} is UNDEFINED in ThumbEE state (Table A9-2)"
             );
-            let plain = decode_halfwords(hw, 0, 0x1000, false);
+            let plain = decode_halfwords(hw, 0, 0x1000, Target::Union);
             if hw == 0xC100 {
                 assert_eq!(plain, None, "empty register list is UNPREDICTABLE");
             } else {
@@ -703,8 +804,8 @@ mod tests {
 
         // And the boundary: one halfword below the row is `HBP`, one above is
         // `HB`, both of which ThumbEE state does define.
-        assert!(decode_halfwords(0xC0FF, 0, 0x1000, true).is_some());
-        assert!(decode_halfwords(0xC200, 0, 0x1000, true).is_some());
+        assert!(decode_halfwords(0xC0FF, 0, 0x1000, Target::ThumbEE).is_some());
+        assert!(decode_halfwords(0xC200, 0, 0x1000, Target::ThumbEE).is_some());
     }
 
     /// A short run walked through [`Decoder`] both ways, to pin where the two
@@ -723,7 +824,7 @@ mod tests {
 
         let plain: Vec<String> = Decoder::new(&image).map(|i| i.to_string()).collect();
         let ee: Vec<String> = Decoder::new(&image)
-            .thumbee(true)
+            .target(crate::isa::Target::ThumbEE)
             .map(|i| i.to_string())
             .collect();
 
@@ -760,7 +861,7 @@ mod tests {
         let plain: Vec<&str> = Decoder::new(&image).map(|i| i.mnemonic).collect();
         assert_eq!(plain, ["bx", "stmia", "bx"]);
 
-        let mut d = Decoder::new(&image).thumbee(true);
+        let mut d = Decoder::new(&image).target(crate::isa::Target::ThumbEE);
         assert_eq!(d.next().map(|i| i.mnemonic), Some("bx"));
         assert_eq!(d.next(), None, "0xC1C0 is UNDEFINED in ThumbEE state");
         // …and the caller resynchronises past it, exactly as `disassemble`
@@ -782,7 +883,7 @@ mod tests {
         let mut decoded = 0usize;
         for hw1 in (0xEF00u16..=0xEFFF).chain(0xFF00u16..=0xFFFF) {
             for hw2 in [0x0110u16, 0x0842, 0x0A10, 0x0F00] {
-                if decode_halfwords(hw1, hw2, 0x1000, false).is_some() {
+                if decode_halfwords(hw1, hw2, 0x1000, Target::Union).is_some() {
                     decoded += 1;
                 }
             }
@@ -805,7 +906,7 @@ mod tests {
         let truncated = [0x00u8, 0xF0];
         assert_eq!(insn_len(0xF000), 4);
         assert_eq!(decode_at(&truncated, 0), None);
-        assert_eq!(decode_at_with(&truncated, 0, 0x1000, false), None);
+        assert_eq!(decode_at_with(&truncated, 0, 0x1000, Target::Union), None);
         assert_eq!(Decoder::new(&truncated).next(), None);
         // …and the same bytes with the missing halfword supplied do decode, so
         // the `None` above is about the length and nothing else.
@@ -894,12 +995,12 @@ mod tests {
         // `hb #7` — 0xC207 in ThumbEE state, `stmia r2!, {r0-r2}` in Thumb
         // state. The same bytes, two instructions, and `encode` must produce
         // the halfword for the one it was handed.
-        let ee = decode_halfwords(0xC207, 0, 0x1000, true).expect("hb #7");
+        let ee = decode_halfwords(0xC207, 0, 0x1000, Target::ThumbEE).expect("hb #7");
         assert_eq!(ee.mnemonic, "hb");
         assert_eq!(encode(&ee), Some((0xC207, 0)));
         assert_eq!(encode_bytes(&ee), Some(vec![0x07, 0xC2]));
 
-        let plain = decode_halfwords(0xC207, 0, 0x1000, false).expect("stmia");
+        let plain = decode_halfwords(0xC207, 0, 0x1000, Target::Union).expect("stmia");
         assert_eq!(plain.mnemonic, "stmia");
         assert_eq!(encode(&plain), Some((0xC207, 0)));
 
@@ -925,7 +1026,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            ..decode_halfwords(0xCC10, 0, 0x1000, true).expect("ldr r0, [r9, #8]")
+            ..decode_halfwords(0xCC10, 0, 0x1000, Target::ThumbEE).expect("ldr r0, [r9, #8]")
         };
         assert_eq!(aligned.to_string(), "ldr r0, [r9:64]");
         assert_eq!(encode(&aligned), None);
@@ -936,7 +1037,7 @@ mod tests {
         // directly and so cannot see the dispatcher dropping them.
         let mut checked = 0usize;
         for hw in 0xC000u16..=0xCFFF {
-            if let Some(i) = decode_halfwords(hw, 0, 0x1000, true) {
+            if let Some(i) = decode_halfwords(hw, 0, 0x1000, Target::ThumbEE) {
                 assert_eq!(encode(&i), Some((hw, 0)), "{hw:#06x} as `{i}`");
                 checked += 1;
             }
@@ -949,14 +1050,14 @@ mod tests {
     /// buffer.
     #[test]
     fn an_unencodable_instruction_yields_no_bytes() {
-        let mut alien = decode_halfwords(0x4770, 0, 0, false).expect("bx lr");
+        let mut alien = decode_halfwords(0x4770, 0, 0, Target::Union).expect("bx lr");
         alien.mnemonic = "frobnicate";
         assert_eq!(encode(&alien), None);
         assert_eq!(encode_bytes(&alien), None);
 
         // A wide instruction that no group can express fails the same way —
         // and the wide path is a different arm of `encode`.
-        let mut wide = decode_halfwords(0xF000, 0xF800, 0, false).expect("bl");
+        let mut wide = decode_halfwords(0xF000, 0xF800, 0, Target::Union).expect("bl");
         wide.mnemonic = "frobnicate";
         assert_eq!(wide.width, Width::Wide);
         assert_eq!(encode(&wide), None);
@@ -965,7 +1066,7 @@ mod tests {
         // A branch whose target has moved out of a narrow encoding's reach is
         // the same answer for a different reason: the caller is told to widen
         // it rather than handed a branch to the wrong place.
-        let mut far = decode_halfwords(0xE7FE, 0, 0x1000, false).expect("b .");
+        let mut far = decode_halfwords(0xE7FE, 0, 0x1000, Target::Union).expect("b .");
         far.operands = [Operand::Target(0x9000)].into_iter().collect();
         assert_eq!(encode(&far), None);
     }
@@ -975,11 +1076,11 @@ mod tests {
     /// which would byte-swap every 32-bit instruction.
     #[test]
     fn encode_bytes_is_word_invariant() {
-        let narrow = decode_halfwords(0x4770, 0, 0, false).expect("bx lr");
+        let narrow = decode_halfwords(0x4770, 0, 0, Target::Union).expect("bx lr");
         assert_eq!(encode_bytes(&narrow), Some(vec![0x70, 0x47]));
 
         // `bl` +0 — hw1 0xF000, hw2 0xF800.
-        let wide = decode_halfwords(0xF000, 0xF800, 0, false).expect("bl");
+        let wide = decode_halfwords(0xF000, 0xF800, 0, Target::Union).expect("bl");
         assert_eq!(encode(&wide), Some((0xF000, 0xF800)));
         assert_eq!(encode_bytes(&wide), Some(vec![0x00, 0xF0, 0x00, 0xF8]));
     }
@@ -990,14 +1091,14 @@ mod tests {
     /// the caller.
     #[test]
     fn a_candidate_that_does_not_decode_is_not_faithful() {
-        let insn = decode_halfwords(0x4770, 0, 0, false).expect("bx lr");
+        let insn = decode_halfwords(0x4770, 0, 0, Target::Union).expect("bx lr");
         // `0xB651` is `SETEND` with a should-be-zero bit set; this crate
         // refuses it, so no instruction can be faithfully encoded to it.
-        assert_eq!(decode_halfwords(0xB651, 0, 0, false), None);
-        assert!(!faithful(&insn, 0xB651, 0, false));
+        assert_eq!(decode_halfwords(0xB651, 0, 0, Target::Union), None);
+        assert!(!faithful(&insn, 0xB651, 0, Target::Union));
         // And the instruction's own halfword is faithful, so the assertion
         // above is about the candidate and not about the comparison.
-        assert!(faithful(&insn, 0x4770, 0, false));
+        assert!(faithful(&insn, 0x4770, 0, Target::Union));
     }
 
     /// An IT block conditionalises the instructions it governs, and clears
@@ -1024,7 +1125,7 @@ mod tests {
         assert!(!decoded[1].sets_flags);
         // … while a bare decode of the same halfword, with no IT state in
         // sight, reports the flags it sets outside a block.
-        let bare = decode_halfwords(0x0088, 0, 0, false).expect("lsls");
+        let bare = decode_halfwords(0x0088, 0, 0, Target::Union).expect("lsls");
         assert!(bare.sets_flags);
         // The wide one: conditional, and still flag-setting.
         assert_eq!(decoded[2].cond, Some(Cond::Eq));
@@ -1086,7 +1187,7 @@ mod tests {
             (0xFE00, 0x0E10, Some("mcr2 p14, #0, r0, c0, c0, #0")),
             (0xFE10, 0x0E10, Some("mrc2 p14, #0, r0, c0, c0, #0")),
         ] {
-            let decoded = decode_halfwords(hw1, hw2, 0x1000, false);
+            let decoded = decode_halfwords(hw1, hw2, 0x1000, Target::Union);
             // Computed here rather than inline in the message: a format
             // argument is only evaluated when the assertion fails, so inline
             // it would be an uncovered region on every passing run.
@@ -1120,7 +1221,7 @@ mod tests {
     #[test]
     fn encode_refuses_a_flag_the_halfword_cannot_carry() {
         for hw in [0xB510u16, 0xBD10, 0xE7FE, 0xBF00] {
-            let insn = decode_halfwords(hw, 0, 0x1000, false).expect("a defined halfword");
+            let insn = decode_halfwords(hw, 0, 0x1000, Target::Union).expect("a defined halfword");
             assert!(!insn.sets_flags, "{hw:#06x} has no S bit");
             assert_eq!(insn.cond, None, "{hw:#06x} is unconditional");
             assert_eq!(encode(&insn), Some((hw, 0)));
@@ -1147,7 +1248,7 @@ mod tests {
         // `lsleq r0, r1, #2` and `lsls r0, r1, #2` are the same halfword.
         // A fresh decode of `0x0088` reports the flags it sets outside a
         // block; an `Insn` that came through an `IT` does not.
-        let bare = decode_halfwords(0x0088, 0, 0x1000, false).expect("lsls r0, r1, #2");
+        let bare = decode_halfwords(0x0088, 0, 0x1000, Target::Union).expect("lsls r0, r1, #2");
         assert!(bare.sets_flags);
         let mut in_it = bare;
         in_it.cond = Some(Cond::Eq);
@@ -1181,18 +1282,21 @@ mod tests {
     /// in a patched image the next conditional branch reads them.
     #[test]
     fn the_flag_carve_out_excuses_an_it_block_and_nothing_else() {
-        let bits = decode_halfwords(0x0088, 0, 0x1000, false).expect("lsls r0, r1, #2");
+        let bits = decode_halfwords(0x0088, 0, 0x1000, Target::Union).expect("lsls r0, r1, #2");
         assert!(bits.sets_flags);
         assert_eq!(bits.cond, None);
         assert_eq!(bits.width, Width::Narrow);
         // The bits described exactly: there is nothing to excuse.
-        assert!(faithful(&bits, 0x0088, 0, false));
+        assert!(faithful(&bits, 0x0088, 0, Target::Union));
 
         // Inside an `IT` block — the one excused direction.
         let mut in_it = bits;
         in_it.cond = Some(Cond::Eq);
         in_it.sets_flags = false;
-        assert!(faithful(&in_it, 0x0088, 0, false), "`lsleq` is `0x0088`");
+        assert!(
+            faithful(&in_it, 0x0088, 0, Target::Union),
+            "`lsleq` is `0x0088`"
+        );
 
         // Outside one, the identical disagreement is a different
         // instruction, and the condition is the whole of what tells them
@@ -1200,7 +1304,7 @@ mod tests {
         let mut bare = bits;
         bare.sets_flags = false;
         assert!(
-            !faithful(&bare, 0x0088, 0, false),
+            !faithful(&bare, 0x0088, 0, Target::Union),
             "no enclosing `IT`, so `0x0088`'s S bit is not excusable"
         );
     }
@@ -1217,23 +1321,26 @@ mod tests {
     /// the check cannot simply be equality.
     #[test]
     fn a_condition_in_the_bits_must_match_and_one_from_an_it_block_need_not() {
-        let beq = decode_halfwords(0xD0FE, 0, 0x1000, false).expect("beq .");
+        let beq = decode_halfwords(0xD0FE, 0, 0x1000, Target::Union).expect("beq .");
         assert_eq!(beq.cond, Some(Cond::Eq));
-        assert!(faithful(&beq, 0xD0FE, 0, false));
+        assert!(faithful(&beq, 0xD0FE, 0, Target::Union));
         let mut bne = beq;
         bne.cond = Some(Cond::Ne);
         assert!(
-            !faithful(&bne, 0xD0FE, 0, false),
+            !faithful(&bne, 0xD0FE, 0, Target::Union),
             "`bne .` is `0xD1FE`: this halfword carries its own condition"
         );
 
         // `nop` has no condition field, so the one an `IT` block supplies is
         // invisible to a fresh decode and has to be excused.
-        let nop = decode_halfwords(0xBF00, 0, 0x1000, false).expect("nop");
+        let nop = decode_halfwords(0xBF00, 0, 0x1000, Target::Union).expect("nop");
         assert_eq!(nop.cond, None);
         let mut nopeq = nop;
         nopeq.cond = Some(Cond::Eq);
-        assert!(faithful(&nopeq, 0xBF00, 0, false), "`nopeq` is `0xBF00`");
+        assert!(
+            faithful(&nopeq, 0xBF00, 0, Target::Union),
+            "`nopeq` is `0xBF00`"
+        );
     }
 
     /// [`disassemble`] sizes its output from what the image can yield, not

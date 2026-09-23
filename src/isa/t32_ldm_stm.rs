@@ -427,6 +427,7 @@ fn wide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::Target;
 
     /// Decode a halfword pair of this group, panicking with the pattern if it
     /// does not decode — a failing assertion should name the encoding it
@@ -1021,7 +1022,7 @@ mod tests {
             (0xE82D, 0xC011, "srsdb sp!, #0x11"),
             (0xE9B0, 0xC000, "rfeia r0!"),
         ] {
-            let routed = super::super::decode_halfwords(hw1, hw2, 0x1000, false);
+            let routed = super::super::decode_halfwords(hw1, hw2, 0x1000, Target::Union);
             assert!(
                 routed.is_some(),
                 "{hw1:#06x} {hw2:#06x} did not reach this module"

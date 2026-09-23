@@ -261,6 +261,7 @@ pub(crate) fn encode(insn: &Insn) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{decode, encode};
+    use crate::isa::Target;
     use crate::isa::{decode_halfwords, Operand, Width};
 
     /// Every halfword in `0x0000..=0x3FFF` that decodes must re-encode to
@@ -298,7 +299,7 @@ mod tests {
     fn dispatch_boundary() {
         for hw in 0x0000u16..=0x3FFF {
             assert_eq!(
-                decode_halfwords(hw, 0, 0, false),
+                decode_halfwords(hw, 0, 0, Target::Union),
                 decode(hw, 0, 0),
                 "{hw:#06x} is not reaching t16_shift"
             );

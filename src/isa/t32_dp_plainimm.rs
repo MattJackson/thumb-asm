@@ -596,6 +596,7 @@ pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::{align_pc, decode, encode};
+    use crate::isa::Target;
     use crate::isa::{decode_halfwords, Insn, Operand, Operands, Reg, Width};
 
     /// The eleven `op` values Table A5-12 allocates. Every other value in the
@@ -704,7 +705,7 @@ mod tests {
             let hw1 = 0xF200 | (op << 4) | 1;
             let hw2 = 0x0102;
             assert_eq!(
-                decode_halfwords(hw1, hw2, 0x1000, false),
+                decode_halfwords(hw1, hw2, 0x1000, Target::Union),
                 decode(hw1, hw2, 0x1000),
                 "{hw1:#06x} is not reaching t32_dp_plainimm"
             );
@@ -938,7 +939,7 @@ mod tests {
             // Through the dispatcher, so each row is also a check that
             // `decode_halfwords` routes this encoding here. `0x1000` rather
             // than `0` because the `ADR` rows resolve against their address.
-            let insn = decode_halfwords(hw1, hw2, 0x1000, false).expect("defined encoding");
+            let insn = decode_halfwords(hw1, hw2, 0x1000, Target::Union).expect("defined encoding");
             assert_eq!(insn.to_string(), text, "for {hw1:#06x} {hw2:#06x}");
             assert_eq!(encode(&insn), Some((hw1, hw2)), "for `{text}`");
         }

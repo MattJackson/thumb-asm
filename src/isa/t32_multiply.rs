@@ -518,6 +518,7 @@ fn find_a5_28(mnemonic: &str) -> Option<(u16, u16, Cell, bool)> {
 mod tests {
     use super::*;
     use crate::isa::decode_halfwords;
+    use crate::isa::Target;
 
     /// `hw1` for a Table A5-28 encoding.
     fn hw1_28(op1: u16, rn: u16) -> u16 {
@@ -1041,13 +1042,16 @@ mod tests {
         assert_eq!(encode(&wide), Some((0xFB01, 0xF002)));
 
         // The whole-crate dispatcher agrees, in both directions.
-        assert_eq!(decode_halfwords(0xFB01, 0xF002, 0, false), Some(wide));
+        assert_eq!(
+            decode_halfwords(0xFB01, 0xF002, 0, Target::Union),
+            Some(wide)
+        );
         assert_eq!(crate::isa::encode(&wide), Some((0xFB01, 0xF002)));
 
         // And the 16-bit `MULS r1, r2, r1` is emphatically not ours: this
         // module must not claim it, or `isa::encode` would hand back wide
         // halfwords for a narrow instruction.
-        let narrow = decode_halfwords(0x4351, 0, 0, false).unwrap();
+        let narrow = decode_halfwords(0x4351, 0, 0, Target::Union).unwrap();
         assert_eq!(narrow.mnemonic, "mul");
         assert_eq!(narrow.width, Width::Narrow);
         assert_eq!(encode(&narrow), None);
@@ -1060,7 +1064,10 @@ mod tests {
         // module; confirm with one encoding from each that the whole-crate
         // entry point produces what `decode` does.
         for (hw1, hw2) in [(0xFB11u16, 0x3002u16), (0xFBC2, 0x0103)] {
-            assert_eq!(decode_halfwords(hw1, hw2, 0, false), decode(hw1, hw2, 0));
+            assert_eq!(
+                decode_halfwords(hw1, hw2, 0, Target::Union),
+                decode(hw1, hw2, 0)
+            );
             assert!(decode(hw1, hw2, 0).is_some());
         }
     }

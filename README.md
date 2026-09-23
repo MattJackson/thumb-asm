@@ -52,7 +52,7 @@ dependencies beyond `std`, and no Cargo features to choose between.
 
 ```toml
 [dependencies]
-thumb-asm = "0.11"
+thumb-asm = "0.12"
 ```
 
 ## Status
@@ -64,6 +64,17 @@ for is patching firmware that then gets flashed to hardware, where a wrong
 encoding is a brick rather than an exception — so the bar is that emitting
 wrong bytes should be impossible, not merely unlikely, and
 [How it is checked](#how-it-is-checked) is the argument that it is.
+
+**Say what you are patching.** `isa::Target` tells the decoder which
+architecture the bytes are for. It defaults to `Target::Union` — decode
+everything any profile defines — which is the right answer for an image of
+unknown provenance and is what this crate did before `Target` existed. Name a
+target when you know it, and most sharply on Armv8-M: without
+`Target::V8M`, `SG` — the mandatory first instruction of every secure-gateway
+veneer — decodes as `ldrd lr, r9, [pc, #-508]!` carrying a literal address
+that does not exist, and `BXNS`, which ends every secure entry function, does
+not decode at all. Those are not refusals but confident wrong answers, which
+is the one thing this crate is built not to do.
 
 **The API is not frozen, and a minor bump may break it.** Before 1.0 the minor
 slot is where breaking changes go; `cargo-semver-checks` runs in CI and fails
@@ -108,7 +119,7 @@ patches it, and it cannot be written without the decoder.
 | Capability | Entry points | Notes |
 | ---------- | ------------ | ----- |
 | **Install a detour** | `detour::tramp`, `detour::detour`, `DetourOptions`, `Convention`, `Detour`, `DetourError` | Decode, relocate, branch back, install. Refuses rather than guesses: a site that is not an instruction boundary, a displaced instruction that is inside an `IT` block, a literal load whose pool would no longer be in reach, a stub that cannot be reached from the site. On any error the image is byte-for-byte unchanged |
-| Decode and disassemble | `isa::Decoder`, `isa::decode_at`, `isa::decode_at_with`, `isa::decode_halfwords`, `isa::disassemble`, `isa::insn_len` | `Decoder` is an `Iterator<Item = Insn>` that walks a stream from a known start and tracks `ITSTATE`, so the instructions governed by an `IT` come back with their condition filled in rather than reported as unconditional |
+| Decode and disassemble | `isa::Decoder`, `isa::decode_at`, `isa::decode_at_with`, `isa::decode_halfwords`, `isa::disassemble`, `isa::insn_len`, `isa::Target` | `Decoder` is an `Iterator<Item = Insn>` that walks a stream from a known start and tracks `ITSTATE`, so the instructions governed by an `IT` come back with their condition filled in rather than reported as unconditional |
 | The decoded form | `Insn`, `Operand`, `Operands`, `Mem`, `AddrMode`, `Reg`, `FpReg`, `Shift`, `Width` | One shared vocabulary across all nineteen encoding-group modules. `Insn` carries its mnemonic, encoding name (`"T1"`, `"T3"`, …), address, width, condition and operands, and answers `is_branch`, `is_call`, `writes_pc` and `branch_target`. Decoding allocates nothing |
 | Re-encode | `isa::encode`, `isa::encode_bytes` | The inverse of the decoder, and the crate's compliance proof. Dispatch is *verified*: every candidate is decoded again and compared before it is returned, so a group that accepts a neighbour's instruction wastes work instead of emitting the wrong encoding |
 | Relocate one instruction | `relocate::relocate`, `relocate_with`, `relocate_bytes`, `Widen`, `RelocateError` | Move an instruction to a new address and have it still mean the same thing. Never redoes pc arithmetic — an `Operand::Target` is a resolved absolute address, so relocation holds the target still and asks whether the new displacement fits. `Align(PC, 4)` does not move linearly, which is the trap this exists to avoid |
@@ -563,7 +574,7 @@ and a keyless cosign signature over the exact `.crate` published to crates.io,
 both attached as release assets:
 
 ```sh
-gh attestation verify thumb-asm-0.11.1.crate --repo MattJackson/thumb-asm
+gh attestation verify thumb-asm-0.12.0.crate --repo MattJackson/thumb-asm
 ```
 
 ## Changelog

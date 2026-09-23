@@ -205,6 +205,44 @@ pub enum FindError {
     },
 }
 
+impl FindError {
+    /// A stable, machine-readable reason: `"not-found"` or `"ambiguous"`.
+    ///
+    /// Every error type in this crate carries one, so a caller can branch on
+    /// the cause without matching variants it would have to update when a new
+    /// one appears (these enums are `#[non_exhaustive]` precisely so that new
+    /// ones can appear).
+    ///
+    /// # Labelling a failure
+    ///
+    /// There is deliberately no `context` or `label` on this type. A
+    /// `&'static str` would not take a label built at run time, and a `String`
+    /// would make the error allocate on a path that is often in a loop. Both
+    /// fields a caller needs to write its own message are public, so the
+    /// wrapper this replaces is one line:
+    ///
+    /// ```
+    /// use thumb_asm::{find_one, FindError, Needle};
+    ///
+    /// let image = [0u8; 8];
+    /// let what = "cmac table";
+    /// let msg = match find_one(&image, Needle::Word(0xdead_beef)) {
+    ///     Ok(at) => format!("{what} at {at:#x}"),
+    ///     Err(e @ FindError::Ambiguous { count, .. }) => {
+    ///         format!("{what} signature matched {count} times ({e})")
+    ///     }
+    ///     Err(e) => format!("{what}: {e}"),
+    /// };
+    /// assert_eq!(msg, "cmac table: no match");
+    /// ```
+    pub fn reason(&self) -> &'static str {
+        match self {
+            FindError::NotFound => "not-found",
+            FindError::Ambiguous { .. } => "ambiguous",
+        }
+    }
+}
+
 impl core::fmt::Display for FindError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -633,6 +671,24 @@ pub fn prologue_is_push_lr(image: &[u8], off: usize, window: usize) -> bool {
 /// [`InstallMismatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsmError(String);
+
+impl AsmError {
+    /// A stable, machine-readable reason. Always `"operand"`.
+    ///
+    /// Every failure this type reports is the same kind: an operand the
+    /// requested encoding cannot hold. The constant is here so that callers
+    /// matching on `reason()` across this crate's error types do not have to
+    /// special-case one of them, and so that a future split into more reasons
+    /// is additive rather than a new method.
+    pub fn reason(&self) -> &'static str {
+        "operand"
+    }
+
+    /// The human-readable message, naming the operand and the limit it broke.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
 
 impl core::fmt::Display for AsmError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1503,6 +1559,7 @@ impl core::fmt::Display for BranchKind {
 /// are both stored with bit 0 cleared, so a caller can print or compare them
 /// without re-deriving the Thumb-bit convention (see [`verify_branch`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InstallMismatch {
     /// File offset that was checked.
     pub site: usize,
@@ -1515,6 +1572,22 @@ pub struct InstallMismatch {
     /// [`install_branch`] reports when `expected` was out of range and so
     /// nothing was written).
     pub found: Option<u32>,
+}
+
+impl InstallMismatch {
+    /// A stable, machine-readable reason: `"not-a-branch"` when nothing of the
+    /// expected kind decodes at the site, `"wrong-target"` when one does but
+    /// points elsewhere.
+    ///
+    /// The distinction matters and is otherwise only recoverable by inspecting
+    /// [`found`](Self::found): a `None` there means the write did not happen
+    /// or was overwritten, while a `Some` means it happened and landed wrong.
+    pub fn reason(&self) -> &'static str {
+        match self.found {
+            None => "not-a-branch",
+            Some(_) => "wrong-target",
+        }
+    }
 }
 
 impl core::fmt::Display for InstallMismatch {
@@ -1605,6 +1678,23 @@ pub enum InstallHazard {
     },
 }
 
+impl InstallHazard {
+    /// A stable, machine-readable reason: `"out-of-bounds"`,
+    /// `"not-an-instruction"` or `"splits-instruction"`.
+    ///
+    /// Matches the convention every other error type in this crate follows,
+    /// so a caller can log or branch on the cause without matching variants —
+    /// which matters here because this enum is `#[non_exhaustive]` and will
+    /// grow as more pre-flight hazards become checkable.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            InstallHazard::OutOfBounds { .. } => "out-of-bounds",
+            InstallHazard::NotAnInstruction { .. } => "not-an-instruction",
+            InstallHazard::SplitsInstruction { .. } => "splits-instruction",
+        }
+    }
+}
+
 impl core::fmt::Display for InstallHazard {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -1671,7 +1761,7 @@ pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), In
     }
     let mut at = site;
     while at < site + 4 {
-        let insn = match isa::decode_at_with(image, at, at as u32, false) {
+        let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
             Some(i) => i,
             None => return Err(InstallHazard::NotAnInstruction { site: at }),
         };
@@ -1727,7 +1817,7 @@ pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), In
 /// ));
 /// ```
 pub fn classify_branch(image: &[u8], at: usize) -> BranchAt {
-    let insn = match isa::decode_at_with(image, at, at as u32, false) {
+    let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
         Some(i) => i,
         None => return BranchAt::NotABranch,
     };
@@ -2060,6 +2150,29 @@ pub fn find_free_space_in(
 ///
 /// The two are different safety decisions, not two spellings of one, so this
 /// is explicit rather than defaulted in a way that suits one caller.
+///
+/// # Which regions
+///
+/// **The ones you passed, and nothing else.** This is worth stating outright
+/// because the wording below invites the other reading:
+/// [`Reject`](Straddle::Reject)'s rationale mentions erase granularity, which
+/// sounds as though the crate consults an erase-block map. It does not, and
+/// cannot — it is handed a `&[u8]` with no device geometry, no flash
+/// controller, and no idea what a page is on your part.
+///
+/// So a "region" is whatever *you* meant it to be: an integrity-covered span,
+/// a CMAC-protected table, an erase block, a linker-script section. The two
+/// variants differ only in whether a run may be offered when it extends past
+/// one of them.
+///
+/// Erase granularity is a reason you might *choose* `Reject`, not something
+/// this crate detects. If a page on your part is coarser than the regions you
+/// are passing, that is a fact about the part which has to be reflected in the
+/// regions themselves; nothing here can discover it.
+///
+/// Every "region" in this crate works this way — [`find_free_space_in`],
+/// [`FreeSpace`], and [`detour_in`](crate::detour::detour_in) all take the
+/// caller's declaration and never infer one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Straddle {
@@ -2266,3 +2379,88 @@ fn round_up(v: usize, align: usize) -> usize {
 #[cfg(test)]
 #[path = "thumb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod error_reason_tests {
+    use super::*;
+
+    /// Every error type in this crate answers `reason()` with a stable token.
+    ///
+    /// These are part of the public contract: consumers log them, branch on
+    /// them, and put them in their own error messages. Pinning them as string
+    /// literals here is what makes a rename a failing test rather than a
+    /// silent break in somebody else's matching.
+    #[test]
+    fn every_error_type_reports_a_stable_machine_readable_reason() {
+        assert_eq!(FindError::NotFound.reason(), "not-found");
+        assert_eq!(
+            FindError::Ambiguous {
+                count: 3,
+                first: 0x10
+            }
+            .reason(),
+            "ambiguous"
+        );
+
+        assert_eq!(
+            InstallHazard::OutOfBounds {
+                site: 0,
+                image_len: 2
+            }
+            .reason(),
+            "out-of-bounds"
+        );
+        assert_eq!(
+            InstallHazard::NotAnInstruction { site: 0 }.reason(),
+            "not-an-instruction"
+        );
+
+        // `found: None` and `found: Some` are genuinely different outcomes —
+        // nothing was written, versus something was written and landed wrong.
+        let nothing = InstallMismatch {
+            site: 0,
+            kind: BranchKind::Bl,
+            expected: 0x1000,
+            found: None,
+        };
+        assert_eq!(nothing.reason(), "not-a-branch");
+        let wrong = InstallMismatch {
+            found: Some(0x2000),
+            ..nothing
+        };
+        assert_eq!(wrong.reason(), "wrong-target");
+    }
+
+    /// `SplitsInstruction` is reachable only through `can_install`, so it is
+    /// built the way a caller would meet it rather than by hand.
+    #[test]
+    fn the_split_instruction_hazard_reports_its_reason() {
+        // A two-byte `nop` followed by a four-byte `bl`: the four bytes a
+        // branch needs at offset 0 cover the `nop` and only the first half of
+        // the `bl`, which is the hazard — the site itself decodes fine.
+        let image = [0x00, 0xBF, 0x00, 0xF0, 0x00, 0xF8, 0x00, 0xBF];
+        let hazard =
+            can_install(&image, 0, BranchKind::Bl).expect_err("site splits an instruction");
+        assert_eq!(hazard.reason(), "splits-instruction");
+    }
+
+    /// `AsmError` reports a constant reason and exposes its message.
+    #[test]
+    fn an_assembler_error_reports_its_reason_and_message() {
+        // The immediate is a `u8`, so it cannot overflow by construction —
+        // the reachable failure is a register outside the low bank, which
+        // `MOVS` (immediate) T1 encodes in three bits.
+        let mut asm = Asm::new();
+        asm.movs_imm(8, 0);
+        let err = asm.finish().expect_err("a high register must fail");
+        assert_eq!(err.reason(), "operand");
+        // Bound before the assert: a format argument is only evaluated when
+        // the assertion fails, so inline it would never be covered.
+        let msg = err.message();
+        assert!(
+            msg.contains("movs"),
+            "the message should name the instruction, got: {msg}"
+        );
+        assert_eq!(err.message(), err.to_string());
+    }
+}

@@ -363,6 +363,7 @@ fn encode_stm_ldm(insn: &Insn, base: u16, always_wback: bool) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::Target;
 
     /// Decode a halfword at `addr` through this module directly.
     fn dec(hw1: u16, addr: u32) -> Option<Insn> {
@@ -892,7 +893,7 @@ mod tests {
     fn dispatch_boundary() {
         for hw in RANGE_LO..=RANGE_HI {
             assert_eq!(super::super::insn_len(hw), 2, "{hw:#06x}");
-            let via_dispatch = super::super::decode_halfwords(hw, 0, 0x1000, false);
+            let via_dispatch = super::super::decode_halfwords(hw, 0, 0x1000, Target::Union);
             assert_eq!(via_dispatch, dec(hw, 0x1000), "{hw:#06x} routed elsewhere");
         }
         // The first halfword past our range is the start of a 32-bit encoding.

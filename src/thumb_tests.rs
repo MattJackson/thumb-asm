@@ -1549,7 +1549,7 @@ fn round_trip(build: impl FnOnce(&mut Asm)) -> String {
     let mut a = Asm::new();
     build(&mut a);
     let bytes = a.finish().expect("should assemble");
-    crate::isa::decode_at_with(&bytes, 0, 0, false)
+    crate::isa::decode_at_with(&bytes, 0, 0, isa::Target::Union)
         .expect("emitted bytes should decode")
         .to_string()
 }
@@ -1629,7 +1629,7 @@ fn the_literal_pool_and_data_blobs_land_where_the_instruction_points() {
     let bytes = a.finish().unwrap();
     assert_eq!(bytes, vec![0x00, 0x4B, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE]);
     assert_eq!(
-        crate::isa::decode_at_with(&bytes, 0, 0, false)
+        crate::isa::decode_at_with(&bytes, 0, 0, isa::Target::Union)
             .unwrap()
             .to_string(),
         "ldr r3, [pc, #0], 0x4"
@@ -1649,7 +1649,7 @@ fn the_literal_pool_and_data_blobs_land_where_the_instruction_points() {
     let bytes = a.finish().unwrap();
     assert_eq!(bytes, vec![0x00, 0xA5, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]);
     assert_eq!(
-        crate::isa::decode_at_with(&bytes, 0, 0, false)
+        crate::isa::decode_at_with(&bytes, 0, 0, isa::Target::Union)
             .unwrap()
             .to_string(),
         "adr r5, 0x4"
@@ -1667,13 +1667,13 @@ fn a_bound_label_resolves_to_the_offset_it_was_bound_at() {
     let bytes = a.finish().unwrap();
     assert_eq!(bytes, vec![0x00, 0xD0, 0x01, 0x20, 0x70, 0x47, 0x00, 0x00]);
     assert_eq!(
-        crate::isa::decode_at_with(&bytes, 0, 0, false)
+        crate::isa::decode_at_with(&bytes, 0, 0, isa::Target::Union)
             .unwrap()
             .to_string(),
         "beq 0x4"
     );
     assert_eq!(
-        crate::isa::decode_at_with(&bytes, 4, 4, false)
+        crate::isa::decode_at_with(&bytes, 4, 4, isa::Target::Union)
             .unwrap()
             .to_string(),
         "bx lr"
@@ -2356,7 +2356,7 @@ fn encoding_digest() -> (u64, usize) {
         if isa::insn_len(hw) != 2 {
             continue;
         }
-        let insn = match isa::decode_halfwords(hw, 0, 0, false) {
+        let insn = match isa::decode_halfwords(hw, 0, 0, isa::Target::Union) {
             Some(i) => i,
             None => continue,
         };

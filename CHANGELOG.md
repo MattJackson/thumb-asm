@@ -7,6 +7,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-23
+
+Say what you are patching. The crate stops inferring the instruction set from
+the instruction and starts being told.
+
+### Emitted bytes changed
+
+Nothing moves for existing callers. [`Target::Union`] is the default and
+reproduces 0.11.1 exactly, including where an Armv8-M encoding collides with
+an Armv7 one: under the union `SG` still decodes as the `LDRD` Armv7 reads
+there. The pinned 16-bit digest is unchanged — 58,233 decoded halfwords,
+`0x0e06fda25d6b89e8`.
+
+Bytes *do* change if you opt in to `Target::V8M`, which is the point of
+opting in.
+
+### Fixed
+
+- **Armv8-M images were decoded wrongly, silently.** Not refused — answered,
+  confidently and incorrectly:
+
+  | halfwords | was | is, under `Target::V8M` |
+  |---|---|---|
+  | `0xE97F 0xE97F` | `ldrd lr, r9, [pc, #-508]!, 0xe08` | `sg` |
+  | `0xE841 0xF000` | `strex r0, pc, [r1]` | `tt r0, r1` |
+  | `0x4774` | `None`, and `Decoder` stops | `bxns lr` |
+
+  `SG` is the mandatory first instruction of every secure-gateway veneer, so
+  every TrustZone-M image contains one; read as `LDRD` it carries a resolved
+  pc-relative target and `analysis::literal_value` will read a pool word that
+  is not there. `BXNS` ends every secure entry function, so `reachable`
+  reported a function with a truncated body and no exit.
+
+### Breaking changes
+
+- **`decode_at_with`, `decode_halfwords` and `Decoder::thumbee` take a
+  `Target`** instead of a `thumbee: bool`. `Decoder::thumbee(true)` becomes
+  `Decoder::target(Target::ThumbEE)`; `false` becomes `Target::Union`.
+  `decode_at` and `Decoder::new` are unchanged.
+
+- **`Operand`, `XrefKind`, `Widen`, `Reach`, `Xref`, `DetourError` and
+  `InstallMismatch` are now `#[non_exhaustive]`**, so a `match` over them
+  needs a wildcard arm. This is the same budget 0.11.0 spent on `Needle` and
+  friends, finishing the job it started — every one of these has to grow as
+  the ISA and the refusal vocabulary do.
+
+  `Width` and `Cond` are deliberately **not** marked. Thumb has two
+  instruction lengths and a four-bit condition field, so those sets are closed
+  by the architecture; marking them would cost callers exhaustive matching for
+  a flexibility that can never be used.
+
+  `Insn` is not marked either, and that is a deferral rather than a decision:
+  it is a struct with public fields, so `#[non_exhaustive]` would remove
+  literal construction — which is a documented use case here. It needs a
+  builder first, and that is 0.13.0's.
+
+### Added
+
+- **`isa::Target`** — `Union`, `V7M`, `V7AR`, `V8M`, `ThumbEE`. Most of the
+  crate still decodes the union deliberately: for most of the map the profiles
+  disagree only about which patterns are UNDEFINED, and a union decoder is
+  more useful on an image of unknown provenance. `Target` is for where that
+  stops being a coherent answer, because the patterns *collide*.
+
+- **The Armv8-M Security Extension** — `SG`, `BXNS`, `BLXNS`, `TT`, `TTT`,
+  `TTA`, `TTAT`, decoded and encoded under `Target::V8M`. Implemented as a
+  profile-owned slice in the shape `thumbee` established, consulted before
+  dispatch, so none of the nineteen group modules changed. It has to run
+  *before* them rather than as a fallback: these are reassignments of
+  allocated patterns, so once an Armv7 group has answered, the wrong answer
+  has been chosen.
+
+  `CLRM` is **not** included despite usually being listed with CMSE. LLVM
+  rejects it for `armv8-m.main` with "instruction requires: armv8.1m.main", so
+  it belongs with the Armv8.1-M work.
+
+- **`RelocateError::SecureGateway`** — moving an `SG` is refused. It is the
+  only refusal here that is not about range, alignment or encodability: `SG`
+  re-encodes perfectly at any address and is still wrong to move, because the
+  Security Attribution Unit identifies a gateway by the address the
+  instruction sits at. Moved, it stops being a gateway and the address it
+  vacated stops being guarded — so a detour over one would silently close the
+  entry point it was patching.
+
+- **`detour::detour_in`** — place the stub only in regions the caller declares
+  writable. The built-in search knows about runs of `0xff`, which is a guess
+  about what is *erased* and says nothing about what is *safe to write*: a run
+  inside a checksummed block, or one the bootloader rewrites, looks identical
+  to a spare one. `FreeSpace` and `find_free_space_in` shipped in 0.11.1 and
+  `detour` reached neither.
+
+  It is a function rather than a `DetourOptions` field because the option
+  struct would need a lifetime parameter to hold a borrowed slice, and because
+  the regions describe the call rather than a default. It is not equivalent to
+  allocating and passing `stub_at`: that is one attempt with no retry, and
+  whether a stub is usable is not knowable until the patch is laid out.
+
+- **`reason()` on every error type.** `RelocateError` was the only one with
+  both `#[non_exhaustive]` and a machine-readable reason; `FindError` and
+  `InstallHazard` had the first, `DetourError` the second, `AsmError` and
+  `InstallMismatch` neither. All six now have both. `AsmError` also gains
+  `message()`.
+
+### Testing
+
+- **Mutation score holds at 91.1%** across 7,738 mutants (up from 7,624), so
+  the new code is covered in the same proportion as the old rather than
+  diluting it. 593 of the 666 survivors are the `|` to `^` family over
+  disjoint bit-fields and 4 are `r.num() < 16`, both equivalent by
+  construction.
+
+  The run found one real gap in this release's own code: nothing distinguished
+  `hook & !1` from `hook`, `hook | !1` or `hook ^ !1` in `detour_in`, because
+  every test passed an already-even hook. A Thumb function pointer
+  conventionally has bit 0 set — that is how the architecture marks a Thumb
+  entry point — so a caller reading one out of a vector table passes an odd
+  address, and the masking is on the path every such call takes.
+
+### Documentation
+
+- **Which "regions" this crate means: the caller's, always.** Raised by a
+  consumer against `Straddle`, whose `Reject` rationale cites erase
+  granularity and so reads as though the crate consults an erase-block map. It
+  does not and cannot — it is handed a `&[u8]` with no device geometry. A
+  region is whatever you meant it to be, and erase granularity is a reason you
+  might *choose* `Reject`, not something that can be detected here. Stated on
+  `Straddle` and applied to every region-taking API.
+
+- **Labelling a `FindError`** is shown rather than supported. A `context(&str)`
+  was requested; a `&'static str` would not take a label built at run time and
+  a `String` would make a currently-`Copy` error allocate on a path that is
+  often in a loop. `count` and `first` are public, so the wrapper it would
+  replace is one `match` arm, now the documented example.
+
 ## [0.11.1] - 2026-09-23
 
 ### Emitted bytes changed

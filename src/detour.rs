@@ -341,6 +341,7 @@ impl DetourOptions {
 /// [`RelocateError::reason`] does: a consumer deciding whether to fall back to
 /// a hand-written stub should not have to parse prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DetourError {
     /// There are not four bytes at the site to put a branch in.
     OutOfBounds {
@@ -628,12 +629,19 @@ pub fn detour(
     hook: u32,
     opts: DetourOptions,
 ) -> Result<Detour, DetourError> {
-    let plan = plan(image, site, hook & !1, &opts)?;
+    let plan = plan(image, site, hook & !1, &opts, None)?;
+    Ok(commit(image, site, plan, &opts))
+}
 
-    // Commit: two stores of bytes that are already decided, into ranges that
-    // are already bounds-checked. Nothing here can fail, and nothing here
-    // decides anything. The stub goes first so that a half-applied *flash* —
-    // this crate's images are firmware — is a functionally unmodified one.
+/// Write a decided [`Plan`] into the image.
+///
+/// Two stores of bytes that are already decided, into ranges that are already
+/// bounds-checked. Nothing here can fail and nothing here decides anything,
+/// which is the whole reason [`plan`] takes `&[u8]` and this takes
+/// `&mut [u8]`. The stub goes first so that a half-applied *flash* — this
+/// crate's images are firmware — leaves a functionally unmodified image
+/// rather than a site branching into blank space.
+fn commit(image: &mut [u8], site: usize, plan: Plan, opts: &DetourOptions) -> Detour {
     crate::write(image, plan.stub as usize, &plan.bytes);
     crate::write(image, site, &plan.hook_branch);
     debug_assert_eq!(
@@ -642,13 +650,13 @@ pub fn detour(
         "the site must read back as the branch that was planned"
     );
 
-    Ok(Detour {
+    Detour {
         site,
         displaced: plan.displaced,
         stub: plan.stub,
         stub_len: plan.bytes.len(),
         kind: opts.kind,
-    })
+    }
 }
 
 /// The two-argument detour: `BL` at the site, call the hook, then run the
@@ -678,6 +686,65 @@ pub fn tramp(image: &mut [u8], site: usize, hook: u32) -> Result<Detour, DetourE
     detour(image, site, hook, DetourOptions::default())
 }
 
+/// [`detour`], with the stub confined to regions the caller says are writable.
+///
+/// The built-in search only knows about runs of `0xff`, which is a guess about
+/// what is erased and says nothing about what is *safe to write* — a run
+/// inside a region a checksum covers, or inside a block the bootloader
+/// rewrites, looks identical to one that is genuinely spare. `within` is the
+/// caller's answer to that, in image coordinates, and the stub is placed only
+/// inside it.
+///
+/// This exists rather than a `DetourOptions` field because the option struct
+/// would need a lifetime parameter to hold a borrowed slice, and because the
+/// regions describe the *call*, not a default.
+///
+/// # Why not just allocate and pass `stub_at`
+///
+/// Because [`stub_at`](DetourOptions::stub_at) is one attempt with no retry.
+/// A stub is only usable if the branch at the site reaches it, and whether it
+/// does is not knowable until the whole patch is laid out; when it does not,
+/// this keeps searching the remaining regions, exactly as the whole-image
+/// search keeps walking runs. A caller doing its own
+/// [`FreeSpace::alloc`](crate::FreeSpace::alloc) and passing the result gets
+/// one shot, and a [`DetourError::SiteUnreachable`] it has to unpick itself.
+///
+/// ```
+/// use thumb_asm::detour::{detour_in, DetourOptions};
+/// use thumb_asm::Fit;
+///
+/// let mut image = vec![0u8; 0x400];
+/// // A `push {r4, lr}` at the site, so there is something to displace.
+/// image[0x100..0x104].copy_from_slice(&[0x10, 0xb5, 0x00, 0xbf]);
+/// // Only the tail of the image is ours to write.
+/// for b in image[0x200..].iter_mut() {
+///     *b = 0xff;
+/// }
+/// let region = 0x200usize..0x400;
+/// let regions = core::slice::from_ref(&region);
+/// let d = detour_in(
+///     &mut image,
+///     0x100,
+///     0x300,
+///     regions,
+///     Fit::First,
+///     DetourOptions::default(),
+/// )
+/// .unwrap();
+/// assert!((0x200..0x400).contains(&(d.stub as usize)));
+/// ```
+pub fn detour_in(
+    image: &mut [u8],
+    site: usize,
+    hook: u32,
+    within: &[core::ops::Range<usize>],
+    fit: crate::Fit,
+    opts: DetourOptions,
+) -> Result<Detour, DetourError> {
+    let plan = plan(image, site, hook & !1, &opts, Some((within, fit)))?;
+    Ok(commit(image, site, plan, &opts))
+}
+
 /// Everything [`detour`] needs to know before it writes anything — including
 /// both blocks of bytes, so that committing is two stores and no decisions.
 struct Plan {
@@ -692,7 +759,13 @@ struct Plan {
 }
 
 /// The read-only half of [`detour`]: decide the whole patch, touching nothing.
-fn plan(image: &[u8], site: usize, hook: u32, opts: &DetourOptions) -> Result<Plan, DetourError> {
+fn plan(
+    image: &[u8],
+    site: usize,
+    hook: u32,
+    opts: &DetourOptions,
+    within: Option<(&[core::ops::Range<usize>], crate::Fit)>,
+) -> Result<Plan, DetourError> {
     // The hook branch is four bytes wide whichever kind it is.
     if site.checked_add(4).map_or(true, |end| end > image.len()) {
         return Err(DetourError::OutOfBounds {
@@ -726,7 +799,33 @@ fn plan(image: &[u8], site: usize, hook: u32, opts: &DetourOptions) -> Result<Pl
     // asking for alignment here costs no reachable free space.
     let mut last: Option<DetourError> = None;
     let mut from = opts.search_start;
-    while let Some(found) = crate::find_free_space(image, need, 4, from) {
+    // When the caller has said which regions are writable, the search is
+    // confined to them and walks them in turn, exactly as the whole-image
+    // search walks runs. The retry is the point: a stub that is out of branch
+    // range from the first usable run may be in range from the next, and a
+    // caller doing its own `FreeSpace::alloc` and passing `stub_at` gets one
+    // attempt and no second chance.
+    while let Some(found) = match within {
+        Some((regions, fit)) => {
+            let rest: Vec<core::ops::Range<usize>> = regions
+                .iter()
+                .filter_map(|r| {
+                    let start = r.start.max(from);
+                    if start < r.end {
+                        Some(start..r.end)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if rest.is_empty() {
+                None
+            } else {
+                crate::find_free_space_in(image, need, 4, &rest, fit)
+            }
+        }
+        None => crate::find_free_space(image, need, 4, from),
+    } {
         match attempt(
             image,
             site,
@@ -1617,7 +1716,7 @@ mod tests {
 
         let stub = d.stub as usize;
         // `ldr.w r12, [pc, #4]` reads the word at stub + 8 …
-        let load = isa::decode_at_with(&image, stub, d.stub, false).unwrap();
+        let load = isa::decode_at_with(&image, stub, d.stub, isa::Target::Union).unwrap();
         assert_eq!(load.mnemonic, "ldr");
         assert_eq!(load.branch_target(), Some(d.stub + 8));
         assert_eq!(load.to_string(), "ldr.w r12, [pc, #4], 0x1008");
@@ -1627,9 +1726,11 @@ mod tests {
         // A jump, not a call: `lr` is whatever the site left, which with a
         // `b.w` at the site is the outer function's return address.
         assert_eq!(decode_b_wide(&image, stub + 4), Some(HOOK));
-        assert!(!isa::decode_at_with(&image, stub + 4, d.stub + 4, false)
-            .unwrap()
-            .is_call());
+        assert!(
+            !isa::decode_at_with(&image, stub + 4, d.stub + 4, isa::Target::Union)
+                .unwrap()
+                .is_call()
+        );
         // The continuation is the displaced code and the branch back.
         assert_eq!(
             isa::disassemble(&image, continuation as usize, continuation, 3),
@@ -1794,26 +1895,27 @@ mod tests {
     #[test]
     fn the_hand_written_prologue_instructions_decode_as_intended() {
         assert_eq!(
-            isa::decode_at_with(&PUSH_LR, 0, 0x1000, false)
+            isa::decode_at_with(&PUSH_LR, 0, 0x1000, isa::Target::Union)
                 .unwrap()
                 .to_string(),
             "push {lr}"
         );
         assert_eq!(
-            isa::decode_at_with(&LDR_LR_POP, 0, 0x1000, false)
+            isa::decode_at_with(&LDR_LR_POP, 0, 0x1000, isa::Target::Union)
                 .unwrap()
                 .to_string(),
             "ldr lr, [sp], #4"
         );
         assert_eq!(
-            isa::decode_at_with(&NOP, 0, 0x1000, false)
+            isa::decode_at_with(&NOP, 0, 0x1000, isa::Target::Union)
                 .unwrap()
                 .to_string(),
             "nop"
         );
         // At a 4-aligned address, `[pc, #4]` resolves to address + 8 — which is
         // where `build_stub` puts the continuation word.
-        let load = isa::decode_at_with(&LDR_IP_CONTINUATION, 0, 0x1000, false).unwrap();
+        let load =
+            isa::decode_at_with(&LDR_IP_CONTINUATION, 0, 0x1000, isa::Target::Union).unwrap();
         assert_eq!(load.to_string(), "ldr.w r12, [pc, #4], 0x1008");
         assert_eq!(load.branch_target(), Some(0x1008));
     }
@@ -2250,5 +2352,201 @@ mod tests {
         )
         .expect("exactly four bytes of room is enough, as install_branch says");
         assert_eq!(d.resume(), LEN as u32);
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::Fit;
+
+    /// An image with a `push {r4, lr}` at `site` and two erased regions.
+    fn image_with_two_runs() -> Vec<u8> {
+        let mut image = vec![0u8; 0x600];
+        image[0x100..0x104].copy_from_slice(&[0x10, 0xb5, 0x00, 0xbf]);
+        for b in image[0x200..0x280].iter_mut() {
+            *b = 0xff;
+        }
+        for b in image[0x400..0x500].iter_mut() {
+            *b = 0xff;
+        }
+        image
+    }
+
+    /// The stub lands inside a declared region, and the run outside every
+    /// declared region is not used even though it is erased and comes first.
+    ///
+    /// This is the property the whole-image search cannot offer: `0xff` means
+    /// "looks erased", not "safe to write", and a run inside a checksummed or
+    /// bootloader-owned block is indistinguishable from a spare one.
+    #[test]
+    fn the_stub_goes_only_where_the_caller_says_it_may() {
+        let mut image = image_with_two_runs();
+        // `from_ref` rather than `[a..b]`: a one-element array of `Range`
+        // trips `clippy::single_range_in_vec_init`, which reads it as a
+        // mistyped attempt to list the range's elements.
+        let region = 0x400usize..0x500;
+        let regions = core::slice::from_ref(&region);
+        let d = detour_in(
+            &mut image,
+            0x100,
+            0x300,
+            regions,
+            Fit::First,
+            DetourOptions::default(),
+        )
+        .expect("a stub should fit in the declared region");
+        assert!(
+            (0x400..0x500).contains(&(d.stub as usize)),
+            "stub at {:#x} is outside the declared region",
+            d.stub
+        );
+
+        // The same image, searched without regions, uses the earlier run —
+        // which is exactly the run a caller might have been protecting.
+        let mut plain = image_with_two_runs();
+        let p = detour(&mut plain, 0x100, 0x300, DetourOptions::default())
+            .expect("the whole-image search should also succeed");
+        assert!(
+            (0x200..0x280).contains(&(p.stub as usize)),
+            "unconstrained search should take the first run, got {:#x}",
+            p.stub
+        );
+    }
+
+    /// With no usable region, the failure is `NoFreeSpace` rather than a stub
+    /// placed somewhere the caller did not sanction.
+    #[test]
+    fn no_declared_region_means_no_stub_rather_than_a_different_one() {
+        let mut image = image_with_two_runs();
+        // A region containing no erased run at all.
+        let empty = 0x300usize..0x340;
+        let deny = core::slice::from_ref(&empty);
+        let err = detour_in(
+            &mut image,
+            0x100,
+            0x300,
+            deny,
+            Fit::First,
+            DetourOptions::default(),
+        )
+        .expect_err("there is no free space in the declared region");
+        // Asserted through `reason()` rather than `matches!` with a
+        // `{err:?}` message: a format argument is only evaluated when the
+        // assertion fails, so it would be an uncovered region on every
+        // passing run — and the reason string is the stronger claim anyway.
+        assert_eq!(err.reason(), "no-free-space");
+        // And nothing was written: the site still holds its original push.
+        assert_eq!(&image[0x100..0x104], &[0x10, 0xb5, 0x00, 0xbf]);
+    }
+
+    /// An empty region list is a caller saying "nowhere is writable", and is
+    /// answered as such rather than by falling back to the whole image.
+    #[test]
+    fn an_empty_region_list_places_nothing() {
+        let mut image = image_with_two_runs();
+        let err = detour_in(
+            &mut image,
+            0x100,
+            0x300,
+            &[],
+            Fit::First,
+            DetourOptions::default(),
+        )
+        .expect_err("no regions means no placement");
+        assert_eq!(err.reason(), "no-free-space");
+        assert_eq!(&image[0x100..0x104], &[0x10, 0xb5, 0x00, 0xbf]);
+    }
+
+    /// The hook's Thumb bit is masked off, as it is for [`detour`].
+    ///
+    /// A Thumb function pointer conventionally has bit 0 set — that is how the
+    /// architecture distinguishes a Thumb entry point from an ARM one — so a
+    /// caller passing a pointer it read out of a vector table or a symbol
+    /// passes an odd address. The branch encoding has no room for that bit and
+    /// the target must be halfword-aligned, so it is cleared. Without this
+    /// test nothing distinguished `hook & !1` from `hook`, `hook | !1` or
+    /// `hook ^ !1`, because every other test here passes an already-even hook.
+    #[test]
+    fn an_odd_hook_address_is_masked_to_its_halfword_boundary() {
+        let region = 0x400usize..0x500;
+        let regions = core::slice::from_ref(&region);
+        let mut odd = image_with_two_runs();
+        let from_odd = detour_in(
+            &mut odd,
+            0x100,
+            0x301,
+            regions,
+            Fit::First,
+            DetourOptions::default(),
+        )
+        .expect("an odd hook is a Thumb function pointer, not an error");
+
+        let mut even = image_with_two_runs();
+        let from_even = detour_in(
+            &mut even,
+            0x100,
+            0x300,
+            regions,
+            Fit::First,
+            DetourOptions::default(),
+        )
+        .expect("the same hook, already even");
+
+        assert_eq!(
+            from_odd.stub, from_even.stub,
+            "the Thumb bit must not change where the stub goes"
+        );
+        assert_eq!(
+            odd, even,
+            "0x301 and 0x300 must produce byte-identical images"
+        );
+    }
+
+    /// A region that lies entirely behind the search start is skipped, not
+    /// clamped to it.
+    ///
+    /// `search_start` and the region list are two different statements — "do
+    /// not look before here" and "these are writable" — and the intersection
+    /// of them can be empty for a given region without being empty overall.
+    /// Getting this wrong would either place a stub before the caller's start
+    /// or drop the regions after it.
+    #[test]
+    fn a_region_behind_the_search_start_is_skipped_not_clamped() {
+        let mut image = image_with_two_runs();
+        let d = detour_in(
+            &mut image,
+            0x100,
+            0x300,
+            &[0x200..0x280, 0x400..0x500],
+            Fit::First,
+            DetourOptions::default().with_search_start(0x300),
+        )
+        .expect("the later region is still usable");
+        assert!(
+            (0x400..0x500).contains(&(d.stub as usize)),
+            "stub at {:#x} should be in the region after the search start",
+            d.stub
+        );
+    }
+
+    /// `Fit::Largest` picks the bigger declared run, not the first.
+    #[test]
+    fn fit_largest_reaches_past_the_first_usable_run() {
+        let mut image = image_with_two_runs();
+        let d = detour_in(
+            &mut image,
+            0x100,
+            0x300,
+            &[0x200..0x280, 0x400..0x500],
+            Fit::Largest,
+            DetourOptions::default(),
+        )
+        .expect("a stub should fit");
+        assert!(
+            (0x400..0x500).contains(&(d.stub as usize)),
+            "Fit::Largest should take the 0x100-byte run, got {:#x}",
+            d.stub
+        );
     }
 }

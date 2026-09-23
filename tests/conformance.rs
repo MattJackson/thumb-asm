@@ -70,7 +70,7 @@ use std::fmt::Write as _;
 use support::{
     assemble, find_assembler, find_objdump, raw_disassemble, Asm, Assembled, Objdump, Scratch,
 };
-use thumb_asm::isa::{decode_halfwords, insn_len, Insn, Operand};
+use thumb_asm::isa::{decode_halfwords, insn_len, Insn, Operand, Target};
 use thumb_asm::Cond;
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1048,7 @@ fn sweep(
         // Our side, once.
         let decoded: Vec<Option<Insn>> = chunk
             .iter()
-            .map(|&(hw1, hw2)| decode_halfwords(hw1, hw2, 0, false))
+            .map(|&(hw1, hw2)| decode_halfwords(hw1, hw2, 0, Target::Union))
             .collect();
         let bodies: Vec<Option<Body>> = decoded
             .iter()
@@ -1525,7 +1525,7 @@ fn every_width_suffix_we_print_is_one_llvm_will_parse() {
     let (structured, sampled) = probes_32(SEED, RANDOM_SAMPLES);
     let mut reps: BTreeMap<String, (Body, String, u16, u16)> = BTreeMap::new();
     for &(hw1, hw2) in probes_16().iter().chain(&structured).chain(&sampled) {
-        let insn = match decode_halfwords(hw1, hw2, 0, false) {
+        let insn = match decode_halfwords(hw1, hw2, 0, Target::Union) {
             Some(i) => i,
             None => continue,
         };
@@ -1635,7 +1635,7 @@ fn render_is_display_apart_from_the_pc_relative_substitution() {
     let mut checked = 0usize;
     let mut diffs: Vec<String> = Vec::new();
     for &(hw1, hw2) in probes_16().iter().chain(&structured).chain(&sampled) {
-        let insn = match decode_halfwords(hw1, hw2, 0, false) {
+        let insn = match decode_halfwords(hw1, hw2, 0, Target::Union) {
             Some(i) => i,
             None => continue,
         };
@@ -1710,4 +1710,114 @@ fn same_instruction_distinguishes_shift_kind_and_addressing_mode() {
     ] {
         assert!(!same_instruction(a, b), "`{a}` is not `{b}`");
     }
+}
+
+/// Every Armv8-M Security Extension encoding this crate decodes, assembled by
+/// LLVM and compared byte for byte.
+///
+/// This is the ratchet for `Target::V8M`. The unit tests in `isa::cmse` check
+/// against LLVM's answers *recorded as constants*; this checks against LLVM
+/// itself, over the whole group rather than ten samples, so a change to either
+/// implementation shows up here rather than in a stale table.
+///
+/// The group is small enough to enumerate exhaustively — 16 `BXNS`, 16
+/// `BLXNS`, 16x16x4 `TT` forms and the single `SG` — so there is no sampling
+/// argument to make and no seed to record.
+///
+/// It assembles with `.arch armv8-m.main`, which overrides the harness's
+/// `thumbv7a` triple: the directive wins, which is the same reason every
+/// dialect in `DIALECTS` puts `.thumb` *after* its `.arch`.
+#[test]
+fn every_security_extension_encoding_means_to_llvm_what_it_means_to_us() {
+    let scratch = Scratch::new("cmse").expect("scratch directory");
+    let (asm, _) = match toolchain(&scratch) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Enumerate the whole group, decode under `Target::V8M`, and keep the
+    // ones that decode. What this crate refuses is not this test's subject —
+    // the reverse census covers that — so a `None` is skipped rather than
+    // failed.
+    let mut cases: Vec<((u16, u16), String)> = Vec::new();
+    for rm in 0u16..16 {
+        for &base in &[0x4704u16, 0x4784] {
+            let hw1 = base | (rm << 3);
+            if let Some(i) = decode_halfwords(hw1, 0, 0, Target::V8M) {
+                cases.push(((hw1, 0), i.to_string()));
+            }
+        }
+    }
+    if let Some(i) = decode_halfwords(0xE97F, 0xE97F, 0, Target::V8M) {
+        cases.push(((0xE97F, 0xE97F), i.to_string()));
+    }
+    for rn in 0u16..16 {
+        for rt in 0u16..16 {
+            for az in 0u16..4 {
+                let hw1 = 0xE840 | rn;
+                let hw2 = 0xF000 | (rt << 8) | (az << 6);
+                if let Some(i) = decode_halfwords(hw1, hw2, 0, Target::V8M) {
+                    cases.push(((hw1, hw2), i.to_string()));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        cases.len(),
+        // 15 BXNS (pc refused) + 13 BLXNS (sp, lr, pc refused) + 1 SG
+        // + TT: 15 usable Rn x 14 usable Rt x 4 forms.
+        15 + 13 + 1 + 15 * 14 * 4,
+        "the enumeration changed shape; a count pinned as a literal is what \
+         makes that visible rather than silent"
+    );
+
+    // One source file, one assembler invocation. Each instruction is followed
+    // by a sentinel `.short` so a form that assembles to the wrong *length*
+    // is caught as well as one that assembles to the wrong bytes.
+    let mut src = String::with_capacity(cases.len() * 32);
+    src.push_str("\t.syntax unified\n\t.arch armv8-m.main\n\t.text\n\t.thumb\n");
+    for (_, text) in &cases {
+        let _ = writeln!(src, "\t{text}");
+        let _ = writeln!(src, "\t.short 0xbf00");
+    }
+
+    let bytes = match assemble(&asm, &scratch.dir, "cmse", &src).expect("assembling") {
+        Assembled::Object { text, object } => {
+            support::discard(&object);
+            text
+        }
+        Assembled::Errors(e) => panic!(
+            "LLVM rejected text this crate printed for Armv8-M: {:?}",
+            &e[..e.len().min(6)]
+        ),
+    };
+
+    let mut pos = 0usize;
+    for ((hw1, hw2), text) in &cases {
+        let wide = *hw2 != 0 || *hw1 == 0xE97F;
+        let n = if wide { 4 } else { 2 };
+        let got: Vec<u8> = bytes[pos..pos + n].to_vec();
+        let want: Vec<u8> = if wide {
+            vec![
+                (*hw1 & 0xFF) as u8,
+                (*hw1 >> 8) as u8,
+                (*hw2 & 0xFF) as u8,
+                (*hw2 >> 8) as u8,
+            ]
+        } else {
+            vec![(*hw1 & 0xFF) as u8, (*hw1 >> 8) as u8]
+        };
+        assert_eq!(
+            got, want,
+            "`{text}` (from {hw1:#06x} {hw2:#06x}) assembled to different bytes"
+        );
+        // The sentinel proves LLVM gave the instruction the length we did.
+        assert_eq!(
+            &bytes[pos + n..pos + n + 2],
+            &[0x00, 0xBF],
+            "`{text}` assembled to a different length than {n} bytes"
+        );
+        pos += n + 2;
+    }
+    assert_eq!(pos, bytes.len(), "trailing bytes in the assembled output");
 }

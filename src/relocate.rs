@@ -45,7 +45,7 @@
 //!
 //! // `ldr r0, [pc, #8]` at 0x1000 — the pool word is at 0x100c.
 //! let image = [0x02, 0x48];
-//! let insn = isa::decode_at_with(&image, 0, 0x1000, false).unwrap();
+//! let insn = isa::decode_at_with(&image, 0, 0x1000, isa::Target::Union).unwrap();
 //! assert_eq!(insn.branch_target(), Some(0x100c));
 //!
 //! // Two bytes up: Align(PC,4) is unchanged, so the displacement is too.
@@ -98,6 +98,7 @@ use crate::{encode_b_cond, encode_b_wide, Cond};
 /// pool word next to the stub, or materialise the value with `movw`/`movt`),
 /// which is a different operation from relocation and not this module's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Widen {
     /// Never change the instruction's length. `relocate(i, to)` guarantees
     /// `out.width == i.width`, hence `out.len() == i.len()`.
@@ -130,6 +131,7 @@ pub enum Widen {
 ///   work, and for a branch [`Widen::IfNeeded`] often fixes it outright.
 /// * **Caller error** — [`Misaligned`](Self::Misaligned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RelocateError {
     /// `to` is odd. Every Thumb instruction is halfword aligned (A5.1), so
     /// there is no address to relocate to.
@@ -280,6 +282,25 @@ pub enum RelocateError {
         /// The address it was asked to move to.
         to: u32,
     },
+    /// An Armv8-M `SG`, whose *address* is its meaning.
+    ///
+    /// `SG` marks the entry point of a secure gateway, and the Security
+    /// Attribution Unit decides whether a call is permitted by the address the
+    /// `SG` sits at — it must be the first instruction of a Non-Secure
+    /// Callable region (ARM DDI 0553B.y B4.3). Moved anywhere else the
+    /// instruction still encodes perfectly and still disassembles as `sg`, and
+    /// is no longer a gateway: entry through it stops being permitted, and the
+    /// address it vacated stops being guarded.
+    ///
+    /// This is the same class of refusal as [`ReadsPc`](Self::ReadsPc) — the
+    /// bits are fine and the meaning is not — which is why it lives here
+    /// rather than surfacing as an [`isa::encode`] failure.
+    SecureGateway {
+        /// The address it was decoded at, which is the address that matters.
+        from: u32,
+        /// The address it was asked to move to.
+        to: u32,
+    },
 }
 
 impl RelocateError {
@@ -302,6 +323,7 @@ impl RelocateError {
             RelocateError::LiteralAlignment { .. } => "literal-alignment",
             RelocateError::OutOfRange { .. } => "out-of-range",
             RelocateError::NotEncodable { .. } => "not-encodable",
+            RelocateError::SecureGateway { .. } => "secure-gateway",
         }
     }
 
@@ -316,6 +338,9 @@ impl RelocateError {
             | RelocateError::LiteralAlignment { mnemonic, .. }
             | RelocateError::OutOfRange { mnemonic, .. }
             | RelocateError::NotEncodable { mnemonic, .. } => mnemonic,
+            // `SG` carries no mnemonic field because it can only ever be one
+            // instruction: the encoding is a single fixed pattern.
+            RelocateError::SecureGateway { .. } => "sg",
         }
     }
 
@@ -330,6 +355,7 @@ impl RelocateError {
             | RelocateError::LiteralAlignment { from, .. }
             | RelocateError::OutOfRange { from, .. }
             | RelocateError::NotEncodable { from, .. } => from,
+            RelocateError::SecureGateway { from, .. } => from,
         }
     }
 
@@ -344,6 +370,7 @@ impl RelocateError {
             | RelocateError::LiteralAlignment { to, .. }
             | RelocateError::OutOfRange { to, .. }
             | RelocateError::NotEncodable { to, .. } => to,
+            RelocateError::SecureGateway { to, .. } => to,
         }
     }
 
@@ -380,6 +407,9 @@ impl core::fmt::Display for RelocateError {
             }
             RelocateError::ReadsPc { .. } => {
                 f.write_str(" (the pc value it observes changes with its address)")
+            }
+            RelocateError::SecureGateway { .. } => {
+                f.write_str(" (a secure gateway is identified by the address it sits at)")
             }
             RelocateError::ForwardOnlyBranch { target, .. } => write!(
                 f,
@@ -427,7 +457,7 @@ impl std::error::Error for RelocateError {}
 /// use thumb_asm::relocate::relocate;
 ///
 /// // `b 0x1010` (B T2) at 0x1000, and the same branch four bytes later.
-/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, false).unwrap();
+/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, isa::Target::Union).unwrap();
 /// assert_eq!(insn.branch_target(), Some(0x1010));
 /// let moved = relocate(&insn, 0x1004).unwrap();
 /// assert_eq!(moved.branch_target(), Some(0x1010)); // the target did not move
@@ -450,7 +480,7 @@ pub fn relocate(insn: &Insn, to: u32) -> Result<Insn, RelocateError> {
 /// use thumb_asm::relocate::{relocate_with, Widen};
 ///
 /// // `b 0x1010` cannot reach 0x1010 from 0x9000 in eleven bits …
-/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, false).unwrap();
+/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, isa::Target::Union).unwrap();
 /// assert_eq!(relocate_with(&insn, 0x9000, Widen::Never).unwrap_err().reason(), "out-of-range");
 ///
 /// // … but `b.w` spans ±16 MB, and still branches to 0x1010.
@@ -475,10 +505,10 @@ pub fn relocate_with(insn: &Insn, to: u32, widen: Widen) -> Result<Insn, Relocat
 /// use thumb_asm::isa;
 /// use thumb_asm::relocate::{relocate_bytes, Widen};
 ///
-/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, false).unwrap();
+/// let insn = isa::decode_at_with(&[0x06, 0xe0], 0, 0x1000, isa::Target::Union).unwrap();
 /// let bytes = relocate_bytes(&insn, 0x9000, Widen::IfNeeded).unwrap();
 /// assert_eq!(bytes.len(), 4); // widened to `b.w`
-/// assert_eq!(isa::decode_at_with(&bytes, 0, 0x9000, false).unwrap().branch_target(), Some(0x1010));
+/// assert_eq!(isa::decode_at_with(&bytes, 0, 0x9000, isa::Target::Union).unwrap().branch_target(), Some(0x1010));
 /// ```
 pub fn relocate_bytes(insn: &Insn, to: u32, widen: Widen) -> Result<Vec<u8>, RelocateError> {
     relocate_encoded(insn, to, widen).map(|(_, bytes)| bytes)
@@ -528,6 +558,12 @@ fn resite(insn: &Insn, to: u32) -> Result<Insn, RelocateError> {
     }
     if matches!(mnemonic, "tbb" | "tbh") {
         return Err(RelocateError::TableBranch { mnemonic, from, to });
+    }
+    // Checked before anything that inspects operands: `SG` has none, and the
+    // reason it cannot move has nothing to do with its encoding, which is a
+    // single fixed pattern that re-encodes at any address.
+    if mnemonic == "sg" {
+        return Err(RelocateError::SecureGateway { from, to });
     }
     if reads_pc(insn) {
         return Err(RelocateError::ReadsPc { mnemonic, from, to });
@@ -673,7 +709,7 @@ fn widened(insn: &Insn, to: u32) -> Option<(Insn, Vec<u8>)> {
         ("b", "T1", Some(cond)) if cond != Cond::Al => encode_b_cond(to as usize, cond, target)?,
         _ => return None,
     };
-    isa::decode_at_with(&bytes, 0, to, false).map(|wide| (wide, bytes))
+    isa::decode_at_with(&bytes, 0, to, isa::Target::Union).map(|wide| (wide, bytes))
 }
 
 /// The first [`Operand::Target`], i.e. the resolved branch destination or pool
@@ -824,7 +860,7 @@ mod tests {
 
     /// Decode one instruction from `bytes` as if it lived at `addr`.
     fn at(bytes: &[u8], addr: u32) -> Insn {
-        isa::decode_at_with(bytes, 0, addr, false).expect("test vector must decode")
+        isa::decode_at_with(bytes, 0, addr, isa::Target::Union).expect("test vector must decode")
     }
 
     /// The bytes a relocated instruction assembles to.
@@ -1534,7 +1570,7 @@ mod tests {
                 continue;
             }
             let bytes = hw.to_le_bytes();
-            let insn = match isa::decode_at_with(&bytes, 0, 0x1000, false) {
+            let insn = match isa::decode_at_with(&bytes, 0, 0x1000, isa::Target::Union) {
                 Some(i) => i,
                 None => continue,
             };
@@ -1668,7 +1704,8 @@ mod tests {
             // `assert!` then `unwrap`, not `unwrap_or_else(|| panic!(…))`:
             // the closure is a function that never runs, and this crate's
             // coverage gate is 100% of functions.
-            let decoded = crate::isa::decode_at_with(&hw.to_le_bytes(), 0, 0x102, false);
+            let decoded =
+                crate::isa::decode_at_with(&hw.to_le_bytes(), 0, 0x102, isa::Target::Union);
             assert!(decoded.is_some(), "{hw:#06x} must decode");
             let insn = decoded.unwrap();
             assert_eq!(insn.mnemonic, "add", "{hw:#06x}");
@@ -1681,7 +1718,8 @@ mod tests {
         // `mov pc, lr` is the counter-case: its first operand is written and
         // never read, so it means the same thing at any address and must stay
         // relocatable. Refusing it would be a silent capability loss.
-        let mv = crate::isa::decode_at_with(&0x46F7u16.to_le_bytes(), 0, 0x102, false).unwrap();
+        let mv = crate::isa::decode_at_with(&0x46F7u16.to_le_bytes(), 0, 0x102, isa::Target::Union)
+            .unwrap();
         assert_eq!(mv.mnemonic, "mov");
         assert!(
             relocate(&mv, 0x200).is_ok(),
@@ -1854,5 +1892,53 @@ mod tests {
         // one *is* a literal access whose displacement has to move.
         let literal = at(&[0x01, 0x48], 0x1000);
         assert!(pc_mem(&literal).is_some(), "{literal} is a literal access");
+    }
+}
+
+#[cfg(test)]
+mod secure_gateway_tests {
+    use super::*;
+    use crate::isa::{decode_halfwords, Target};
+
+    /// An `SG` is refused, and refused for a reason no caller can work around
+    /// by choosing a different address.
+    ///
+    /// This is the one relocation refusal that is not about range, alignment
+    /// or encodability: `SG` re-encodes perfectly anywhere, and moving it is
+    /// still wrong. The Security Attribution Unit identifies a gateway by the
+    /// address the instruction sits at, so a moved `SG` is no longer a
+    /// gateway and the address it left is no longer guarded — a detour over
+    /// one would silently close the entry point it was patching.
+    #[test]
+    fn a_secure_gateway_cannot_be_relocated_to_any_address() {
+        let sg = decode_halfwords(0xE97F, 0xE97F, 0x1000, Target::V8M).expect("sg decodes");
+        for to in [0x2000u32, 0x1004, 0x0, 0xFFFF_FFFE] {
+            let err = relocate(&sg, to).expect_err("sg must never relocate");
+            assert_eq!(err.reason(), "secure-gateway", "to {to:#x}");
+            assert_eq!(err.mnemonic(), "sg");
+            assert_eq!(err.from(), 0x1000);
+            assert_eq!(err.to(), to);
+            assert!(
+                !err.is_address_dependent(),
+                "a different address cannot help: the address is the problem"
+            );
+            assert!(
+                err.to_string().contains("address it sits at"),
+                "the message should say why, got: {err}"
+            );
+        }
+    }
+
+    /// The refusal is about `SG` specifically, not about Armv8-M: the rest of
+    /// the Security Extension relocates normally, because nothing about
+    /// `BXNS` or `TT` is tied to the address it occupies.
+    #[test]
+    fn the_other_security_extension_instructions_still_relocate() {
+        for (hw1, hw2) in [(0x4774u16, 0u16), (0xE841, 0xF000)] {
+            let insn = decode_halfwords(hw1, hw2, 0x1000, Target::V8M).expect("decodes");
+            let moved = relocate(&insn, 0x9000).expect("should relocate");
+            assert_eq!(moved.addr, 0x9000);
+            assert_eq!(moved.mnemonic, insn.mnemonic);
+        }
     }
 }

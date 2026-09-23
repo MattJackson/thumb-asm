@@ -1,6 +1,6 @@
 [package]
 name = "thumb-asm"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2021"
 # 1.56 is the edition-2021 floor. The only other thing this crate's source needs is inline
 # format-string captures (`format!("{x}")`), stabilised in 1.58.0 — used throughout the test

@@ -52,6 +52,7 @@ const NOP_T1: u16 = 0xBF00;
 /// Ordered so that a sort of [`Xref`]s by `(at, kind)` is deterministic; the
 /// order itself carries no meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum XrefKind {
     /// A direct call — `bl <label>` or `blx <label>`. Control is expected back
     /// at the following instruction, so the reference is also a caller.
@@ -71,6 +72,7 @@ pub enum XrefKind {
 
 /// One reference to an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Xref {
     /// File offset of the reference: of the instruction for [`XrefKind::Call`],
     /// [`XrefKind::Branch`] and [`XrefKind::PcRelativeAddress`], of the 4-byte
@@ -385,7 +387,7 @@ fn is_prologue(image: &[u8], at: usize) -> bool {
 /// assert_eq!(literal_value(&image, 0x02), Some(0xDEAD_BEEF));
 /// ```
 pub fn literal_value(image: &[u8], at: usize) -> Option<u32> {
-    let insn = isa::decode_at_with(image, at, at as u32, false)?;
+    let insn = isa::decode_at_with(image, at, at as u32, isa::Target::Union)?;
     if insn.mnemonic != "ldr" {
         return None;
     }
@@ -484,6 +486,7 @@ pub fn nop_fill(image: &mut [u8], at: usize, len: usize) {
 /// what was reached, what could not be followed, and whether the walk itself
 /// ran out of road.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Reach {
     /// File offset of every instruction reached, ascending and deduplicated.
     pub insns: Vec<usize>,
@@ -601,7 +604,7 @@ pub fn reachable(image: &[u8], entry: usize, limit: usize) -> Reach {
             out.complete = false;
             break;
         }
-        let insn = match isa::decode_at_with(image, at, at as u32, false) {
+        let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
             Some(i) => i,
             None => {
                 // Data, or an encoding this crate does not know. Either way the
@@ -960,7 +963,7 @@ mod tests {
         // 0x04: a genuine call to 0x40, on the far side of it.
         crate::write(&mut image, 0x04, &encode_bl(0x04, 0x40).unwrap());
         assert_eq!(
-            isa::decode_at_with(&image, 0x00, 0, false),
+            isa::decode_at_with(&image, 0x00, 0, isa::Target::Union),
             None,
             "the test vector must be undecodable, or it proves nothing"
         );
@@ -1025,7 +1028,9 @@ mod tests {
             if isa::insn_len(hw) != 2 {
                 continue;
             }
-            if let Some(insn) = isa::decode_at_with(&hw.to_le_bytes(), 0, 0x1000, false) {
+            if let Some(insn) =
+                isa::decode_at_with(&hw.to_le_bytes(), 0, 0x1000, isa::Target::Union)
+            {
                 seen += usize::from(check(&insn));
             }
         }
@@ -1039,7 +1044,9 @@ mod tests {
             ] {
                 let [a, b] = hw1.to_le_bytes();
                 let [c, d] = hw2.to_le_bytes();
-                if let Some(insn) = isa::decode_at_with(&[a, b, c, d], 0, 0x1000, false) {
+                if let Some(insn) =
+                    isa::decode_at_with(&[a, b, c, d], 0, 0x1000, isa::Target::Union)
+                {
                     seen += usize::from(check(&insn));
                 }
             }

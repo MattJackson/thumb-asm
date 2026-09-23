@@ -339,6 +339,7 @@ impl core::fmt::Display for Mem {
 ///
 /// Every variant is `Copy`; nothing here borrows or allocates.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Operand {
     /// A core register.
     Reg(Reg),

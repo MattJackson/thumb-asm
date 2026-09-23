@@ -2676,6 +2676,7 @@ pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::Target;
 
     /// Decode a halfword pair and, if it decodes, insist that it re-encodes to
     /// exactly the bytes it came from. Returns whether it decoded, so that the
@@ -3348,7 +3349,8 @@ mod tests {
         // part of this module the shared dispatcher reaches; the A7.4 data
         // processing space is given to the coprocessor group instead, for the
         // reason set out at the top of this file.
-        let insn = crate::isa::decode_halfwords(0xF920, 0x070F, 0, false).expect("routed here");
+        let insn =
+            crate::isa::decode_halfwords(0xF920, 0x070F, 0, Target::Union).expect("routed here");
         assert_eq!(insn.to_string(), "vld1.8 {d0}, [r0]");
         assert_eq!(crate::isa::encode(&insn), Some((0xF920, 0x070F)));
         assert_eq!(

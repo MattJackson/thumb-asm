@@ -621,6 +621,7 @@ fn neg_scaled_offset(mem: &Mem, hi: u32) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::isa::Target;
     use crate::isa::{decode_halfwords, Decoder};
 
     /// Decode a halfword through this module directly.
@@ -730,7 +731,7 @@ mod tests {
         let mut seen = 0usize;
         let mut seen_ldm_stm = 0usize;
         for hw in 0..=u16::MAX {
-            if let Some(i) = decode_halfwords(hw, 0, 0x1000, false) {
+            if let Some(i) = decode_halfwords(hw, 0, 0x1000, Target::Union) {
                 seen += 1;
                 assert_eq!(encode(&i), None, "{hw:#06x} ({i}) is not ThumbEE's");
                 if (RANGE_LO..=RANGE_HI).contains(&hw) {
@@ -1118,7 +1119,10 @@ mod tests {
         assert_eq!(plain.mnemonic, "ldmia");
         assert_eq!(plain.to_string(), "ldmia r4!, {r2, r5}");
 
-        let ee = Decoder::new(&image).thumbee(true).next().unwrap();
+        let ee = Decoder::new(&image)
+            .target(crate::isa::Target::ThumbEE)
+            .next()
+            .unwrap();
         assert_eq!(ee.mnemonic, "ldr");
         assert_eq!(ee.encoding, "E1");
         assert_eq!(ee.to_string(), "ldr r4, [r9, #16]");
@@ -1131,7 +1135,10 @@ mod tests {
             "stmia",
             "0xC207 is STM T1 in Thumb state"
         );
-        let hb = Decoder::new(&hb_image).thumbee(true).next().unwrap();
+        let hb = Decoder::new(&hb_image)
+            .target(crate::isa::Target::ThumbEE)
+            .next()
+            .unwrap();
         assert_eq!(hb.to_string(), "hb #7");
 
         // Outside the re-assigned space the flag changes nothing: `bx lr`
@@ -1139,7 +1146,10 @@ mod tests {
         let bx = [0x70, 0x47];
         assert_eq!(
             Decoder::new(&bx).next().unwrap(),
-            Decoder::new(&bx).thumbee(true).next().unwrap()
+            Decoder::new(&bx)
+                .target(crate::isa::Target::ThumbEE)
+                .next()
+                .unwrap()
         );
 
         // The UNDEFINED row of Table A9-2, and the reason `owns` exists. This
@@ -1153,7 +1163,9 @@ mod tests {
         assert!(owns(0xC1C0), "…but it is in the range ThumbEE re-assigns");
         assert_eq!(Decoder::new(&undef).next().unwrap().mnemonic, "stmia");
         assert_eq!(
-            Decoder::new(&undef).thumbee(true).next(),
+            Decoder::new(&undef)
+                .target(crate::isa::Target::ThumbEE)
+                .next(),
             None,
             "A9.2.1's UNDEFINED row must not reappear as the Thumb encoding \
              ThumbEE replaced"
@@ -1200,10 +1212,10 @@ mod tests {
     #[test]
     fn dispatch_matches_state_over_the_whole_range() {
         for hw in RANGE_LO..=RANGE_HI {
-            let ee = decode_halfwords(hw, 0, 0x1000, true);
+            let ee = decode_halfwords(hw, 0, 0x1000, Target::ThumbEE);
             assert_eq!(ee, dec(hw), "{hw:#06x} in ThumbEE state");
 
-            let plain = decode_halfwords(hw, 0, 0x1000, false);
+            let plain = decode_halfwords(hw, 0, 0x1000, Target::Union);
             if let Some(i) = plain {
                 assert!(
                     matches!(i.mnemonic, "stmia" | "ldmia"),
@@ -1222,7 +1234,7 @@ mod tests {
             0xC0FFu16, 0xC207, 0xC31F, 0xC443, 0xC811, 0xC9D1, 0xCA08, 0xCA9D, 0xCB7F, 0xCC00,
             0xCDF8, 0xCE13, 0xCFF8,
         ] {
-            let i = decode_halfwords(hw, 0, 0x1000, true).unwrap();
+            let i = decode_halfwords(hw, 0, 0x1000, Target::ThumbEE).unwrap();
             assert_eq!(crate::isa::encode(&i), Some((hw, 0)), "{hw:#06x} ({i})");
         }
     }

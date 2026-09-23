@@ -699,6 +699,7 @@ pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::isa::decode_halfwords;
+    use crate::isa::Target;
 
     /// The two halfwords with these fields, `imm3:imm2` given whole.
     fn hw(op: u16, s: u16, rn: u16, rd: u16, ty: u16, imm5: u16, rm: u16) -> (u16, u16) {
@@ -937,7 +938,7 @@ mod tests {
             for s in 0..2u16 {
                 let (a, b) = hw(op, s, 1, 0, 0b01, 3, 2);
                 assert_eq!(
-                    decode_halfwords(a, b, 0, false),
+                    decode_halfwords(a, b, 0, Target::Union),
                     decode(a, b, 0),
                     "{a:#06x} {b:#06x} is not reaching t32_dp_shiftreg"
                 );
@@ -966,7 +967,7 @@ mod tests {
                         for ty in 0..4u16 {
                             for imm5 in [0u16, 1, 2, 30, 31] {
                                 let (a, b) = hw(op, s, rn, rd, ty, imm5, 2);
-                                let insn = match decode_halfwords(a, b, 0, false) {
+                                let insn = match decode_halfwords(a, b, 0, Target::Union) {
                                     Some(i) => i,
                                     None => continue,
                                 };
