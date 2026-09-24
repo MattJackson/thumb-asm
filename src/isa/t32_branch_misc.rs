@@ -170,7 +170,7 @@ fn t3_cond(hw1: u16) -> Option<Cond> {
     }
 }
 
-/// `B<cond>.W`, encoding T3 (A7.7.12, A8.8.18) — ±1 MB, condition in the
+/// `B<cond>.W`, encoding T3 (A7.7.12, DDI 0406B A8.6.16) — ±1 MB, condition in the
 /// encoding.
 ///
 /// The condition goes in [`Insn::cond`], not in the mnemonic: `Display`

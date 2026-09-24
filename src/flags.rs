@@ -55,7 +55,7 @@
 //! [`Insn::sets_flags`]: crate::isa::insn::Insn::sets_flags
 //! [`RelocateError::ForwardOnlyBranch`]: crate::relocate::RelocateError::ForwardOnlyBranch
 
-use crate::isa::insn::Insn;
+use crate::isa::insn::{Insn, Operand, ShiftKind};
 use crate::isa::{self, Target};
 
 /// A set of condition flags.
@@ -158,8 +158,38 @@ pub fn writes(insn: &Insn) -> Flags {
         // `EOR`, so V survives.
         "cmp" | "cmn" => Flags::ALL,
         "tst" | "teq" => Flags::NZC,
-        // Writing the flags register directly.
-        "msr" => Flags::ALL,
+        // Writing the flags register directly — but only the spellings that
+        // name the condition bits. Table B5-2 (DDI 0403E.e, B5.2) gives three
+        // `<bits>` encodings for `MSR APSR`: `_nzcvq` writes N, Z, C, V and Q;
+        // `_g` writes **only** GE[3:0] and touches no condition flag; `_nzcvqg`
+        // writes both.
+        //
+        // Claiming `_g` writes all four would be the expensive direction of
+        // wrong: `live_from` resolves a flag the moment something writes it, so
+        // an over-claim here reports a live flag as dead and licenses
+        // clobbering it. Anything that is not a recognised APSR spelling —
+        // `PRIMASK`, `CONTROL`, a register this crate does not know — writes no
+        // condition flag at all.
+        // The `<bits>` suffix decides, not the register stem. The decoder
+        // spells these `APSR_g`, `APSR_nzcvq`, `APSR_nzcvqg` and the same
+        // three suffixes on the composite PSRs — `IAPSR_nzcvq`,
+        // `EAPSR_nzcvqg`, `XPSR_g` and so on — all of which carry the APSR
+        // bits. Matching on the stem would miss every composite form; matching
+        // on the suffix is what the mask field actually encodes.
+        //
+        // Anything with no such suffix — `PRIMASK`, `BASEPRI`, `CONTROL`, a
+        // bare `APSR` — writes no condition flag.
+        "msr" => match insn.operands.get(0) {
+            Some(Operand::SpecialReg(name)) => {
+                let n = name.to_ascii_lowercase();
+                if n.ends_with("_nzcvq") || n.ends_with("_nzcvqg") {
+                    Flags::ALL
+                } else {
+                    Flags::NONE
+                }
+            }
+            _ => Flags::NONE,
+        },
         _ if !insn.sets_flags => Flags::NONE,
         // Logical and shift: N, Z, C, and V untouched (A7.7.9 and siblings).
         "and" | "orr" | "eor" | "bic" | "orn" | "mvn" | "lsl" | "lsr" | "asr" | "ror" | "rrx" => {
@@ -194,7 +224,21 @@ pub fn reads(insn: &Insn) -> Flags {
         "mrs" => Flags::ALL,
         _ => Flags::NONE,
     };
-    from_cond.union(from_operation)
+    // ...and `RRX` as a *shift applied to an operand* of some other
+    // instruction. `and.w r0, r1, r2, rrx` rotates `r2` right through carry,
+    // so it reads C while its mnemonic is `and`. Looking only at the mnemonic
+    // — which this function did until the audit caught it — misses every one
+    // of these, and the module doc names this as the case it exists to get
+    // right.
+    let from_shift = insn
+        .operands
+        .as_slice()
+        .find_map(|o| match o {
+            Operand::RegShifted(_, sh) if sh.kind == ShiftKind::Rrx => Some(Flags::C),
+            _ => None,
+        })
+        .unwrap_or(Flags::NONE);
+    from_cond.union(from_operation).union(from_shift)
 }
 
 /// Which flags a condition code consults (ARM DDI 0403E.e A7.3, Table A7-3).
@@ -312,6 +356,26 @@ pub fn live_after(image: &[u8], at: usize, target: Target, limit: usize) -> Flag
     // on the taken path and report it dead — the one direction that turns a
     // refusal into a silent miscompile.
     if here.is_branch() {
+        // `branch_target()` is not a control-flow edge on its own. A
+        // pc-relative *literal* access carries a `Target` too — the resolved
+        // address of the pool word — and `Insn::branch_target`'s own contract
+        // says so: "A consumer building a control-flow graph must treat a
+        // `Target` as a branch destination only when the instruction has no
+        // `Operand::Mem`."
+        //
+        // `ldr pc, [pc, #8]` is exactly that case and is an ordinary dispatch
+        // idiom: `is_branch()` is true, and the `Target` is the address of the
+        // word *holding* the destination. Following it would walk into the
+        // literal pool and decode data as code — and could then report a flag
+        // dead on the strength of bytes that are not instructions at all,
+        // which inverts this function's one-directional guarantee.
+        let loads_its_destination = here
+            .operands
+            .as_slice()
+            .any(|o| matches!(o, Operand::Mem(_)));
+        if loads_its_destination {
+            return Flags::ALL;
+        }
         match here.branch_target() {
             // A target inside the image is followed, one level. Anything it
             // reaches that branches again resolves to `Flags::ALL` there, so
@@ -459,6 +523,94 @@ mod tests {
         let msr = at(0xF380, 0x8800); // msr apsr_nzcvq, r0
         assert_eq!(msr.mnemonic, "msr");
         assert_eq!(writes(&msr), Flags::ALL, "MSR replaces the whole APSR");
+    }
+
+    /// `MSR APSR_g` writes the GE bits and no condition flag at all.
+    ///
+    /// Table B5-2 (DDI 0403E.e B5.2) gives three `<bits>` spellings: `_nzcvq`
+    /// writes N, Z, C, V and Q; `_g` writes **only** GE[3:0]; `_nzcvqg`
+    /// writes both. Claiming `_g` writes the condition flags is the expensive
+    /// direction of wrong — `live_from` resolves a flag the moment something
+    /// writes it, so an over-claim reports a live flag as dead.
+    #[test]
+    fn the_ge_only_spelling_of_msr_writes_no_condition_flag() {
+        let ge = at(0xF380, 0x8400); // msr apsr_g, r0
+        assert_eq!(ge.mnemonic, "msr");
+        assert_eq!(
+            writes(&ge),
+            Flags::NONE,
+            "APSR_g writes GE[3:0] and nothing else"
+        );
+
+        let nzcvq = at(0xF380, 0x8800); // msr apsr_nzcvq, r0
+        assert_eq!(writes(&nzcvq), Flags::ALL, "APSR_nzcvq writes all four");
+
+        // The composite PSRs carry the same suffixes and the same bits, so
+        // classifying on the register stem rather than the suffix would miss
+        // them.
+        let iapsr = at(0xF380, 0x8801); // msr iapsr_nzcvq, r0
+        assert_eq!(iapsr.mnemonic, "msr");
+        assert_eq!(
+            writes(&iapsr),
+            Flags::ALL,
+            "IAPSR_nzcvq carries the APSR bits too"
+        );
+
+        // A system register with no `<bits>` suffix writes no condition flag.
+        let primask = at(0xF380, 0x8810); // msr primask, r0
+        assert_eq!(writes(&primask), Flags::NONE, "PRIMASK is not the APSR");
+
+        // ...and a hand-built `Insn` whose first operand is not a special
+        // register at all is not an APSR write either.
+        let mut odd = nzcvq;
+        odd.operands = [Operand::Reg(crate::isa::insn::Reg(0))]
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(writes(&odd), Flags::NONE);
+    }
+
+    /// `RRX` applied as a *shift to an operand* reads carry, even though the
+    /// mnemonic is something else entirely.
+    ///
+    /// `and.w r0, r1, r2, rrx` rotates `r2` right through carry. A rule that
+    /// inspects only `insn.mnemonic` sees `"and"` and reports no read — which
+    /// is what this function did until an audit caught it, despite the module
+    /// doc naming this as the case it exists to get right.
+    #[test]
+    fn rrx_as_a_shift_operand_reads_carry() {
+        let shifted = at(0xEA01, 0x0032); // and.w r0, r1, r2, rrx
+        assert_eq!(shifted.mnemonic, "and");
+        assert_eq!(shifted.cond, None, "no condition, so no read from that");
+        assert!(
+            reads(&shifted).c,
+            "the RRX shift consumes carry regardless of the mnemonic"
+        );
+    }
+
+    /// An instruction that *loads* its destination is not a control-flow edge
+    /// this can follow.
+    ///
+    /// `ldr.w pc, [pc]` makes `is_branch()` true, but its `Target` is the
+    /// address of the word *holding* the destination, not the destination —
+    /// `Insn::branch_target`'s own contract says a `Target` is a branch
+    /// destination only when the instruction has no `Operand::Mem`. Following
+    /// it would walk into the literal pool and decode data as code, and could
+    /// then report a flag dead on the strength of bytes that are not
+    /// instructions.
+    #[test]
+    fn an_instruction_that_loads_its_destination_is_not_followed() {
+        // ldr.w pc, [pc] at 0, then bytes that happen to decode as an `adds`
+        // — which, if followed as code, would resolve every flag and wrongly
+        // report them dead.
+        let image = [0xdf, 0xf8, 0x00, 0xf0, 0xd1, 0x18, 0xd1, 0x18];
+        let insn = crate::isa::decode_at_with(&image, 0, 0, Target::Union).expect("decodes");
+        assert!(insn.is_branch(), "writing pc makes this a branch");
+        assert_eq!(
+            live_after(&image, 0, Target::Union, 8),
+            Flags::ALL,
+            "the destination is loaded from memory, so no path is visible"
+        );
     }
 
     /// A branch whose target is outside the image is code this cannot see, so

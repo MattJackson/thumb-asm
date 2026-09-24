@@ -327,7 +327,7 @@ impl RelocateError {
     /// A stable, machine-readable reason: `"misaligned-destination"`,
     /// `"reads-pc"`, `"forward-only-branch"`, `"pc-relative-table"`,
     /// `"unresolved-pc-relative"`, `"literal-alignment"`, `"out-of-range"`,
-    /// `"not-encodable"`.
+    /// `"not-encodable"`, `"secure-gateway"`, `"flags-live"`.
     ///
     /// These strings are part of this module's contract. A consumer that logs
     /// or tests against them — a firmware patcher deciding whether to fall

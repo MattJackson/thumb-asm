@@ -508,7 +508,15 @@ impl CommandTable {
     pub fn find(&self, image: &[u8], opcode: u8) -> Option<CommandRecord> {
         let mut off = self.base;
         for _ in 0..self.max_records {
-            if off + self.stride > image.len() {
+            // `checked_add`, not `off + self.stride`: `base` and `stride` are
+            // the caller's, so their sum can overflow. In debug that panics;
+            // in release it wraps to a small number that passes the `>` test,
+            // and the indexing below then reads from an offset the check was
+            // supposed to have refused. `walk` below has always used
+            // `checked_add` — this is the same guard, which `find` was
+            // missing.
+            let end = off.checked_add(self.stride)?;
+            if end > image.len() {
                 return None;
             }
             let flags = image[off + self.flags_off];
@@ -2380,6 +2388,45 @@ fn round_up(v: usize, align: usize) -> usize {
 #[cfg(test)]
 #[path = "thumb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod command_table_overflow_tests {
+    use super::*;
+
+    /// `find`'s bounds check must not overflow on a caller-supplied `base`
+    /// and `stride`.
+    ///
+    /// Both come from the caller describing a table in their own image, so
+    /// their sum is not bounded by anything. Computed as `off + stride` this
+    /// panics in a debug build and, worse, *wraps* in a release build to a
+    /// small number that passes the `> image.len()` test — after which the
+    /// indexing below reads from an offset the check was meant to refuse.
+    /// `walk` has always used `checked_add`; `find` did not.
+    #[test]
+    fn a_table_whose_base_plus_stride_overflows_is_refused_not_wrapped() {
+        let image = vec![0u8; 100];
+        let table = CommandTable {
+            base: usize::MAX - 10,
+            stride: 20,
+            opcode_off: 0,
+            flags_off: 1,
+            handler_off: 4,
+            term_flag: 0xFF,
+            max_records: 5,
+        };
+        assert_eq!(
+            table.find(&image, 0x42),
+            None,
+            "an overflowing base+stride must be refused, not wrapped into range"
+        );
+        // `walk` is the sibling that already did this correctly; it must
+        // agree, so the two cannot drift apart again.
+        assert!(
+            table.walk(&image, 0x01).is_empty(),
+            "walk must refuse the same table"
+        );
+    }
+}
 
 #[cfg(test)]
 mod error_reason_tests {

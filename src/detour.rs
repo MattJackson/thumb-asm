@@ -510,8 +510,8 @@ impl DetourError {
     /// A stable, machine-readable reason: `"out-of-bounds"`, `"undecodable"`,
     /// `"scan-start-after-site"`, `"site-not-aligned"`, `"site-in-it-block"`,
     /// `"splits-it-block"`, `"relocate"`, `"no-free-space"`,
-    /// `"stub-misaligned"`, `"stub-out-of-bounds"`, `"site-unreachable"`,
-    /// `"hook-unreachable"`, `"resume-unreachable"`.
+    /// `"stub-misaligned"`, `"stub-out-of-bounds"`, `"stub-overlaps-site"`,
+    /// `"site-unreachable"`, `"hook-unreachable"`, `"resume-unreachable"`.
     pub fn reason(&self) -> &'static str {
         match self {
             DetourError::OutOfBounds { .. } => "out-of-bounds",
