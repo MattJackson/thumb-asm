@@ -201,8 +201,6 @@ fn flags_ok(insn: &Insn, expected: bool) -> bool {
 /// `add`/`T2` and `cmp`/`T1` all also name encodings in A5.2.3, and are told
 /// apart here by operand shape (`cmp r0, r1` is two registers; `cmp r0, #1` is
 /// a register and an immediate).
-// `allow`: nothing in `super` dispatches re-encoding yet, so from the lib
-// target's point of view this and its helpers are unreachable. The tests below
 pub(crate) fn encode(insn: &Insn) -> Option<u16> {
     if insn.width != Width::Narrow {
         return None;

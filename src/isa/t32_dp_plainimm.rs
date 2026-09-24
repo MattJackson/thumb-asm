@@ -472,8 +472,6 @@ fn field_form(op: u16, rn: u16, rd: u16, five: u16, tail: u16) -> (u16, u16) {
 ///
 /// `insn.addr` is read for the `ADR` forms, whose operand is an absolute
 /// target that only means something relative to `Align(PC,4)`.
-// `allow`: nothing in `super` dispatches re-encoding yet, so from the lib
-// target's point of view this and its helpers are unreachable. The tests
 pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
     // No row here has an `S` bit, and all of them are 32-bit.
     if insn.width != Width::Wide || insn.sets_flags {

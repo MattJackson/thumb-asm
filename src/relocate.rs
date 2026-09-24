@@ -2087,9 +2087,27 @@ pub fn widen_compare_branch(
         Cond::Ne
     };
     // The `B<cond>` sits two bytes after the `CMP`, and its range is measured
-    // from there — not from `to`.
+    // from there — not from `to`. The `+ 2` is done in `u32`, where `to`
+    // lives, not after a widening `as usize`: a `to` of `0xFFFF_FFFE`
+    // (even, so it passes the alignment check above) overflows `to + 2` in the
+    // 32-bit Thumb address space whatever the host's pointer width, and a
+    // `usize`-space check would only catch it on a 32-bit target while a
+    // 64-bit build silently produced a site at `0x1_0000_0000`. A stub cannot
+    // live past the top of memory, so this is just another out-of-range
+    // destination.
+    let branch_site = match to.checked_add(2) {
+        Some(s) => s as usize,
+        None => {
+            return Err(RelocateError::OutOfRange {
+                mnemonic,
+                from,
+                to,
+                target: Some(target),
+            })
+        }
+    };
     let branch =
-        crate::encode_b_cond((to as usize) + 2, cond, target).ok_or(RelocateError::OutOfRange {
+        crate::encode_b_cond(branch_site, cond, target).ok_or(RelocateError::OutOfRange {
             mnemonic,
             from,
             to,
@@ -2206,6 +2224,23 @@ mod compare_branch_tests {
         no_target.operands = [Operand::Reg(Reg(0))].iter().copied().collect();
         let err = widen_compare_branch(&no_target, 0x9000, Flags::NONE).expect_err("no target");
         assert_eq!(err.reason(), "not-encodable");
+    }
+
+    /// A destination near the top of the address space is refused, not
+    /// overflowed.
+    ///
+    /// `to` is the caller's, and the branch sits at `to + 2`. On a 32-bit
+    /// `usize` target that add would overflow for a `to` near `u32::MAX` — a
+    /// panic in debug, a wrapped and wrong site in release. It is an
+    /// out-of-range destination like any other, because nothing that high can
+    /// host a stub.
+    #[test]
+    fn a_destination_at_the_top_of_memory_is_refused_not_overflowed() {
+        let cbz = decode_at_with(&BOTH_PATHS_CLOBBER, 0, 0, Target::Union).expect("cbz");
+        let err = widen_compare_branch(&cbz, 0xFFFF_FFFE, Flags::NONE)
+            .expect_err("a near-u32::MAX destination cannot host a stub");
+        assert_eq!(err.reason(), "out-of-range");
+        assert_eq!(err.to(), 0xFFFF_FFFE);
     }
 
     /// An odd destination has no instruction boundary to land on.
