@@ -326,15 +326,31 @@ fn list_text(count: u8, inc: u8, base: u8, suffix: u8) -> Option<&'static str> {
 /// The inverse of [`list_text`]: `(count, inc, base, suffix)` for a spelling,
 /// found by scanning the generated table, so the two directions cannot drift.
 fn list_fields(text: &str) -> Option<(u8, u8, u8, u8)> {
+    let want = text.as_bytes();
+    // An empty spelling matched no row under the old `text_of`-based scan
+    // (which returned `None` for an empty cell), and a byte compare against an
+    // empty cell would wrongly match it — so refuse it explicitly.
+    if want.is_empty() {
+        return None;
+    }
+    // Still a scan of the generated table, so the two directions cannot drift
+    // — but the row is compared as bytes against `LIST_TEXT` directly instead
+    // of running `text_of`'s `from_utf8` on every one of the ~2,240 cells. The
+    // table holds ASCII, so a byte-equal row is a str-equal row, and the
+    // length prefix (`row[..want.len()]` with the next byte a terminator)
+    // rejects almost every cell before the comparison.
+    if want.len() > TEXT_W {
+        return None;
+    }
     let mut shape = 0;
     while shape < LIST_SHAPES.len() {
         let (count, inc) = LIST_SHAPES[shape];
         for suffix in 0..LIST_SUFFIXES {
             for base in 0..32u8 {
-                if let Some(s) = text_of(&LIST_TEXT[list_index(shape, suffix, base)]) {
-                    if s == text {
-                        return Some((count, inc, base, suffix as u8));
-                    }
+                let row = &LIST_TEXT[list_index(shape, suffix, base)];
+                let terminated = want.len() == TEXT_W || row[want.len()] == 0;
+                if terminated && &row[..want.len()] == want {
+                    return Some((count, inc, base, suffix as u8));
                 }
             }
         }
@@ -1761,6 +1777,17 @@ fn encode_modimm(insn: &Insn) -> Option<(u16, u16)> {
     for op in 0..2u16 {
         for cmode in 0..16u16 {
             let name = MODIMM_NAMES[op as usize][cmode as usize];
+            // Hoisted out of the `imm8` loop below, where it used to sit
+            // *after* `expand_imm`. `name` is a pure function of `(op,
+            // cmode)`, so a block whose name does not match the mnemonic can
+            // never produce an answer — and testing it inside meant running
+            // `expand_imm` up to 256 times per block, 8,192 times per call,
+            // to reject every one of them on a condition that was already
+            // decided. Skipping the block is behaviour-identical: it cannot
+            // change which `(op, cmode, imm8)` triple is returned first.
+            if name != insn.mnemonic {
+                continue;
+            }
             for imm8 in 0..=255u8 {
                 if imm8 == 0 && modimm_needs_nonzero(cmode) {
                     continue;
@@ -1771,7 +1798,7 @@ fn encode_modimm(insn: &Insn) -> Option<(u16, u16)> {
                     // either, so the name test below would reject it too.
                     None => continue,
                 };
-                if name != insn.mnemonic || modimm_operand(name, got) != want {
+                if modimm_operand(name, got) != want {
                     continue;
                 }
                 let hw1 = 0xEF80
@@ -2677,6 +2704,26 @@ pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::isa::Target;
+
+    /// `list_fields` inverts the spelling table by scan, and two spellings can
+    /// never appear there: the empty string and one longer than a cell.
+    ///
+    /// Both are refused before the scan. The empty case matters because a
+    /// byte-compare against an empty cell would otherwise match it, where the
+    /// old `text_of`-based scan returned `None`; the over-long case cannot fit
+    /// any `TEXT_W`-wide row and short-circuits.
+    #[test]
+    fn list_fields_refuses_spellings_no_row_can_hold() {
+        assert_eq!(list_fields(""), None, "an empty spelling is in no row");
+        let too_long = "d".repeat(TEXT_W + 1);
+        assert_eq!(list_fields(&too_long), None, "longer than any cell");
+        // A real spelling still round-trips through the scan.
+        assert_eq!(
+            list_fields("{d0}"),
+            Some((1, 1, 0, 0)),
+            "the inverse of list_text for a one-register list"
+        );
+    }
 
     /// Decode a halfword pair and, if it decodes, insist that it re-encodes to
     /// exactly the bytes it came from. Returns whether it decoded, so that the
