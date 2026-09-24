@@ -928,7 +928,7 @@ fn attempt(
     if stub % 4 != 0 {
         return Err(DetourError::StubMisaligned { stub });
     }
-    let bytes = build_stub(stub, insns, live, hook, resume, site, opts)?;
+    let bytes = build_stub(stub, insns, live, hook, resume, site, image.len(), opts)?;
     // The commit writes the stub and then the hook branch. If the two overlap,
     // the second write lands inside the first and the result is neither.
     let stub_end = (stub as usize).saturating_add(bytes.len());
@@ -1035,6 +1035,7 @@ fn prologue_len(opts: &DetourOptions) -> usize {
 }
 
 /// Assemble the stub that would live at `stub`.
+#[allow(clippy::too_many_arguments)]
 fn build_stub(
     stub: u32,
     insns: &[Insn],
@@ -1042,9 +1043,27 @@ fn build_stub(
     hook: u32,
     resume: u32,
     site: usize,
+    image_len: usize,
     opts: &DetourOptions,
 ) -> Result<Vec<u8>, DetourError> {
     let mut out: Vec<u8> = Vec::new();
+    // The running address of the byte after `out`. Every intermediate stub
+    // address is `stub + out.len()`, and `stub` is the caller's `stub_at`, so
+    // that add can overflow `u32` for a value near the top of memory — which
+    // this crate's `offset == address` model already forbids, but a decoder
+    // must refuse rather than panic. `attempt`'s `stub_end > image.len()`
+    // check catches an oversized stub, but only after this function has run,
+    // so the arithmetic here has to be total on its own.
+    let addr = |len: usize| -> Result<u32, DetourError> {
+        u32::try_from(len)
+            .ok()
+            .and_then(|l| stub.checked_add(l))
+            .ok_or(DetourError::StubOutOfBounds {
+                stub,
+                need: len,
+                len: image_len,
+            })
+    };
     let save_lr = opts.convention == Convention::CallThenContinue && opts.kind == BranchKind::BWide;
 
     match opts.convention {
@@ -1052,6 +1071,11 @@ fn build_stub(
             if save_lr {
                 out.extend_from_slice(&PUSH_LR);
             }
+            // `out.len()` here is 0, or 2 with the optional `PUSH`, and `stub`
+            // is 4-aligned (`attempt` rejects a misaligned one), so this sum
+            // is at most `0xFFFF_FFFE` and cannot overflow — unlike the sites
+            // below, whose offset depends on the displaced block, which is why
+            // only they need `addr`.
             let at = stub + out.len() as u32;
             let call = encode_bl(at as usize, hook)
                 .ok_or(DetourError::HookUnreachable { from: at, hook })?;
@@ -1062,7 +1086,7 @@ fn build_stub(
         }
         Convention::HookDecides => {
             out.extend_from_slice(&LDR_IP_CONTINUATION);
-            let at = stub + out.len() as u32;
+            let at = addr(out.len())?;
             let jump = encode_b_wide(at as usize, hook)
                 .ok_or(DetourError::HookUnreachable { from: at, hook })?;
             out.extend_from_slice(&jump);
@@ -1081,11 +1105,11 @@ fn build_stub(
     // site's alignment is therefore free and keeps the displacement of any
     // displaced `adr` or literal load exactly as it was, up to the constant
     // offset between stub and site. Two bytes of `nop` buy that.
-    if (stub as usize + out.len()) % 4 != site % 4 {
+    if (stub as usize).wrapping_add(out.len()) % 4 != site % 4 {
         out.extend_from_slice(&NOP);
     }
 
-    let body = stub + out.len() as u32;
+    let body = addr(out.len())?;
     if opts.convention == Convention::HookDecides {
         // Thumb bit set: the hook reaches this with `bx r12`.
         let word = (body | 1).to_le_bytes();
@@ -2435,6 +2459,56 @@ mod tests {
         )
         .expect("exactly four bytes of room is enough, as install_branch says");
         assert_eq!(d.resume(), LEN as u32);
+    }
+}
+
+#[cfg(test)]
+mod stub_address_tests {
+    use super::*;
+
+    /// A `stub_at` near the top of the address space is refused, not
+    /// overflowed.
+    ///
+    /// `build_stub` computes intermediate addresses as `stub + out.len()`, and
+    /// `stub` is the caller's `stub_at`. For a value near `u32::MAX` that add
+    /// overflows — a panic in debug, a wrong address in release — and it runs
+    /// before `attempt`'s `stub_end > image.len()` check, so the arithmetic
+    /// has to be total on its own. The hook is placed near the stub so the
+    /// `BL` is in range and execution reaches the overflowing add rather than
+    /// stopping at `HookUnreachable` first.
+    #[test]
+    fn a_stub_at_the_top_of_memory_is_refused_not_overflowed() {
+        for &(stub, hook) in &[(0xFFFF_FFFCu32, 0xFFFF_F800u32), (0xFFFF_F000, 0xFFFF_F800)] {
+            let mut image = vec![0u8; 0x20];
+            // movs r0, #1 / movs r1, #2 at the site, so there is code to displace.
+            image[0..4].copy_from_slice(&[0x01, 0x20, 0x02, 0x21]);
+            let err = detour(&mut image, 0, hook, DetourOptions::new().with_stub_at(stub))
+                .expect_err("a near-top-of-memory stub cannot be written");
+            assert_eq!(err.reason(), "stub-out-of-bounds", "stub {stub:#x}");
+            // And nothing was written: the site still holds its original code.
+            assert_eq!(&image[0..4], &[0x01, 0x20, 0x02, 0x21]);
+        }
+    }
+
+    /// The same overflow through the `HookDecides` convention, whose first
+    /// stub address is four bytes in (the continuation-word load) rather than
+    /// at the stub base — so it is the hook-branch computation that overflows
+    /// here, a different `addr` call than the `CallThenContinue` case above.
+    #[test]
+    fn a_top_of_memory_stub_overflows_the_hook_decides_layout_too() {
+        let mut image = vec![0u8; 0x20];
+        image[0..4].copy_from_slice(&[0x01, 0x20, 0x02, 0x21]);
+        let err = detour(
+            &mut image,
+            0,
+            0xFFFF_F800,
+            DetourOptions::new()
+                .with_stub_at(0xFFFF_FFFC)
+                .with_convention(Convention::HookDecides),
+        )
+        .expect_err("the continuation-load offset pushes the hook branch past u32::MAX");
+        assert_eq!(err.reason(), "stub-out-of-bounds");
+        assert_eq!(&image[0..4], &[0x01, 0x20, 0x02, 0x21]);
     }
 }
 
