@@ -683,7 +683,11 @@ pub fn disassemble(image: &[u8], at: usize, addr: u32, count: usize) -> Vec<Stri
     let mut d = Decoder::at(image, at, addr);
     while out.len() < count {
         let pos = d.pos();
-        if pos + 2 > image.len() {
+        // `checked_add`, not `pos + 2`: `at` is a caller-supplied offset that
+        // the `offset == address` model lets sit anywhere in range, including
+        // near the maximum, and this add runs before the length test meant to
+        // reject it. On overflow there is no room for a halfword, so stop.
+        if pos.checked_add(2).map_or(true, |end| end > image.len()) {
             break;
         }
         match d.next() {
@@ -705,6 +709,20 @@ pub fn disassemble(image: &[u8], at: usize, addr: u32, count: usize) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `disassemble` must not panic on a start offset near the maximum.
+    ///
+    /// `at` is a caller-supplied offset — the `offset == address` model lets
+    /// it be anywhere in range — and the loop's `pos + 2` bounds check ran
+    /// before it could reject the extreme value, overflowing in debug and
+    /// wrapping past the check in release. It now returns nothing, as it does
+    /// for any start past the end.
+    #[test]
+    fn disassemble_at_the_top_of_memory_yields_nothing_rather_than_panicking() {
+        let image = vec![0u8; 0x20];
+        assert!(disassemble(&image, usize::MAX, 0, 4).is_empty());
+        assert!(disassemble(&image, usize::MAX - 1, 0, 4).is_empty());
+    }
 
     #[test]
     fn insn_len_follows_the_top_five_bits() {

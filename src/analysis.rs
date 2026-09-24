@@ -317,7 +317,12 @@ pub fn function_start(image: &[u8], addr: usize, max_scan: usize) -> Option<usiz
         if is_prologue(image, p) {
             return Some(p);
         }
-        if p < 2 || p < lo + 2 {
+        // `p - lo`, not `lo + 2`: `lo` is derived from a caller-supplied
+        // address and `lo + 2` overflows for one near the maximum — a panic in
+        // debug, and in release a wrap that defeats the floor test and scans
+        // the whole address space downward. Comparing the distance instead is
+        // overflow-free (`p >= lo` throughout) and identical everywhere else.
+        if p < 2 || p.saturating_sub(lo) < 2 {
             return None;
         }
         p -= 2;
@@ -642,7 +647,11 @@ pub fn reachable(image: &[u8], entry: usize, limit: usize) -> Reach {
         };
 
         let mut push = |t: usize, state: ItState, out: &mut Reach| {
-            if t + 2 <= image.len() {
+            // `checked_add`, not `t + 2`: `t` is a decoded branch target cast
+            // from `u32`, so on a 32-bit target it can be near the maximum and
+            // this add overflows before the bounds test. On overflow the
+            // target is past the image, which is exactly the `else`.
+            if t.checked_add(2).map_or(false, |end| end <= image.len()) {
                 work.push((t, state));
             } else {
                 out.complete = false;
@@ -768,6 +777,46 @@ pub fn veneer(at: usize, target: u32) -> Option<[u8; 8]> {
 mod tests {
     use super::*;
     use crate::{encode_bl, find_bl_sites, Asm};
+
+    /// `function_start` must not panic or loop on an address near the maximum.
+    ///
+    /// The floor test was `p < lo + 2`, and `lo` derives from the caller's
+    /// address; near the maximum that add overflowed — a panic in debug, and
+    /// in release a wrap that defeated the floor and scanned the whole address
+    /// space downward. It now compares the distance `p - lo` and returns
+    /// promptly.
+    #[test]
+    fn function_start_near_the_top_of_memory_terminates() {
+        let image = vec![0u8; 0x20];
+        assert_eq!(function_start(&image, usize::MAX, 0), None);
+        assert_eq!(function_start(&image, usize::MAX, 64), None);
+        assert_eq!(function_start(&image, usize::MAX - 1, 0), None);
+    }
+
+    /// `reachable` must not panic when a branch target sits near the maximum.
+    ///
+    /// The worklist's `t + 2 <= image.len()` bounds check overflowed for a
+    /// target cast from a `u32` near its maximum (on a 32-bit target), before
+    /// the check could reject it. Such a target is past any real image, so it
+    /// is dropped and the function reports `complete == false`.
+    #[test]
+    fn reachable_with_a_branch_target_near_the_top_is_not_a_panic() {
+        // `b.w` to the far end of the space, then nothing. The target is out
+        // of the image, so the walk marks itself incomplete rather than
+        // following it — and must not overflow computing that.
+        let mut asm = Asm::new();
+        // A wide unconditional branch as raw bytes: `b.w` with a large
+        // displacement. Built via the encoder so the bytes are real.
+        let bytes = crate::encode_b_wide(0, 0x00FF_FFFE).expect("b.w encodes");
+        asm.raw16(u16::from_le_bytes([bytes[0], bytes[1]]));
+        asm.raw16(u16::from_le_bytes([bytes[2], bytes[3]]));
+        let image = asm.finish().expect("assembles");
+        let r = reachable(&image, 0, 16);
+        assert!(
+            !r.complete,
+            "a target past the image leaves the walk incomplete"
+        );
+    }
 
     /// An image of `len` bytes of live (non-`0xFF`) filler.
     fn live(len: usize) -> Vec<u8> {
