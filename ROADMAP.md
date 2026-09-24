@@ -21,9 +21,9 @@ not, is counted section by section in
 ## Near term
 
 - **Close the remaining real mutation survivors.** `cargo-mutants` generates
-  7,624 mutants, of which 7,378 are viable. 6,669 are caught outright and a
+  7,820 mutants, of which 7,569 are viable. 6,835 are caught outright and a
   further 53 hang a loop until the run times out, which is a detected
-  difference — 91.1% between them. Of the 656 that survive, 588 are `|`
+  difference — 91.1% between them. Of the 677 that survive, 594 are `|`
   replaced by `^` over *disjoint* bit-fields and 4 are `r.num() < 16`, which
   `Reg::num` makes unconditionally true; both families are equivalent by
   construction and no test can kill them. Setting those aside gives **99.1%**,

@@ -149,14 +149,14 @@ that wrote `Rd` at bit 12 where the manual says bit 8 survived fourteen tests,
 because the test helper built its expected halfword with the same formula as
 the encoder it was checking.
 
-*Evidence.* The coverage job in `qa.yml`; 545 library tests, 7 conformance
-tests and 32 doctests. Against that, periodic `cargo-mutants` runs: **7,624
-mutants, 91.1% caught, 99.1% once the provably-equivalent families are set
-aside** (588 survivors are `|` replaced by `^` across disjoint bit-fields,
+*Evidence.* The coverage job in `qa.yml`; 601 library tests, 9 conformance
+tests and 36 doctests. Against that, periodic `cargo-mutants` runs: **7,820
+mutants, 91.1% caught, 99.2% once the provably-equivalent families are set
+aside** (594 survivors are `|` replaced by `^` across disjoint bit-fields,
 which computes the same value — and that the fields really are disjoint is not
 an assumption, it is what the 669,696-probe round-trip sweep proves; 4 more
 are `r.num() < 16`, which `Reg::num` makes unconditionally true). The
-remaining **64** survivors are real and are named as such in
+remaining survivors are real and are named as such in
 [`CONFORMANCE.md`](CONFORMANCE.md) and on [`../ROADMAP.md`](../ROADMAP.md),
 rather than rounded away. The run is not decoration: it produced operand
 validation on every `Asm` emitter, tests pinning `first_operand_is_source` and

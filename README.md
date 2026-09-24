@@ -452,7 +452,7 @@ than a tag or a branch, and none of them uses `continue-on-error` anywhere.
   - **mutation testing**, periodically rather than in CI: `cargo-mutants`
     rewrites the source in small mechanical ways and reruns the suite, so a
     surviving mutant is a change to behaviour no test noticed. The latest run
-    is 7,624 mutants, **91.1% caught** — or **99.1%** once the 592 survivors
+    is 7,820 mutants, **91.1% caught** — or **99.2%** once the 598 survivors
     that are provably equivalent (`|` swapped for `^` across disjoint
     bit-fields, and `r.num() < 16`, which is always true) are set aside. It is
     not decoration: it is what produced the `Asm` operand validation, the

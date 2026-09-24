@@ -308,7 +308,7 @@ to this crate's behaviour that the entire suite ran straight past.
 
 ### Result
 
-`cargo-mutants` generates 7,624 mutants across the crate. The run is sharded
+`cargo-mutants` generates 7,820 mutants across the crate. The run is sharded
 across two large spot machines and takes about 20 minutes of wall time. It
 runs the library tests only (`-- --lib`): the LLVM differential suite costs
 47 seconds per invocation and is a separate gate that runs once per push, and
@@ -318,10 +318,10 @@ excluded returned identical per-shard counts.
 
 | outcome | count |
 |---|---:|
-| caught | 6,669 |
-| **missed** | **656** |
-| timeout | 53 |
-| unviable (did not compile) | 246 |
+| caught | 6,835 |
+| **missed** | **677** |
+| timeout | 57 |
+| unviable (did not compile) | 251 |
 
 That is a mutation score of **91.1%**, counting a timeout as detected: a
 mutation that makes a search loop spin forever is a difference the suite
@@ -331,7 +331,7 @@ in a loop bound has exactly that effect.
 
 ### Not every survivor is a gap
 
-588 of the survivors are a single mechanical family: `|` replaced by `^`
+594 of the survivors are a single mechanical family: `|` replaced by `^`
 in an expression ORing **disjoint** bit-fields into a fixed opcode. With no
 overlap the two operators compute the same value, so the mutated program is
 identical to the original and no test can distinguish them. That the fields
