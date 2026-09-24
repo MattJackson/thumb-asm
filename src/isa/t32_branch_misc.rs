@@ -727,7 +727,6 @@ fn psr_fields(spsr: bool, mask: u8) -> Option<&'static str> {
 /// holds a condition. Everything else is unconditional in its own right, and
 /// an instruction made conditional by an enclosing `IT` block must re-encode
 /// to the same halfwords it decoded from.
-// reaches this and `-D warnings` would reject the group on `dead_code`.
 pub(crate) fn encode(insn: &Insn) -> Option<(u16, u16)> {
     if insn.width != Width::Wide {
         return None;

@@ -1339,6 +1339,22 @@ fn toolchain(scratch: &Scratch) -> Option<(Asm, Option<Objdump>)> {
                  \x20 or set THUMB_ASM_LLVM_BIN to a directory containing one.\n\
                  \x20 The rest of the suite is unaffected; nothing here has failed.\n"
             );
+            // A skip is invisible: libtest swallows stdout without
+            // `--nocapture`, so on a machine with no LLVM these tests report
+            // `ok` and `cargo test`'s summary is identical to a run that
+            // corroborated every probe. That is fine for a contributor and
+            // unacceptable for CI, which would otherwise publish a release
+            // claiming differential conformance it never checked.
+            //
+            // So the choice is the caller's: set `THUMB_ASM_REQUIRE_LLVM` and
+            // a missing toolchain is a hard failure instead of a quiet pass.
+            // CI sets it; nobody else has to.
+            if std::env::var_os("THUMB_ASM_REQUIRE_LLVM").is_some() {
+                panic!(
+                    "THUMB_ASM_REQUIRE_LLVM is set but no LLVM assembler was found. \
+                     Refusing to report a pass for conformance checks that did not run."
+                );
+            }
             return None;
         }
     };
@@ -1820,4 +1836,85 @@ fn every_security_extension_encoding_means_to_llvm_what_it_means_to_us() {
         pos += n + 2;
     }
     assert_eq!(pos, bytes.len(), "trailing bytes in the assembled output");
+}
+
+/// Every Arm section number `docs/CONFORMANCE.md` cites for a divergence is
+/// one that `tests/support/divergences.rs` cites for the same divergence.
+///
+/// The two are independent prose about the same facts, which is exactly the
+/// shape that drifts: the allow-list is what the harness actually enforces,
+/// and the document is what a reader checks. An audit found **ten** rows where
+/// they disagreed — `A7.7.24 CPS` where the real section is `A7.7.29`,
+/// `A7.7.242 VTBL/VTBX` where VTBL is not in the M-profile manual at all — and
+/// every one of them had been sitting there being read as authoritative.
+///
+/// This compares the *set of section tokens* per divergence id rather than the
+/// prose, because the two are deliberately worded differently: the allow-list
+/// entry carries the architectural clause, the table carries a summary. What
+/// must not differ is which section a reader is sent to.
+#[test]
+fn the_conformance_document_cites_what_the_allow_list_cites() {
+    let doc = include_str!("../docs/CONFORMANCE.md");
+    let list = include_str!("support/divergences.rs");
+
+    // `A7.7.29`, `A8.6.406`, `A5.2.5`, `B5.2.1` — the shapes used for a
+    // numbered section in either manual.
+    fn sections(text: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let bytes: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            if (bytes[i] == 'A' || bytes[i] == 'B') && i + 1 < bytes.len() {
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == '.') {
+                    j += 1;
+                }
+                let tok: String = bytes[start..j].iter().collect();
+                // At least two dotted components, e.g. `A7.7.29` or `A5.2.5`.
+                if tok.matches('.').count() >= 2 && !tok.ends_with('.') {
+                    out.insert(tok);
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for id_line in list
+        .lines()
+        .filter(|l| l.trim_start().starts_with("id: \""))
+    {
+        let id = id_line
+            .trim()
+            .trim_start_matches("id: \"")
+            .trim_end_matches("\",");
+        // The document row for this id, if the document names it at all.
+        let row = match doc.lines().find(|l| l.contains(&format!("`{id}`"))) {
+            Some(r) => r,
+            None => continue,
+        };
+        // The allow-list entry's citation block: from this id to the next.
+        let from = list.find(&format!("id: \"{id}\"")).unwrap_or(0);
+        let rest = &list[from..];
+        let to = rest[1..]
+            .find("id: \"")
+            .map(|k| k + 1)
+            .unwrap_or(rest.len());
+        let entry = &rest[..to];
+
+        for cited in sections(row) {
+            if !sections(entry).contains(&cited) {
+                missing.push((id.to_string(), cited));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/CONFORMANCE.md cites sections the allow-list does not, so one of \
+         the two is wrong about the manual: {missing:?}"
+    );
 }

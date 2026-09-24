@@ -413,27 +413,27 @@ the manual refuses to define means inventing a meaning for it.
 |---|---|---|---|
 | `t16-cmp-reg-t2-both-low` | `0x4500`–`0x453F` | A7.7.28 CMP (register) T2 | `N:Rm` and `Rn` both low, which T1 already covers, so T2 declares it UNPREDICTABLE. LLVM decodes it. |
 | `t16-bx-should-be-zero-bits` | `0x4700`–`0x477F` | A7.7.20 BX T1, bits[2:0] are `(0)(0)(0)` | A should-be-zero bit is set. LLVM ignores them. |
-| `t16-reserved-hint` | `0xBF50`–`0xBFF0` | A5.2.5 Table A5-11 | A reserved hint. Executes as `NOP` but has no mnemonic; LLVM prints `hint #n`. **Arguably LLVM is more useful here** — see below. |
+| `t16-reserved-hint` | `0xBF50`–`0xBFF0` | A5.2.5 Table A5-7 | A reserved hint. Executes as `NOP` but has no mnemonic; LLVM prints `hint #n`. **Arguably LLVM is more useful here** — see below. |
 | `t16-it-unpredictable-firstcond` | `0xBFE0`–`0xBFFF` | A7.7.38 IT | `firstcond == 0b1111`, or `AL` governing more than one instruction. |
-| `t16-cps-no-flags` | `0xB660`, `0xB670` | A7.7.24 CPS T1 | `CPSIE`/`CPSID` naming no mask. LLVM prints `cpsie none`. |
+| `t16-cps-no-flags` | `0xB660`, `0xB670` | A7.7.29 CPS T1 | `CPSIE`/`CPSID` naming no mask. LLVM prints `cpsie none`. |
 | `t32-ldm-stm-unpredictable-register-list` | `0xE800`–`0xE9FF` | A7.7.41, A7.7.99, A7.7.101, A7.7.159 | list contains SP, or PC and LR together, or fewer than two registers. |
 | `t32-dp-shifted-register-unpredictable` | `0xEA00`–`0xEBFF` | A5.3.11 and the per-instruction clauses | PC or SP in a register field that forbids it, or `hw2[15]`'s `(0)` bit set. |
-| `t32-vfp-load-store-multiple-overrun` | `0xEC00`–`0xEDFF` | A7.7.256 VSTM, A7.7.249 VLDM | register list runs off the end of the bank, or the pre-UAL `FSTMIAX`/`FLDMIAX` odd-length form. |
-| `t32-vmsr-vmrs-reserved-system-register` | `0xEE00`–`0xEFFF` | A7.7.244 VMSR, A7.7.243 VMRS, A7.7.229 VMOV (imm) | a VFP system register the architecture does not define as writable (`FPSID` is read-only), or an Advanced SIMD `cmode`/`op` pair with no meaning. |
+| `t32-vfp-load-store-multiple-overrun` | `0xEC00`–`0xEDFF` | A7.7.258 VSTM, A7.7.235 VLDM | register list runs off the end of the bank, or the pre-UAL `FSTMIAX`/`FLDMIAX` odd-length form. |
+| `t32-vmsr-vmrs-reserved-system-register` | `0xEE00`–`0xEFFF` | A7.7.247 VMSR, A7.7.246 VMRS, DDI 0406B A8.6.326 VMOV (imm) | a VFP system register the architecture does not define as writable (`FPSID` is read-only), or an Advanced SIMD `cmode`/`op` pair with no meaning. |
 | `t32-modified-immediate-unpredictable-constant` | `0xF000`–`0xF1FF`, `0xF400`–`0xF5FF` | A5.3.2 `ThumbExpandImm` | a replication pattern is selected but the byte is zero, which the expansion pseudocode calls UNPREDICTABLE. LLVM evaluates it to `#0`. |
-| `t32-plain-immediate-unpredictable` | `0xF200`–`0xF3FF`, `0xF600`–`0xF7FF` | A7.7.13 BFI, A7.7.83 MSR, A7.7.82 MRS | `msbit < lsbit`; `MSR` with `mask == '00'`; `MRS`/`MSR` with a should-be-one field wrong. |
+| `t32-plain-immediate-unpredictable` | `0xF200`–`0xF3FF`, `0xF600`–`0xF7FF` | A7.7.14 BFI, B5.2.3 MSR, A7.7.82 MRS | `msbit < lsbit`; `MSR` with `mask == '00'`; `MRS`/`MSR` with a should-be-one field wrong. |
 | `t32-branch-misc-smc-hvc` | `0xF7E0`–`0xF7FF` | DDI 0406B B6.1.9 SMC; HVC is Virtualization Extensions, DDI 0406C only | `SMC`/`HVC` with should-be-zero bits set, and `HVC` itself (Virtualization Extensions, not decoded here). |
-| `t32-load-store-single-rt-is-pc` | `0xF800`–`0xF9FF` | A7.7.162 STRB, A7.7.46 LDRB, A7.7.60 LDRSB, A7.7.63 LDRSH and the `…T` forms | transfer register is PC or SP, which no such encoding permits. |
-| `t32-dp-register-pc-operand` | `0xFA00`–`0xFBFF` | A7.7.156 SXTAH, A7.7.172 UXTAH, A7.7.120 SDIV, … (A5.3.12) | an extend, reverse, shift or divide naming PC or SP. |
-| `t32-ldc-stc-vfp-coprocessor-space` | `0xFC00`–`0xFDFF` | A7.7.29 LDC/LDC2 | `LDC2`/`STC2` naming coprocessor 10 or 11, which the architecture reserves for the Advanced SIMD and floating-point space. |
-| `t32-simd-table-lookup-list-overrun` | `0xFF00`–`0xFFFF` | A7.7.242 VTBL/VTBX | the list of table registers runs past `d31`. LLVM decodes it and prints names off the end of its own register table (`{d30, d31, fpinst2, mvfr0}`), which is a fair illustration of why this crate refuses the encoding. |
+| `t32-load-store-single-rt-is-pc` | `0xF800`–`0xF9FF` | A7.7.163 STRB, A7.7.46 LDRB, A7.7.59 LDRSB, A7.7.63 LDRSH and the `…T` forms | transfer register is PC or SP, which no such encoding permits. |
+| `t32-dp-register-pc-operand` | `0xFA00`–`0xFBFF` | A7.7.181 SXTAH, A7.7.220 UXTAH, A7.7.127 SDIV, … (A5.3.12) | an extend, reverse, shift or divide naming PC or SP. |
+| `t32-ldc-stc-vfp-coprocessor-space` | `0xFC00`–`0xFDFF` | DDI 0406B A8.6.51 LDC/LDC2 | `LDC2`/`STC2` naming coprocessor 10 or 11, which the architecture reserves for the Advanced SIMD and floating-point space. |
+| `t32-simd-table-lookup-list-overrun` | `0xFF00`–`0xFFFF` | DDI 0406B A8.6.406 VTBL/VTBX | the list of table registers runs past `d31`. LLVM decodes it and prints names off the end of its own register table (`{d30, d31, fpinst2, mvfr0}`), which is a fair illustration of why this crate refuses the encoding. |
 
 ### Known and justified — the bits carry more than any text can
 
 | id | citation | divergence |
 |---|---|---|
 | `t32-adr-minus-zero`, `t32-adr-minus-zero-rejected` | A7.7.7 ADR T2/T3 | `ADR` with a zero offset: the subtracting T2 and the adding T3 encodings name the same address and no text can say which it came from. |
-| `t32-saturate-bitfield-destination-is-pc` | A7.7.153 SSAT, A7.7.199 USAT, A7.7.13 BFI, … | destination is PC or SP. This crate decodes it; LLVM neither reads nor writes it, so there is no second opinion at all. This is the weakest bucket in the table: it is not corroboration, it is an absence of one. |
+| `t32-saturate-bitfield-destination-is-pc` | A7.7.152 SSAT, A7.7.213 USAT, A7.7.14 BFI, … | destination is PC or SP. This crate decodes it; LLVM neither reads nor writes it, so there is no second opinion at all. This is the weakest bucket in the table: it is not corroboration, it is an absence of one. |
 
 ### Defects this harness found, and their fixes
 
@@ -453,7 +453,7 @@ it caught, not by the fact that it is currently green.
 
 `t16-reserved-hint` — the eleven reserved values in the 16-bit hint space
 (`0xBF50`, `0xBF60`, … `0xBFF0`). The architecture defines them: they are
-reserved hints and they execute as `NOP` (A5.2.5, Table A5-11). This crate
+reserved hints and they execute as `NOP` (A5.2.5, Table A5-7). This crate
 returns `None` for them, so a disassembly of firmware that contains one shows
 `.short 0xbf50` instead of an instruction, and the instruction-length walk is
 unaffected but the listing is less useful. LLVM prints `hint #5`. Decoding

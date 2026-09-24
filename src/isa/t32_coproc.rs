@@ -2277,8 +2277,17 @@ fn encode_convert_fixed(insn: &Insn) -> Option<(u16, u16)> {
                     // `<fbits>` is `size - UInt(imm4:i)`, so the field is
                     // `size - <fbits>` and must still fit in five bits.
                     let size = if sx == 1 { 32 } else { 16 };
+                    // Range-checked *before* the subtraction, not after.
+                    // `Operand::Imm` carries a full `i64` the caller sets, so
+                    // `size - frac` with `frac` near `i64::MIN` overflows —
+                    // which aborts in any build with overflow checks on,
+                    // including every `cargo test` run, before the guard below
+                    // can reject it. Every sibling immediate in this crate
+                    // checks the range first; this site had the order
+                    // inverted.
                     let field = match insn.operands.get(2) {
-                        Some(Operand::Imm(frac)) => size - frac,
+                        Some(Operand::Imm(frac)) if (0..=32).contains(&frac) => size - frac,
+                        Some(Operand::Imm(_)) => return None,
                         _ => return None,
                     };
                     if !(0..32).contains(&field) {

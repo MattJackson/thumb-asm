@@ -128,9 +128,6 @@ pub(crate) fn decode(hw1: u16, _hw2: u16, addr: u32) -> Option<Insn> {
 /// `"T1"` encoding name, a narrow width, the exact operand shape of the form,
 /// and low registers throughout. `cond` is not consulted — the halfword has no
 /// condition field, and an instruction inside an IT block encodes identically.
-// reaches this and `-D warnings` would reject the group on `dead_code`. The
-// allow goes away the moment `isa::mod` grows the re-encode dispatcher that
-// calls each group's `encode`.
 pub(crate) fn encode(insn: &Insn) -> Option<u16> {
     if insn.width != Width::Narrow || insn.encoding != "T1" || insn.explicit_width {
         return None;

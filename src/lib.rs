@@ -1142,8 +1142,26 @@ impl Asm {
         }
         // 1. code-position branches (targets already bound during emit).
         for (pos, label, uncond) in core::mem::take(&mut self.fixups) {
-            let target = self.labels[label as usize]
-                .ok_or_else(|| AsmError(format!("unbound label {label}")))?;
+            // `get`, not `self.labels[..]`. The id is the caller's: `bind`
+            // validates it through `get_mut` and reports "never reserved" as
+            // an error, but the emitters that push fixups — `b`, `b_cond`,
+            // `adr` — do not, so an id that was never handed out by `label()`
+            // arrives here unchecked. Indexing raw turns a would-be
+            // `AsmError` into a panic, which contradicts this type's whole
+            // contract that a bad operand is an error.
+            //
+            // The two failures are distinguished because they are different
+            // mistakes: an id nobody reserved is a bug at the call site, and
+            // a reserved id never bound is a missing `bind`.
+            let target = match self.labels.get(label as usize) {
+                Some(Some(t)) => *t,
+                Some(None) => return Err(AsmError(format!("unbound label {label}"))),
+                None => {
+                    return Err(AsmError(format!(
+                        "label {label} was never reserved by `label()`"
+                    )))
+                }
+            };
             let off = (target as i32 - (pos as i32 + 4)) / 2;
             let enc = if uncond {
                 if !(-1024..=1023).contains(&off) {
@@ -1197,13 +1215,25 @@ impl Asm {
             while self.code.len() % 4 != 0 {
                 self.code.push(0x00);
             }
+            // Indexed directly, unlike the fixup loops above, and safely so:
+            // `self.blobs` has exactly one producer, `data_blob`, which calls
+            // `self.label()` itself and returns that id. So a blob's label is
+            // always one this `Asm` reserved. The *reader* below is different
+            // — `adr` takes the id from the caller — and is guarded.
             self.labels[label as usize] = Some(self.code.len());
             self.code.extend_from_slice(&bytes);
         }
         // 4. adr fixups (blob labels now bound).
         for (pos, label) in core::mem::take(&mut self.adrs) {
-            let target = self.labels[label as usize]
-                .ok_or_else(|| AsmError(format!("unbound blob label {label}")))?;
+            let target = match self.labels.get(label as usize) {
+                Some(Some(t)) => *t,
+                Some(None) => return Err(AsmError(format!("unbound blob label {label}"))),
+                None => {
+                    return Err(AsmError(format!(
+                        "blob label {label} was never reserved by `label()`"
+                    )))
+                }
+            };
             let base = (pos as u32 + 4) & !3;
             let imm = target as u32;
             if imm < base || (imm - base) % 4 != 0 || (imm - base) / 4 > 0xFF {
@@ -2388,6 +2418,65 @@ fn round_up(v: usize, align: usize) -> usize {
 #[cfg(test)]
 #[path = "thumb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod unreserved_label_tests {
+    use super::*;
+
+    /// A label id that was never handed out by `label()` is an error, not a
+    /// panic — on every path that accepts one.
+    ///
+    /// `bind` has always validated the id through `get_mut`, and
+    /// `thumb_tests::binding_a_label_that_was_never_reserved_is_an_error_not_a_panic`
+    /// pins that. The emitters that record a fixup — `b`, `b_cond`, `adr`,
+    /// `blob` — did not, and `finish` then indexed `self.labels` raw, so the
+    /// same bad id aborted the process instead of returning `AsmError`. The
+    /// existing unbound-label tests all call `label()` first, so they
+    /// exercised reserved-but-unbound and never never-reserved.
+    #[test]
+    fn a_label_never_reserved_is_refused_by_every_path_that_takes_one() {
+        // A conditional branch to an id nobody reserved.
+        let mut a = Asm::new();
+        a.b_cond(Cond::Eq, 7);
+        let err = a.finish().expect_err("an unreserved label must not panic");
+        // Bound before asserting: a format argument is only evaluated when
+        // the assertion fails, so inline it is dead on every passing run.
+        let msg = err.message().to_string();
+        assert!(msg.contains("never reserved"), "{msg}");
+
+        // An unconditional branch, which takes a different fixup path.
+        let mut a = Asm::new();
+        a.b(9);
+        let err = a.finish().expect_err("an unreserved label must not panic");
+        assert!(err.message().contains("never reserved"));
+
+        // `adr` to a blob label nobody reserved.
+        let mut a = Asm::new();
+        a.adr(0, 3);
+        let err = a
+            .finish()
+            .expect_err("an unreserved blob label must not panic");
+        assert!(err.message().contains("never reserved"));
+
+        // Note there is deliberately no case here for a *blob* recorded
+        // against an unreserved label: `data_blob` reserves its own id and is
+        // the only producer, so that path cannot be reached from the public
+        // API and guarding it would be an unreachable branch.
+    }
+
+    /// Reserved-but-never-bound stays distinguishable from never-reserved:
+    /// they are different mistakes and deserve different messages.
+    #[test]
+    fn a_reserved_but_unbound_label_reports_separately() {
+        let mut a = Asm::new();
+        let l = a.label();
+        a.b_cond(Cond::Eq, l);
+        let err = a.finish().expect_err("never bound");
+        let msg = err.message().to_string();
+        assert!(msg.contains("unbound label"), "{msg}");
+        assert!(!msg.contains("never reserved"));
+    }
+}
 
 #[cfg(test)]
 mod command_table_overflow_tests {

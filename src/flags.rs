@@ -393,20 +393,47 @@ pub fn live_after(image: &[u8], at: usize, target: Target, limit: usize) -> Flag
 
 /// Walk forward from `pos`, reporting which flags are read before they are
 /// rewritten.
+///
+/// Uses [`Decoder`](isa::Decoder), not [`isa::decode_at_with`], and the
+/// difference is load-bearing rather than stylistic. The stateless decode
+/// knows nothing about an enclosing `IT` block, and an `IT` block breaks this
+/// walk in *both* directions at once:
+///
+/// - A governed instruction comes back with `cond: None`, so [`reads`] sees no
+///   condition and reports no flag read. `itt eq` / `addeq` reads Z, and a
+///   stateless walk cannot tell.
+/// - `setflags = !InITBlock()` (A7.7.4 and every narrow data-processing page)
+///   means a governed `adds` does **not** write the flags — but the stateless
+///   decode reports `sets_flags: true`, so [`writes`] resolves flags that are
+///   in fact untouched.
+///
+/// Both mistakes point the same way: fewer flags reported live. That is the
+/// direction that licenses a rewrite to clobber something still in use, and it
+/// inverts the guarantee [`live_after`] makes.
+///
+/// `Decoder` tracks `ITSTATE` forward from `pos`, which fixes every block that
+/// *begins* within the walk. A block already in progress at `pos` cannot be
+/// detected from `pos` alone — a Thumb stream does not decode backwards — so
+/// `pos` is required to be an instruction boundary outside any `IT` block.
+/// The in-crate caller satisfies this: `detour` refuses a site inside an `IT`
+/// block before it ever asks about flags.
 fn live_from(image: &[u8], pos: usize, target: Target, limit: usize) -> Flags {
     let mut unresolved = Flags::ALL;
     let mut live = Flags::NONE;
-    let mut pos = pos;
 
-    for _ in 0..limit {
+    let mut decoder = isa::Decoder::at(image, pos, pos as u32).target(target);
+    let mut seen = 0usize;
+    while seen < limit {
         if unresolved.is_empty() {
             break;
         }
-        let insn = match isa::decode_at_with(image, pos, pos as u32, target) {
+        let insn = match decoder.next() {
             Some(i) => i,
-            // Unknown bytes: anything still unresolved has to be assumed read.
+            // Unknown bytes or the end of the image: anything still unresolved
+            // has to be assumed read.
             None => return live.union(unresolved),
         };
+        seen += 1;
 
         // A flag read before it is written is live. Only flags still
         // unresolved count — one already overwritten holds a different value.
@@ -420,7 +447,6 @@ fn live_from(image: &[u8], pos: usize, target: Target, limit: usize) -> Flags {
         if insn.is_branch() || insn.writes_pc() {
             return live.union(unresolved);
         }
-        pos += insn.len();
     }
     live.union(unresolved)
 }
@@ -523,6 +549,32 @@ mod tests {
         let msr = at(0xF380, 0x8800); // msr apsr_nzcvq, r0
         assert_eq!(msr.mnemonic, "msr");
         assert_eq!(writes(&msr), Flags::ALL, "MSR replaces the whole APSR");
+    }
+
+    /// An `IT` block must not make its governed instructions' flag reads
+    /// invisible.
+    ///
+    /// This is the defect a stateless walk has, and it is unsafe in two ways
+    /// at once. `addeq` reads Z, but decoded without `ITSTATE` it carries
+    /// `cond: None` and looks like it reads nothing. And
+    /// `setflags = !InITBlock()` means a governed `add` does *not* write the
+    /// flags, yet the stateless decode reports `sets_flags: true` and so
+    /// resolves flags that were never touched. Both errors report fewer flags
+    /// live — the direction that licenses clobbering one still in use.
+    #[test]
+    fn a_conditional_instruction_inside_an_it_block_still_reads_its_flags() {
+        // nop / itt eq / addeq r1,#1 / addeq r2,#1 / bx lr
+        //
+        // Nothing writes the flags before the block, so Z reaches the `addeq`
+        // still holding whatever the caller set — which is exactly when a
+        // rewrite must not clobber it.
+        let image = [0x00, 0xbf, 0x04, 0xbf, 0x01, 0x31, 0x01, 0x32, 0x70, 0x47];
+        let live = live_after(&image, 0, Target::Union, 12);
+        assert!(
+            live.z,
+            "the IT block's condition is EQ, which reads Z — a stateless walk \
+             would miss it and report Z dead"
+        );
     }
 
     /// `MSR APSR_g` writes the GE bits and no condition flag at all.

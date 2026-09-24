@@ -296,11 +296,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends llvm clang
           clang --version
       - name: Sweep the encoding space against LLVM
-        # `--nocapture` is load-bearing, not debugging noise. The harness skips
-        # cleanly when no toolchain is present, so without the banner and the
-        # outcome tables in the log a green run cannot be distinguished from a
-        # run that checked nothing. `--test-threads=1` only keeps the four
-        # sweeps' tables from interleaving for a human reader.
+        # `THUMB_ASM_REQUIRE_LLVM` turns a missing toolchain from a quiet skip
+        # into a hard failure. Without it this job can go green having checked
+        # nothing at all: the harness skips cleanly by design so contributors
+        # without LLVM are not blocked, libtest swallows the skip banner, and
+        # `cargo test`'s summary is then identical to a run that corroborated
+        # every probe. That is exactly how a release could claim differential
+        # conformance it never performed.
+        #
+        # `--nocapture` keeps the banner and outcome tables in the log for a
+        # human reader; `--test-threads=1` only stops the sweeps' tables
+        # interleaving. Neither is what makes the job trustworthy — the
+        # environment variable is.
+        env:
+          THUMB_ASM_REQUIRE_LLVM: "1"
         run: cargo test --test conformance -- --nocapture --test-threads=1
 
   semver:
