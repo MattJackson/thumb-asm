@@ -69,6 +69,32 @@ The 16-bit digest is unchanged: `0x0e06fda25d6b89e8`.
   displaced instruction's original address, and a site where any flag survives
   is still refused.
 
+### Hardened
+
+- **A ten-lens audit of the new liveness code and the modules around it**,
+  looped to convergence over six rounds. It confirmed 27 defects, all fixed
+  here. The four high-severity ones were all in this release's own `flags`
+  code and all erred toward reporting a flag *dead* — the direction that turns
+  a refusal into a silent clobber: `live_after` following a literal load's
+  `Target` into the pool and decoding data as code; `live_from` walking with
+  the stateless decoder and so missing an `IT` block's flag reads and its
+  `setflags = !InITBlock()` suppression; `reads` missing `RRX` used as a shift
+  operand; and `writes` claiming `MSR APSR_g` touches the condition flags when
+  it writes only the GE bits.
+
+- **An integer-overflow class, fixed in six places.** Arithmetic on a
+  caller-supplied `u32`/`usize` address done before the bounds check meant to
+  reject an extreme value — a panic in debug, a wrapped and wrong result in
+  release — in `CommandTable::find`, `widen_compare_branch`, `build_stub`,
+  `disassemble`, `function_start` and `reachable`. A crate that must never
+  crash on caller input now refuses these rather than overflowing.
+
+- **Every ARMv8-M / VFP citation in `docs/CONFORMANCE.md` corrected** (twelve
+  section numbers that named the wrong instruction), and the document is now
+  pinned to `tests/support/divergences.rs` by a test, so the two cannot drift
+  again. `Asm::finish` also stopped indexing its label table with an
+  unvalidated caller id, and several stale comment fragments were removed.
+
 ### Deferred
 
 - **The `UNPREDICTABLE` channel on `Insn`**, again. It needs
