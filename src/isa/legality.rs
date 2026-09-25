@@ -207,4 +207,14 @@ mod tests {
     fn encform_from_str_panics_on_unknown_form() {
         let _ = EncForm::from("A1");
     }
+
+    /// Every `EncForm` string the decoder attaches round-trips through
+    /// `From<&str>`. Keeps every arm of the `match` live under mutation.
+    #[test]
+    fn encform_from_str_covers_every_known_form() {
+        assert_eq!(EncForm::from("T1"), EncForm::T1);
+        assert_eq!(EncForm::from("T2"), EncForm::T2);
+        assert_eq!(EncForm::from("T3"), EncForm::T3);
+        assert_eq!(EncForm::from("T4"), EncForm::T4);
+    }
 }

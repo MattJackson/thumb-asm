@@ -306,8 +306,8 @@ pub struct DetourOptions {
     /// Threads through every decoder call the detour path makes — the
     /// displaced-instruction sweep, the flag-liveness analysis, the
     /// stub verifier, and the post-relocation re-decode. Default is
-    /// [`isa::Target::Union`], which reproduces the pre-0.14 behaviour byte
-    /// for byte. Set to [`isa::Target::V8M`] on an Armv8-M image so that a
+    /// [`crate::isa::Target::Union`], which reproduces the pre-0.14 behaviour byte
+    /// for byte. Set to [`crate::isa::Target::V8M`] on an Armv8-M image so that a
     /// Security Gateway at the hook site is decoded as `sg` (not as a
     /// phantom `LDRD` whose bytes the detour would then follow) — the load-
     /// bearing correctness fix Fable's audit named.

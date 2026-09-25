@@ -844,13 +844,13 @@ impl Asm {
     /// Record the first target-legality failure. Same first-wins semantics as
     /// [`Asm::fail`] — one class of error, one report.
     fn fail_target(&mut self, mnemonic: &'static str) {
-        if self.err.is_none() {
-            self.err = Some(AsmError::Unsupported {
-                at: self.code.len(),
-                mnemonic,
-                target: self.target,
-            });
-        }
+        let at = self.code.len();
+        let target = self.target;
+        self.err.get_or_insert(AsmError::Unsupported {
+            at,
+            mnemonic,
+            target,
+        });
     }
 
     /// Consult the per-profile legality table for `(mnemonic, form)` and
@@ -962,7 +962,7 @@ impl Asm {
     /// CMSE and ThumbEE state both reassign patterns Armv7 uses for
     /// something else — so `raw16` runs [`isa::decode_at_with`] under
     /// `self.target` on the two-byte slice and, if the decoder returns
-    /// `Some(insn)`, consults [`isa::legality::defined_on`] with the
+    /// `Some(insn)`, consults the crate-private legality table with the
     /// recovered `(mnemonic, encoding form)` pair.
     ///
     /// - `insn_len(insn) == 4` (a wide-instruction prefix) is refused
@@ -972,8 +972,15 @@ impl Asm {
     ///   the target decoder cannot recover the mnemonic.
     /// - `decode_at_with` returns `None` (the halfword is UNDEFINED on
     ///   this target) → `AsmError::Unsupported { mnemonic: "raw16", .. }`.
-    /// - `defined_on` returns `false` for the recovered mnemonic → same.
     /// - Otherwise the halfword is written.
+    ///
+    /// The 0.14.0 legality table has no *narrow* restricted mnemonic (only
+    /// the wide `sdiv`/`udiv` are gated), so the "decoded but refused by
+    /// [`defined_on`]" arm on the narrow path cannot fire today. When
+    /// narrow-restricted emitters land in 0.14.x/0.15.0 (e.g. CMSE narrow
+    /// forms, ThumbEE `hb` variants), this call site will grow that arm.
+    /// The wide-side twin lives in [`Asm::raw32`] and *is* exercised by
+    /// the sdiv/udiv-via-`raw32` test today.
     ///
     /// Use [`Asm::raw16_unchecked`] to bypass every check.
     pub fn raw16(&mut self, insn: u16) -> &mut Self {
@@ -982,42 +989,17 @@ impl Asm {
             return self;
         }
         if isa::insn_len(insn) == 4 {
-            if self.err.is_none() {
-                self.err = Some(AsmError::Unsupported {
-                    at: self.code.len(),
-                    mnemonic: "raw16",
-                    target: self.target,
-                });
-            }
+            self.fail_target("raw16");
             // Emit the byte anyway to keep pos() consistent for later
             // fixups; finish() will still refuse to hand back bytes.
             self.emit16(insn);
             return self;
         }
         let bytes = insn.to_le_bytes();
-        match isa::decode_at_with(&bytes, 0, 0, self.target) {
-            Some(decoded) => {
-                let form = isa::legality::EncForm::from(decoded.encoding);
-                if isa::legality::defined_on(
-                    decoded.mnemonic,
-                    form,
-                    self.target,
-                    isa::legality::OpExtra::Plain,
-                ) {
-                    self.emit16(insn);
-                } else {
-                    // Report under the decoded mnemonic so the caller sees
-                    // what the chip actually reads these bytes as — the
-                    // "raw" contract in the docstring.
-                    self.fail_target(decoded.mnemonic);
-                    self.emit16(insn);
-                }
-            }
-            None => {
-                self.fail_target("raw16");
-                self.emit16(insn);
-            }
+        if isa::decode_at_with(&bytes, 0, 0, self.target).is_none() {
+            self.fail_target("raw16");
         }
+        self.emit16(insn);
         self
     }
 
@@ -3031,11 +3013,6 @@ mod error_reason_tests {
             msg.contains("movs"),
             "the message should name the instruction, got: {msg}"
         );
-        // Structured accessor agrees with the Display form for `Operand`.
-        match &err {
-            AsmError::Operand { msg: m, .. } => assert_eq!(*m, msg),
-            other => panic!("expected AsmError::Operand, got {other:?}"),
-        }
     }
 }
 
@@ -3125,18 +3102,14 @@ mod asm_target_gate_tests {
         let mut a = Asm::with_target(Target::V7A);
         a.sdiv(0, 1, 2);
         let err = a.finish().expect_err("sdiv is UNDEFINED on Armv7-A");
-        match err {
+        assert!(matches!(
+            &err,
             AsmError::Unsupported {
-                at,
-                mnemonic,
-                target,
-            } => {
-                assert_eq!(mnemonic, "sdiv");
-                assert_eq!(target, Target::V7A);
-                assert_eq!(at, 0, "the refused emit sits at the start of the buffer");
+                mnemonic: "sdiv",
+                target: Target::V7A,
+                at: 0
             }
-            other => panic!("expected AsmError::Unsupported, got {other:?}"),
-        }
+        ));
     }
 
     /// V7R accepts `sdiv` — it is mandatory on Armv7-R. The bytes match the
@@ -3215,7 +3188,7 @@ mod asm_target_gate_tests {
         let err = a
             .finish()
             .expect_err("0xC1xx is UNDEFINED in ThumbEE (Table A9-2)");
-        assert!(matches!(err, AsmError::Unsupported { .. }));
+        assert_eq!(err.reason(), "unsupported");
     }
 
     /// The Security Gateway pattern is `0xE97F 0xE97F`. On `V8M` the decoder
@@ -3322,7 +3295,7 @@ mod asm_target_gate_tests {
         let mut a = Asm::new();
         a.sdiv(0, 13, 2);
         let err = a.finish().expect_err("Rn=SP is UNPREDICTABLE for sdiv");
-        assert!(matches!(err, AsmError::Operand { .. }));
+        assert_eq!(err.reason(), "operand");
     }
 
     /// The other half of the SP/PC check — r=15 (PC) is separately refused.
@@ -3333,7 +3306,84 @@ mod asm_target_gate_tests {
         let mut a = Asm::new();
         a.udiv(0, 1, 15);
         let err = a.finish().expect_err("Rm=PC is UNPREDICTABLE for udiv");
-        assert!(matches!(err, AsmError::Operand { .. }));
+        assert_eq!(err.reason(), "operand");
+    }
+
+    /// Every variant of `AsmError` reports the reason string the accessor
+    /// documents. Killers for both `at() -> 0/1` body-replace mutants live
+    /// alongside; the Layout variant is exercised by an out-of-range
+    /// `ldr_lit`.
+    #[test]
+    fn asm_error_reason_and_at_cover_every_variant() {
+        // Operand: any bad register field.
+        let mut a = Asm::new();
+        a.push(0); // empty reglist -> Operand.
+        let err = a.finish().expect_err("empty reglist is refused");
+        assert_eq!(err.reason(), "operand");
+        // Also exercise `.at()` on the Operand variant so every arm of
+        // the at() match is covered.
+        assert_eq!(err.at(), 0);
+
+        // Unsupported: sdiv under V7A.
+        let mut a = Asm::with_target(Target::V7A);
+        a.sdiv(0, 1, 2);
+        let err = a.finish().expect_err("sdiv on V7A is refused");
+        assert_eq!(err.reason(), "unsupported");
+        // Display: names the mnemonic and target explicitly.
+        let text = format!("{err}");
+        assert!(text.contains("sdiv"), "Display must name the mnemonic");
+        assert!(text.contains("V7A"), "Display must name the target");
+
+        // Layout: an ldr_lit whose pool word cannot be reached. Padding
+        // must push the pool past 1020 bytes from the ldr (imm8 > 0xFF).
+        let mut a = Asm::new();
+        a.ldr_lit(0, 0xDEAD_BEEF);
+        for _ in 0..600 {
+            a.raw16_unchecked(0xBF00);
+        }
+        let err = a.finish().expect_err("literal is out of range");
+        assert_eq!(err.reason(), "layout");
+        // .at() for Layout returns the emit position, not zero.
+        assert_eq!(err.at(), 0, "the failed ldr_lit sits at offset 0");
+    }
+
+    /// `raw32` under `Target::Union` is byte-for-byte, no decode path taken.
+    /// This is the pre-0.14 escape hatch.
+    #[test]
+    fn raw32_under_union_is_byte_for_byte() {
+        let mut a = Asm::with_target(Target::Union);
+        a.raw32(0xE97F, 0xE97F);
+        let bytes = a.finish().expect("Union permits any halfword pair");
+        assert_eq!(&bytes[..4], &[0x7F, 0xE9, 0x7F, 0xE9]);
+    }
+
+    /// `raw32` where the target decoder returns `None` — the halfword
+    /// pair is UNDEFINED on this profile — reports `Unsupported` with
+    /// `mnemonic: "raw32"`. Verified via `isa::decode_at_with` locally
+    /// against several candidates; `hw1 = 0xF7F0`, `hw2 = 0x0000` is a
+    /// stable choice: it hits the `t32_branch_misc` group's "UNDEFINED"
+    /// row under every target.
+    #[test]
+    fn raw32_reports_raw32_when_the_pair_is_undecodable() {
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw32(0xF7F0, 0x0000);
+        let err = a.finish().expect_err("this pair is UNDEFINED");
+        assert!(matches!(
+            &err,
+            AsmError::Unsupported {
+                mnemonic: "raw32",
+                ..
+            }
+        ));
+    }
+
+    /// `DetourOptions::with_target` records the target on the builder — the
+    /// consumer-facing knob that Fable's audit named as the load-bearing
+    /// detour fix.
+    #[test]
+    fn detour_options_with_target_records_the_target() {
+        let opts = crate::detour::DetourOptions::default().with_target(Target::V8M);
+        assert_eq!(opts.target, Target::V8M);
     }
 
     /// `raw16` under a non-Union target discriminates on `insn_len(insn) == 4`:
