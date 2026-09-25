@@ -161,13 +161,22 @@ pub struct Xref {
 /// assert_eq!((refs[1].at, refs[1].kind, refs[1].via), (0x40, XrefKind::LiteralPool, None));
 /// ```
 pub fn xrefs(image: &[u8], target: u32) -> Vec<Xref> {
+    xrefs_with(isa::Target::Union, image, target)
+}
+
+/// Same as [`xrefs`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. Threading `Target::V8M` (or `Target::ThumbEE`) matters
+/// on images whose Union decoding invents phantom pc-relative literal
+/// reads out of CMSE gateways — every one of those becomes a spurious
+/// [`XrefKind::LiteralRef`] against whatever the fake `LDRD` "resolves" to.
+pub fn xrefs_with(profile: isa::Target, image: &[u8], target: u32) -> Vec<Xref> {
     let want = target & !1;
     let mut out: Vec<Xref> = Vec::new();
 
     // Kinds 1, 2 and 4: instruction-derived, so walked instruction-accurately
     // from offset 0 with the flat offset == address mapping the rest of the
     // crate uses.
-    let mut d = Decoder::at(image, 0, 0);
+    let mut d = Decoder::at(image, 0, 0).target(profile);
     loop {
         let at = d.pos();
         if at + 2 > image.len() {
@@ -310,6 +319,21 @@ fn xref_kind(insn: &Insn, want: u32) -> Option<XrefKind> {
 /// assert_eq!(function_start(&image, 0x04, 2), None);
 /// ```
 pub fn function_start(image: &[u8], addr: usize, max_scan: usize) -> Option<usize> {
+    function_start_with(isa::Target::Union, image, addr, max_scan)
+}
+
+/// Same as [`function_start`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. Target-invariant today — the prologue patterns
+/// [`function_start`] recognises (`PUSH {…, lr}` T1/T2/T3) are baseline
+/// encodings the decoder treats identically across every profile — but the
+/// overload is here for API consistency and forward-compat with a CMSE
+/// gateway prologue detector.
+pub fn function_start_with(
+    _target: isa::Target,
+    image: &[u8],
+    addr: usize,
+    max_scan: usize,
+) -> Option<usize> {
     let addr = addr & !1;
     let lo = addr.saturating_sub(max_scan);
     let mut p = addr;
@@ -392,7 +416,17 @@ fn is_prologue(image: &[u8], at: usize) -> bool {
 /// assert_eq!(literal_value(&image, 0x02), Some(0xDEAD_BEEF));
 /// ```
 pub fn literal_value(image: &[u8], at: usize) -> Option<u32> {
-    let insn = isa::decode_at_with(image, at, at as u32, isa::Target::Union)?;
+    literal_value_with(isa::Target::Union, image, at)
+}
+
+/// Same as [`literal_value`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. Threading `Target::V8M` matters on images that mix
+/// CMSE gateways with genuine pc-relative literal loads: under `Union` a
+/// `SG` decodes as a spurious `LDRD` whose "literal pool" address the
+/// caller then follows into whatever bytes sit at that offset. See
+/// [`crate::can_install_with`] for the parallel install-side story.
+pub fn literal_value_with(target: isa::Target, image: &[u8], at: usize) -> Option<u32> {
+    let insn = isa::decode_at_with(image, at, at as u32, target)?;
     if insn.mnemonic != "ldr" {
         return None;
     }
@@ -573,6 +607,15 @@ pub struct Reach {
 /// assert_eq!(r.unresolved, vec![4, 8]); // the two returns
 /// ```
 pub fn reachable(image: &[u8], entry: usize, limit: usize) -> Reach {
+    reachable_with(isa::Target::Union, image, entry, limit)
+}
+
+/// Same as [`reachable`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. Threading a specific target matters on V8-M images
+/// where the Union decoder invents phantom pc-relative literal reads out
+/// of `SG` and `BXNS` — an over-approximation that pulls the walk into
+/// bytes the chip does not actually reach.
+pub fn reachable_with(target: isa::Target, image: &[u8], entry: usize, limit: usize) -> Reach {
     let mut out = Reach {
         complete: true,
         ..Reach::default()
@@ -609,7 +652,7 @@ pub fn reachable(image: &[u8], entry: usize, limit: usize) -> Reach {
             out.complete = false;
             break;
         }
-        let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
+        let insn = match isa::decode_at_with(image, at, at as u32, target) {
             Some(i) => i,
             None => {
                 // Data, or an encoding this crate does not know. Either way the

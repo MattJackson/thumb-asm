@@ -301,6 +301,17 @@ pub struct DetourOptions {
     /// an IT block or in the middle of a 32-bit instruction is refused. Worth
     /// supplying whenever a function entry point is known.
     pub scan_from: Option<usize>,
+    /// Which ISA target the image is built for.
+    ///
+    /// Threads through every decoder call the detour path makes — the
+    /// displaced-instruction sweep, the flag-liveness analysis, the
+    /// stub verifier, and the post-relocation re-decode. Default is
+    /// [`isa::Target::Union`], which reproduces the pre-0.14 behaviour byte
+    /// for byte. Set to [`isa::Target::V8M`] on an Armv8-M image so that a
+    /// Security Gateway at the hook site is decoded as `sg` (not as a
+    /// phantom `LDRD` whose bytes the detour would then follow) — the load-
+    /// bearing correctness fix Fable's audit named.
+    pub target: crate::isa::Target,
 }
 
 impl Default for DetourOptions {
@@ -313,6 +324,7 @@ impl Default for DetourOptions {
             stub_at: None,
             rewrite_compare_branches: false,
             scan_from: None,
+            target: crate::isa::Target::Union,
         }
     }
 }
@@ -365,6 +377,18 @@ impl DetourOptions {
     /// Set [`scan_from`](Self::scan_from).
     pub fn with_scan_from(mut self, at: usize) -> Self {
         self.scan_from = Some(at);
+        self
+    }
+
+    /// Set [`target`](Self::target).
+    ///
+    /// On an image whose ISA profile is known, threading it through here
+    /// makes every decoder call the detour path runs (displaced-instruction
+    /// sweep, flag liveness, stub verifier) honour it — which is what stops
+    /// the detour from misreading an Armv8-M `SG` at the hook site as a
+    /// phantom `LDRD`.
+    pub fn with_target(mut self, target: crate::isa::Target) -> Self {
+        self.target = target;
         self
     }
 }
@@ -810,7 +834,7 @@ fn plan(
         });
     }
 
-    let insns = displaced_at(image, site, opts.scan_from)?;
+    let insns = displaced_at(image, site, opts.scan_from, opts.target)?;
     // Liveness is measured here, against the image, at each instruction's
     // original address — the only place it can be. Once an instruction is
     // moved into the stub it has no successors yet, so the question "are the
@@ -825,7 +849,7 @@ fn plan(
                 crate::flags::live_after(
                     image,
                     i.addr as usize,
-                    crate::isa::Target::Union,
+                    opts.target,
                     FLAG_WALK_LIMIT,
                 )
             })
@@ -973,6 +997,7 @@ fn displaced_at(
     image: &[u8],
     site: usize,
     scan_from: Option<usize>,
+    target: crate::isa::Target,
 ) -> Result<Vec<Insn>, DetourError> {
     let start = scan_from.unwrap_or(site);
     if start > site {
@@ -982,7 +1007,7 @@ fn displaced_at(
         });
     }
 
-    let mut d = Decoder::at(image, start, start as u32);
+    let mut d = Decoder::at(image, start, start as u32).target(target);
     while d.pos() < site {
         if d.next().is_none() {
             return Err(DetourError::Undecodable { at: d.pos() });
@@ -2354,7 +2379,8 @@ mod tests {
                     let opts = DetourOptions::new()
                         .with_kind(kind)
                         .with_convention(convention);
-                    let insns = displaced_at(&image, site, None).unwrap();
+                    let insns =
+                        displaced_at(&image, site, None, crate::isa::Target::Union).unwrap();
                     let need = prologue_len(&opts) + 2 + 4 * insns.len() + 4;
                     let d = detour(&mut image, site, HOOK, opts).unwrap();
                     assert!(

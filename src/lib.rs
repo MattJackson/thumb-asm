@@ -2187,6 +2187,25 @@ impl std::error::Error for InstallHazard {}
 /// );
 /// ```
 pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), InstallHazard> {
+    can_install_with(isa::Target::Union, image, site, kind)
+}
+
+/// Same as [`can_install`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. This is the load-bearing surface for the 0.14.0 detour
+/// path: under `Target::Union` an Armv8-M `SG` at the hook site decodes as
+/// a plain `LDRD` (the whole reason [`isa::Target`] exists — 0.12.0), so
+/// `can_install` silently green-lights overwriting the Security Gateway.
+/// A caller who passes `Target::V8M` gets the honest answer, which is
+/// still `Ok(())` today because `SG` is a legal instruction on that target,
+/// but sets the stage for follow-on hazards
+/// (`InstallHazard::SecureGateway`, planned for 0.14.x) to fire from this
+/// path.
+pub fn can_install_with(
+    target: isa::Target,
+    image: &[u8],
+    site: usize,
+    kind: BranchKind,
+) -> Result<(), InstallHazard> {
     let _ = kind; // every kind this crate installs is four bytes.
     if site.checked_add(4).map_or(true, |end| end > image.len()) {
         return Err(InstallHazard::OutOfBounds {
@@ -2196,7 +2215,7 @@ pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), In
     }
     let mut at = site;
     while at < site + 4 {
-        let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
+        let insn = match isa::decode_at_with(image, at, at as u32, target) {
             Some(i) => i,
             None => return Err(InstallHazard::NotAnInstruction { site: at }),
         };
@@ -2252,7 +2271,18 @@ pub fn can_install(image: &[u8], site: usize, kind: BranchKind) -> Result<(), In
 /// ));
 /// ```
 pub fn classify_branch(image: &[u8], at: usize) -> BranchAt {
-    let insn = match isa::decode_at_with(image, at, at as u32, isa::Target::Union) {
+    classify_branch_with(isa::Target::Union, image, at)
+}
+
+/// Same as [`classify_branch`] but for a caller who knows the image's ISA
+/// [`isa::Target`]. Under `Target::V8M` this is what lets a hook-site check
+/// see a CMSE gateway (`SG`) as `NotABranch` — since `SG` is not a
+/// branch — rather than as a fake pc-relative `LDRD` whose displacement
+/// then gets followed as a "branch target that carries a literal
+/// address". See [`can_install_with`] for the parallel argument on the
+/// install side.
+pub fn classify_branch_with(target: isa::Target, image: &[u8], at: usize) -> BranchAt {
+    let insn = match isa::decode_at_with(image, at, at as u32, target) {
         Some(i) => i,
         None => return BranchAt::NotABranch,
     };
@@ -3205,5 +3235,29 @@ mod asm_target_gate_tests {
             .finish()
             .expect("raw16_unchecked bypasses every legality check");
         assert_eq!(&bytes[..2], &[0x00, 0xF4]);
+    }
+
+    /// The install-side `_with` overload accepts the same bytes as
+    /// `can_install` for baseline patterns — the target axis is here for
+    /// V8M/ThumbEE cases, not to change the answer for shared encodings.
+    #[test]
+    fn can_install_with_agrees_with_can_install_on_baseline_bytes() {
+        // `nop; nop`: two 2-byte instructions, no split, accepted under any
+        // target because `nop` is baseline everywhere.
+        let image = [0x00, 0xBF, 0x00, 0xBF];
+        for t in [
+            Target::Union,
+            Target::V7M,
+            Target::V7A,
+            Target::V7R,
+            Target::V7AR,
+            Target::V7EM,
+            Target::V8M,
+        ] {
+            assert!(
+                can_install_with(t, &image, 0, BranchKind::Bl).is_ok(),
+                "can_install_with({t:?}) must accept a baseline site"
+            );
+        }
     }
 }
