@@ -1047,12 +1047,15 @@ impl Asm {
             self.emit32(hw1, hw2);
             return self;
         }
-        let bytes = [
-            (hw1 & 0xFF) as u8,
-            (hw1 >> 8) as u8,
-            (hw2 & 0xFF) as u8,
-            (hw2 >> 8) as u8,
-        ];
+        // `to_le_bytes` on each halfword rather than hand-masking with `& 0xFF`
+        // and `>> 8`: the manual form generated four provably-equivalent mutants
+        // (`&`→`|`, `>>`→`<<`) whose effect on the decoded mnemonic is only
+        // observable through operand-discriminated legality, which the table
+        // does not yet consult (OpExtra::Plain everywhere in 0.14.0). This
+        // spelling has no mutant surface for those bit ops.
+        let hw1_le = hw1.to_le_bytes();
+        let hw2_le = hw2.to_le_bytes();
+        let bytes = [hw1_le[0], hw1_le[1], hw2_le[0], hw2_le[1]];
         match isa::decode_at_with(&bytes, 0, 0, self.target) {
             Some(decoded) => {
                 let form = isa::legality::EncForm::from(decoded.encoding);
@@ -3259,5 +3262,88 @@ mod asm_target_gate_tests {
                 "can_install_with({t:?}) must accept a baseline site"
             );
         }
+    }
+
+    /// `udiv` bytes must match ARM ARM A8.8.267 exactly, and the encoding must
+    /// use a non-zero `Rd` so the `Rd << 8` mutant (a survivor in the 0.14.0
+    /// baseline sweep) cannot masquerade as identity.
+    ///
+    /// `udiv r3, r4, r5`: hw1 = 0xFBB0 | Rn(=4) = 0xFBB4; hw2 = 0xF0F0 |
+    /// (Rd=3 << 8) | Rm(=5) = 0xF3F5. Bytes: `[0xB4, 0xFB, 0xF5, 0xF3]`.
+    #[test]
+    fn udiv_encodes_exactly_with_nonzero_rd() {
+        let mut a = Asm::new();
+        a.udiv(3, 4, 5);
+        let bytes = a.finish().expect("udiv is legal under Union");
+        assert_eq!(&bytes[..4], &[0xB4, 0xFB, 0xF5, 0xF3], "udiv r3, r4, r5");
+    }
+
+    /// `udiv` under `Target::V7R` — the acceptance path proves the target
+    /// gate does not accidentally reject udiv on a profile where it is
+    /// mandatory.
+    #[test]
+    fn udiv_is_accepted_under_v7r() {
+        let mut a = Asm::with_target(Target::V7R);
+        a.udiv(0, 1, 2);
+        let bytes = a
+            .finish()
+            .expect("udiv is mandatory on Armv7-R (spec:874)");
+        assert_eq!(&bytes[..4], &[0xB1, 0xFB, 0xF2, 0xF0]);
+    }
+
+    /// `udiv` and `sdiv` share `divmod_wide`; the SP/PC operand check is
+    /// `r == 13 || r == 15`. The `||` → `&&` mutant would neuter the check
+    /// (no register is BOTH 13 AND 15), so a test using only r=13 kills it.
+    #[test]
+    fn divmod_wide_refuses_rn_equal_sp() {
+        let mut a = Asm::new();
+        a.sdiv(0, 13, 2);
+        let err = a.finish().expect_err("Rn=SP is UNPREDICTABLE for sdiv");
+        assert!(matches!(err, AsmError::Operand { .. }));
+    }
+
+    /// The other half of the SP/PC check — r=15 (PC) is separately refused.
+    /// Testing both endpoints (13 and 15) rules out any partial `||`/`&&`
+    /// mutation.
+    #[test]
+    fn divmod_wide_refuses_rm_equal_pc() {
+        let mut a = Asm::new();
+        a.udiv(0, 1, 15);
+        let err = a.finish().expect_err("Rm=PC is UNPREDICTABLE for udiv");
+        assert!(matches!(err, AsmError::Operand { .. }));
+    }
+
+    /// `raw16` under a non-Union target discriminates on `insn_len(insn) == 4`:
+    /// wide-prefix halfwords are refused with `mnemonic: "raw16"`, narrow
+    /// halfwords go through the decode-under-target legality path. The `==`
+    /// → `!=` mutant swaps the two paths, so a narrow accept (this test)
+    /// under a non-Union target is what distinguishes them: correct code
+    /// emits bytes, mutant code refuses.
+    #[test]
+    fn raw16_accepts_a_narrow_defined_pattern_under_non_union() {
+        // 0xBF00 is `nop` T1 — narrow (`insn_len == 2`), defined on every
+        // target the crate knows.
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw16(0xBF00);
+        let bytes = a.finish().expect("nop is baseline everywhere");
+        assert_eq!(&bytes[..2], &[0x00, 0xBF]);
+    }
+
+    /// `AsmError::at()` must return the actual byte position, not a constant.
+    /// The mutants that replace the body with `0` or `1` are killed by a
+    /// scenario where `at` is neither: emit a couple of instructions first,
+    /// then fail. Uses `sdiv` under V7A (guaranteed Unsupported at pos > 0).
+    #[test]
+    fn asm_error_at_returns_the_actual_byte_position() {
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw16_unchecked(0xBF00); // 2 bytes: NOP.
+        a.raw16_unchecked(0xBF00); // 2 more: cursor at 4.
+        a.sdiv(0, 1, 2); // refused here at position 4.
+        let err = a.finish().expect_err("sdiv is UNDEFINED on V7A");
+        assert_eq!(
+            err.at(),
+            4,
+            "at() must return the actual position (4), not 0 or 1"
+        );
     }
 }
