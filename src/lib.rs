@@ -975,8 +975,8 @@ impl Asm {
     /// - Otherwise the halfword is written.
     ///
     /// The 0.14.0 legality table has no *narrow* restricted mnemonic (only
-    /// the wide `sdiv`/`udiv` are gated), so the "decoded but refused by
-    /// [`defined_on`]" arm on the narrow path cannot fire today. When
+    /// the wide `sdiv`/`udiv` are gated), so the "decoded but refused by the
+    /// legality table" arm on the narrow path cannot fire today. When
     /// narrow-restricted emitters land in 0.14.x/0.15.0 (e.g. CMSE narrow
     /// forms, ThumbEE `hb` variants), this call site will grow that arm.
     /// The wide-side twin lives in [`Asm::raw32`] and *is* exercised by

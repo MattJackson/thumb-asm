@@ -168,7 +168,7 @@ pub fn xrefs(image: &[u8], target: u32) -> Vec<Xref> {
 /// [`isa::Target`]. Threading `Target::V8M` (or `Target::ThumbEE`) matters
 /// on images whose Union decoding invents phantom pc-relative literal
 /// reads out of CMSE gateways — every one of those becomes a spurious
-/// [`XrefKind::LiteralRef`] against whatever the fake `LDRD` "resolves" to.
+/// [`XrefKind::LiteralPool`] against whatever the fake `LDRD` "resolves" to.
 pub fn xrefs_with(profile: isa::Target, image: &[u8], target: u32) -> Vec<Xref> {
     let want = target & !1;
     let mut out: Vec<Xref> = Vec::new();
