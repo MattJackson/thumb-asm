@@ -1461,6 +1461,10 @@ fn fp_two_core(hw1: u16, hw2: u16, addr: u32) -> Option<Insn> {
 // leaves a branch that several of the callers, which check the operand count
 // first, can never take.
 //
+// mutant-equivalent (nine mutants — see the four `r.num() < 16` guards in
+// `op_reg`, `encode_mcr`, `parse_base`, `encode_vmrs_vmsr`, plus the four
+// `< with <=` weakenings of the same guards, plus one in `op_mem`):
+//
 // The `r.num() < 16` guard in `op_reg` below, and the three hand-written
 // copies of it in `encode_mcr`, `parse_base` and `encode_vmrs_vmsr`, are
 // restatements of an invariant rather than tests: `Reg::num` is

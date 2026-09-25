@@ -901,6 +901,9 @@ impl Asm {
     fn imm(&mut self, what: &str, v: u16, max: u16, step: u16) {
         if v > max {
             self.fail(format!("{what}: immediate {v} exceeds maximum {max}"));
+        // mutant-equivalent: `step > 1` → `step >= 1` — with `step == 1`, `v % 1`
+        // is always `0`, so the second conjunct is always `false` and the branch
+        // is unreachable under either operator.
         } else if step > 1 && v % step != 0 {
             self.fail(format!("{what}: immediate {v} is not a multiple of {step}"));
         }

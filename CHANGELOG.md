@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-25
+
+Mutation-coverage patch. No API changes, no behaviour changes. Adds tests
+that close the remaining tractable gaps in the pre-0.14.0 code, and
+introduces a durable convention for documenting mutants that are provably
+equivalent-by-construction so future sweeps can stop chasing them.
+
+### Test coverage
+
+- `Flags::contains` — added three per-flag `other=set, self=empty` cases
+  (one each for N, Z, C), which pin the `!other.x || self.x` clauses that
+  the existing `NZC.contains(ALL)` case only exercised for V. Kills three
+  `delete !` mutants in `src/flags.rs:121`.
+- `encode_stm_ldm` T1 (`stmia`/`ldmia` narrow encoder in `src/isa/t16_branch.rs`)
+  — added a hand-built-`Insn` case with `Rn` in `r8..=r15` for both
+  mnemonics. The `r.is_low()` guard on the base register was previously
+  only exercised by the exhaustive-halfword round-trip loop, whose inputs
+  never see a non-low base; a mutant that replaced the guard with `true`
+  would silently flip `stmia` (base `0xC000`) to `ldmia` (base `0xC800`)
+  through `rn << 8` overflow. The new test asserts `encode` returns `None`
+  for every non-low base for both mnemonics.
+
+### Documentation
+
+Introduces a `// mutant-equivalent:` line-marker convention for mutants
+that are provably equivalent-by-construction — the mutation produces the
+same observable behaviour as the original across every input the function
+can receive, so no test can distinguish them. Comments are one line,
+positioned on or immediately above the mutated line, and state the
+equivalence argument in one sentence.
+
+Sites documented in this release:
+
+- `src/isa/mod.rs:317`, `:331` — the two 32-bit dispatch arms whose
+  mutation is subsumed by the `_ =>` catch-all's `t32_coproc::decode(...)
+  .or_else(t32_simd::decode)`, or by that catch-all's `None`. The existing
+  block comments already argued the equivalence; the `mutant-equivalent`
+  markers make them greppable.
+- `src/lib.rs:904` — `Asm::imm`'s `step > 1` fast-path: with `step == 1`,
+  `v % 1` is identically `0`, so the second conjunct is unreachable under
+  either `> 1` or `>= 1`.
+- `src/analysis.rs:687` — `reachable_with`'s `image[at + 1]` for
+  `it_state_from` reads only the low byte's cond/mask nibbles; the high
+  byte the second index would name (the IT opcode's `0xBF`) is never
+  looked at, so `at + 1` → `at * 1` is observably identical.
+- `src/isa/t32_coproc.rs:1464..1472` — the pre-existing block comment on
+  the four hand-written `r.num() < 16` guards has grown a
+  `mutant-equivalent (nine mutants — ...)` header so the grep sweep
+  recognises the whole family in one place. `Reg::num` is `self.0 & 0xF`,
+  so the predicate is unconditionally true and every weakening of it
+  yields an identical program.
+
+### Not addressed
+
+The 597 `replace | with ^` misses on encoders that OR together
+mask-disjoint bit-fields remain provably equivalent-by-construction, as
+`cargo-mutants`' own runbook (skill §7b) calls out. The `hw = a | b | c`
+family is left as-is: annotating each one line-by-line would be six
+hundred lines of noise. A future release may add a per-encoder-file
+header once the semantics of "these fields are disjoint" is stated once
+in `isa::insn` and pointed to from the emitters.
+
 ## [0.14.0] - 2026-09-24
 
 The encoder learns to say "not on this chip". `isa::Target` — decoder-only

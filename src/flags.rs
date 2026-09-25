@@ -854,6 +854,17 @@ mod tests {
         assert!(Flags::ALL.contains(Flags::NZC));
         assert!(!Flags::NZC.contains(Flags::ALL));
         assert!(Flags::NZC.contains(Flags::NZ));
+        // Per-flag `other=set, self=empty` cases — one for each of N, Z, C.
+        // Without these the three `!other.x || self.x` clauses in `contains`
+        // each look like a no-op: `Flags::NZC.contains(Flags::ALL)` already
+        // distinguishes the V clause, so it is the only one under test until
+        // these lines land.
+        let n_only = Flags { n: true, z: false, c: false, v: false };
+        let z_only = Flags { n: false, z: true, c: false, v: false };
+        let c_only = Flags { n: false, z: false, c: true, v: false };
+        assert!(!Flags::NONE.contains(n_only));
+        assert!(!Flags::NONE.contains(z_only));
+        assert!(!Flags::NONE.contains(c_only));
         assert_eq!(Flags::NZ.union(Flags::C), Flags::NZC);
         assert_eq!(
             Flags::ALL.without(Flags::NZC),

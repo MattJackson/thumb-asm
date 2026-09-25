@@ -416,6 +416,41 @@ mod tests {
         }
     }
 
+    /// `encode_stm_ldm` refuses a base that is not a low register.
+    ///
+    /// The `r.is_low()` guard is what stops a hand-built `Insn` from emitting a
+    /// T1 halfword with `Rn = 8..15`, whose `rn << 8` overflows into the base
+    /// pattern and flips `stmia` (base `0xC000`) to `ldmia` (base `0xC800`).
+    /// Without a test that constructs such an `Insn`, the guard survives
+    /// mutation to `true` unpinned.
+    #[test]
+    fn a_non_low_base_is_refused_by_the_narrow_encoder() {
+        for base in 8u8..=15 {
+            for (mnemonic, base_hw) in [("stmia", 0xC000u16), ("ldmia", 0xC800)] {
+                let insn = Insn {
+                    mnemonic,
+                    encoding: "T1",
+                    addr: 0,
+                    width: Width::Narrow,
+                    cond: None,
+                    sets_flags: false,
+                    explicit_width: false,
+                    operands: {
+                        let mut ops = Operands::new();
+                        ops.push(Operand::Reg(Reg(base)));
+                        ops.push(Operand::RegList(1));
+                        ops
+                    },
+                };
+                assert_eq!(
+                    encode(&insn),
+                    None,
+                    "{mnemonic} with Rn=r{base} must not encode (would collide with {base_hw:#06x})"
+                );
+            }
+        }
+    }
+
     /// The whole range is accounted for: each halfword lands in exactly the
     /// mnemonic Table A5-1/A5-8 says it should.
     #[test]

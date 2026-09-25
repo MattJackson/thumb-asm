@@ -678,12 +678,11 @@ pub fn reachable_with(target: isa::Target, image: &[u8], entry: usize, limit: us
             // decoded, so both bytes are in range, and a `None` arm here
             // would be a branch no input can reach.
             //
-            // Mutation reports `at + 1` -> `at * 1` as a survivor here and it
-            // is an *equivalent* mutant, not a gap: `it_state_from` reads the
-            // condition from `hw1[7:4]` and the mask from `hw1[3:0]`, both of
-            // which live in the low byte. The high byte it would stop reading
-            // is `1011 1111`, the opcode, which the function never looks at.
-            // No test can distinguish the two programs.
+            // mutant-equivalent: `at + 1` → `at * 1` — `it_state_from` reads
+            // the condition from `hw1[7:4]` and the mask from `hw1[3:0]`, both
+            // of which live in the low byte. The high byte the second index
+            // would read is `1011 1111`, the opcode, which the function never
+            // looks at, so the two programs are observably identical.
             isa::it_state_from(u16::from_le_bytes([image[at], image[at + 1]]))
         } else {
             it.advance()

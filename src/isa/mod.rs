@@ -314,6 +314,10 @@ pub fn decode_halfwords(hw1: u16, hw2: u16, addr: u32, target: Target) -> Option
             // catch it. It stays because the table should read as the manual
             // reads, and because a coprocessor row added to the catch-all
             // later would otherwise silently swallow Advanced SIMD's.
+            // mutant-equivalent: guard→false or `& 0b111_0001` → `| 0b111_0001` — the
+            // `_` catch-all below dispatches the same halfwords to `t32_simd::decode`
+            // via `or_else`, so any input that would have matched here still decodes
+            // to the same instruction. Documented above.
             o if o & 0b111_0001 == 0b001_0000 => t32_simd::decode(hw1, hw2, addr),
             o if o & 0b110_0111 == 0b000_0001 => t32_load::decode(hw1, hw2, addr),
             o if o & 0b110_0111 == 0b000_0011 => t32_load::decode(hw1, hw2, addr),
@@ -328,6 +332,9 @@ pub fn decode_halfwords(hw1: u16, hw2: u16, addr: u32, target: Target) -> Option
             // manual's UNDEFINED row written down, so that a row later given
             // a meaning gets added here rather than discovered by accident in
             // the fall-through.
+            // mutant-equivalent: guard→false or `& 0b110_0111` → `| 0b110_0111` — the
+            // `_` catch-all also returns `None` for these four halfwords, per the
+            // paragraph above. Deleting or bypassing this arm changes no decode.
             o if o & 0b110_0111 == 0b000_0111 => None, // UNDEFINED
             o if o & 0b111_0000 == 0b010_0000 => t32_dp_reg::decode(hw1, hw2, addr),
             o if o & 0b111_1000 == 0b011_0000 => t32_multiply::decode(hw1, hw2, addr),
