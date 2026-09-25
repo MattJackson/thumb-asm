@@ -95,6 +95,25 @@ pub fn insn_len(hw1: u16) -> usize {
 /// [`Union`](Target::Union) is the default and reproduces this crate's
 /// behaviour from before `Target` existed, byte for byte. Pick a specific
 /// target when you know it and want the decoder to hold you to it.
+///
+/// # Decode-discrimination vs. legality-discrimination
+///
+/// `V7M`, `V7A`, `V7R`, `V7AR`, `V7EM` are **legality-discriminated**, not
+/// decode-discriminated — the decoder treats them identically to
+/// [`Union`](Target::Union). They differ from `Union` on the *encoder* side
+/// via the encoder's per-profile legality table: for example, `sdiv` and
+/// `udiv` are legal on Armv7-R, Armv7-M, Armv7E-M and Armv8-M, but UNDEFINED
+/// on Armv7-A, so `Asm::with_target(Target::V7A).sdiv(...)` refuses at the
+/// call site while `Asm::with_target(Target::V7R).sdiv(...)` accepts.
+/// `V7AR` is the strict intersection: legal iff legal on **both** `V7A` and
+/// `V7R`, which makes it strictly stricter than `V7R` — the answer to use
+/// for images whose sub-profile is unknown, where the safe default is to
+/// refuse anything either sub-profile might refuse.
+///
+/// `V8M` and `ThumbEE` are the two targets the decoder itself *does*
+/// discriminate: `V8M` because CMSE (`SG`, `TT`, `BXNS`, `BLXNS`) reassigns
+/// halfwords Armv7 gives to something else, and `ThumbEE` because
+/// `0xC000..=0xCFFF` means an entirely different thing in the ThumbEE state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
 pub enum Target {
@@ -107,9 +126,38 @@ pub enum Target {
     /// `SG` still decodes here as the `LDRD` Armv7 calls it. Use
     /// [`V8M`](Target::V8M) on an image you know is Armv8-M.
     Union,
-    /// Armv7-M and Armv7E-M — the Cortex-M profile.
+    /// Armv7-M — the plain Cortex-M profile, without the E-M extensions.
+    ///
+    /// Legality-discriminated only; the decoder treats V7M identically to
+    /// Union. Integer `SDIV`/`UDIV` are legal here (they are mandatory on
+    /// V7-M), and the E-M-only DSP encodings (`SMLAD`, `SMLSD`, `USADA8` and
+    /// friends) are not.
     V7M,
-    /// Armv7-A and Armv7-R — the application and real-time profiles.
+    /// Armv7E-M — Cortex-M with the DSP extension.
+    ///
+    /// A strict superset of V7M for legality: everything legal on V7M plus
+    /// the DSP encodings. Integer `SDIV`/`UDIV` are legal here.
+    V7EM,
+    /// Armv7-A — the application profile.
+    ///
+    /// Legality-discriminated only. Integer `SDIV`/`UDIV` are **UNDEFINED**
+    /// on Armv7-A (they are optional in Armv7-A only via the Virtualization
+    /// Extensions, and Thumb's T1 encoding is not part of that), which is
+    /// the practical difference from V7R.
+    V7A,
+    /// Armv7-R — the real-time profile.
+    ///
+    /// Legality-discriminated only. Integer `SDIV`/`UDIV` are **mandatory**
+    /// on Armv7-R.
+    V7R,
+    /// Armv7-A and Armv7-R together, treated as the strict intersection.
+    ///
+    /// This is the answer for images whose sub-profile is unknown: legal iff
+    /// legal on **both** [`V7A`](Target::V7A) and [`V7R`](Target::V7R). That
+    /// makes it strictly stricter than [`V7R`](Target::V7R) — an instruction
+    /// V7R accepts but V7A refuses (like `SDIV`) is refused here, because a
+    /// buffer that "runs on an unknown A-or-R chip" cannot afford to be
+    /// wrong on one of them.
     V7AR,
     /// Armv8-M Mainline with the Security Extension.
     ///
