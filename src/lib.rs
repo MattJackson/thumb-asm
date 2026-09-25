@@ -679,29 +679,88 @@ pub fn prologue_is_push_lr(image: &[u8], off: usize, window: usize) -> bool {
 /// is unrepresentable — and unnecessary. The same holds for
 /// [`InstallMismatch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsmError(String);
+#[non_exhaustive]
+pub enum AsmError {
+    /// An operand the requested encoding cannot hold: a low-register field
+    /// with a high register in it, an immediate outside the encoding's
+    /// range, a `blx` with `pc` as its argument, and so on. Reported at
+    /// [`Asm::finish`] with the byte position of the emitter that failed.
+    Operand {
+        /// Byte position in the code buffer where the emitter tried to write.
+        at: usize,
+        /// Human-readable diagnostic naming the operand and the limit.
+        msg: String,
+    },
+    /// The encoding an emitter produces is not defined on the assembler's
+    /// [`isa::Target`]. Introduced in 0.14.0 alongside `Asm::with_target`;
+    /// the only in-crate emitter that raises it today is `sdiv`/`udiv`
+    /// under [`Target::V7A`](isa::Target::V7A) or
+    /// [`Target::V7AR`](isa::Target::V7AR), plus `raw16` and `raw32` over
+    /// bytes their target's decoder does not accept.
+    Unsupported {
+        /// Byte position in the code buffer where the refused emit happened.
+        at: usize,
+        /// Static mnemonic the emitter identifies as, e.g. `"sdiv"`.
+        mnemonic: &'static str,
+        /// The target the assembler was built for.
+        target: isa::Target,
+    },
+    /// A layout-time failure: an unbound or never-reserved label, a branch
+    /// whose displacement is out of range for its encoding, a literal-pool
+    /// entry too far away for `ldr pc-relative`'s 8-bit immediate, or an
+    /// `adr` whose blob sits before it. These are the diagnostics
+    /// [`Asm::finish`] can only report after every emitter has run — the
+    /// mistake is not a bad operand, it is a missing (or geometrically
+    /// impossible) call the caller has to add or move.
+    Layout {
+        /// Byte position of the emitter whose fix-up could not be resolved
+        /// (for branches / `adr` / `ldr` literals). Zero for
+        /// never-reserved-label diagnostics that have no code position.
+        at: usize,
+        /// Human-readable diagnostic naming what went wrong.
+        msg: String,
+    },
+}
 
 impl AsmError {
-    /// A stable, machine-readable reason. Always `"operand"`.
-    ///
-    /// Every failure this type reports is the same kind: an operand the
-    /// requested encoding cannot hold. The constant is here so that callers
-    /// matching on `reason()` across this crate's error types do not have to
-    /// special-case one of them, and so that a future split into more reasons
-    /// is additive rather than a new method.
+    /// A stable, machine-readable reason: `"operand"`, `"unsupported"`, or
+    /// `"layout"`. Consumers branch on this to distinguish "the operand is
+    /// wrong" (fixable at the emitter's arguments) from "the encoding is not
+    /// legal on this target" (fixable by changing the target or the
+    /// emitter) from "the layout does not close" (fixable at the caller's
+    /// label / branch / pool geometry).
     pub fn reason(&self) -> &'static str {
-        "operand"
+        match self {
+            AsmError::Operand { .. } => "operand",
+            AsmError::Unsupported { .. } => "unsupported",
+            AsmError::Layout { .. } => "layout",
+        }
     }
 
-    /// The human-readable message, naming the operand and the limit it broke.
-    pub fn message(&self) -> &str {
-        &self.0
+    /// Byte position in the code buffer this error refers to. Zero for
+    /// never-reserved-label diagnostics that have no code position.
+    pub fn at(&self) -> usize {
+        match self {
+            AsmError::Operand { at, .. }
+            | AsmError::Unsupported { at, .. }
+            | AsmError::Layout { at, .. } => *at,
+        }
     }
 }
 
 impl core::fmt::Display for AsmError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            AsmError::Operand { msg, .. } => f.write_str(msg),
+            AsmError::Unsupported {
+                mnemonic, target, ..
+            } => write!(
+                f,
+                "{mnemonic}: not defined on {target:?} (encoder-side legality \
+                 gate refused it)"
+            ),
+            AsmError::Layout { msg, .. } => f.write_str(msg),
+        }
     }
 }
 
@@ -775,7 +834,23 @@ impl Asm {
     /// the one the caller has to fix, and a cascade of consequences obscures it.
     fn fail(&mut self, msg: String) {
         if self.err.is_none() {
-            self.err = Some(AsmError(msg));
+            self.err = Some(AsmError::Operand {
+                at: self.code.len(),
+                msg,
+            });
+        }
+    }
+
+    /// Record the first target-legality failure. Same first-wins semantics as
+    /// [`Asm::fail`] — one class of error, one report.
+    #[allow(dead_code)] // wired to check_target in step 4.
+    fn fail_target(&mut self, mnemonic: &'static str) {
+        if self.err.is_none() {
+            self.err = Some(AsmError::Unsupported {
+                at: self.code.len(),
+                mnemonic,
+                target: self.target,
+            });
         }
     }
 
@@ -1278,24 +1353,34 @@ impl Asm {
             // a reserved id never bound is a missing `bind`.
             let target = match this.labels.get(label as usize) {
                 Some(Some(t)) => *t,
-                Some(None) => return Err(AsmError(format!("unbound label {label}"))),
+                Some(None) => {
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("unbound label {label}"),
+                    })
+                }
                 None => {
-                    return Err(AsmError(format!(
-                        "label {label} was never reserved by `label()`"
-                    )))
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("label {label} was never reserved by `label()`"),
+                    })
                 }
             };
             let off = (target as i32 - (pos as i32 + 4)) / 2;
             let enc = if uncond {
                 if !(-1024..=1023).contains(&off) {
-                    return Err(AsmError(format!("branch out of range ({off} halfwords)")));
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("branch out of range ({off} halfwords)"),
+                    });
                 }
                 0xE000u16 | (off as u16 & 0x07FF)
             } else {
                 if !(-128..=127).contains(&off) {
-                    return Err(AsmError(format!(
-                        "conditional branch out of range ({off} halfwords)"
-                    )));
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("conditional branch out of range ({off} halfwords)"),
+                    });
                 }
                 let base = u16::from_le_bytes([this.code[pos], this.code[pos + 1]]) & 0xFF00;
                 base | (off as i8 as u8 as u16)
@@ -1326,9 +1411,10 @@ impl Asm {
             let pc = (pos as u32 + 4) & !3;
             let imm8 = (off - pc) / 4;
             if imm8 > 0xFF {
-                return Err(AsmError(format!(
-                    "ldr literal out of range (imm8 = {imm8})"
-                )));
+                return Err(AsmError::Layout {
+                    at: pos,
+                    msg: format!("ldr literal out of range (imm8 = {imm8})"),
+                });
             }
             let enc = 0x4800u16 | (rt << 8) | imm8 as u16;
             this.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
@@ -1350,19 +1436,26 @@ impl Asm {
         for (pos, label) in core::mem::take(&mut this.adrs) {
             let target = match this.labels.get(label as usize) {
                 Some(Some(t)) => *t,
-                Some(None) => return Err(AsmError(format!("unbound blob label {label}"))),
+                Some(None) => {
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("unbound blob label {label}"),
+                    })
+                }
                 None => {
-                    return Err(AsmError(format!(
-                        "blob label {label} was never reserved by `label()`"
-                    )))
+                    return Err(AsmError::Layout {
+                        at: pos,
+                        msg: format!("blob label {label} was never reserved by `label()`"),
+                    })
                 }
             };
             let base = (pos as u32 + 4) & !3;
             let imm = target as u32;
             if imm < base || (imm - base) % 4 != 0 || (imm - base) / 4 > 0xFF {
-                return Err(AsmError(format!(
-                    "adr target out of range (pos=0x{pos:x} target=0x{target:x})"
-                )));
+                return Err(AsmError::Layout {
+                    at: pos,
+                    msg: format!("adr target out of range (pos=0x{pos:x} target=0x{target:x})"),
+                });
             }
             let enc = 0xA000u16
                 | ((u16::from_le_bytes([this.code[pos], this.code[pos + 1]]) >> 8 & 7) << 8)
@@ -2564,14 +2657,14 @@ mod unreserved_label_tests {
         let err = a.finish().expect_err("an unreserved label must not panic");
         // Bound before asserting: a format argument is only evaluated when
         // the assertion fails, so inline it is dead on every passing run.
-        let msg = err.message().to_string();
+        let msg = err.to_string();
         assert!(msg.contains("never reserved"), "{msg}");
 
         // An unconditional branch, which takes a different fixup path.
         let mut a = Asm::new();
         a.b(9);
         let err = a.finish().expect_err("an unreserved label must not panic");
-        assert!(err.message().contains("never reserved"));
+        assert!(err.to_string().contains("never reserved"));
 
         // `adr` to a blob label nobody reserved.
         let mut a = Asm::new();
@@ -2579,7 +2672,7 @@ mod unreserved_label_tests {
         let err = a
             .finish()
             .expect_err("an unreserved blob label must not panic");
-        assert!(err.message().contains("never reserved"));
+        assert!(err.to_string().contains("never reserved"));
 
         // Note there is deliberately no case here for a *blob* recorded
         // against an unreserved label: `data_blob` reserves its own id and is
@@ -2595,7 +2688,7 @@ mod unreserved_label_tests {
         let l = a.label();
         a.b_cond(Cond::Eq, l);
         let err = a.finish().expect_err("never bound");
-        let msg = err.message().to_string();
+        let msg = err.to_string();
         assert!(msg.contains("unbound label"), "{msg}");
         assert!(!msg.contains("never reserved"));
     }
@@ -2716,12 +2809,16 @@ mod error_reason_tests {
         assert_eq!(err.reason(), "operand");
         // Bound before the assert: a format argument is only evaluated when
         // the assertion fails, so inline it would never be covered.
-        let msg = err.message();
+        let msg = err.to_string();
         assert!(
             msg.contains("movs"),
             "the message should name the instruction, got: {msg}"
         );
-        assert_eq!(err.message(), err.to_string());
+        // Structured accessor agrees with the Display form for `Operand`.
+        match &err {
+            AsmError::Operand { msg: m, .. } => assert_eq!(*m, msg),
+            other => panic!("expected AsmError::Operand, got {other:?}"),
+        }
     }
 }
 
