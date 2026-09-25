@@ -496,20 +496,20 @@ fn asm_conditional_branch_emitters_cover_all_fourteen_conditions() {
     // the opcode's high byte (the thing under test) varies.
     type Emit = fn(&mut Asm, u16);
     let cases: &[(u16, Emit)] = &[
-        (0xD000, |a, l| a.beq(l)),
-        (0xD100, |a, l| a.bne(l)),
-        (0xD200, |a, l| a.bhs(l)),
-        (0xD300, |a, l| a.blo(l)),
-        (0xD400, |a, l| a.bmi(l)),
-        (0xD500, |a, l| a.bpl(l)),
-        (0xD600, |a, l| a.bvs(l)),
-        (0xD700, |a, l| a.bvc(l)),
-        (0xD800, |a, l| a.bhi(l)),
-        (0xD900, |a, l| a.bls(l)),
-        (0xDA00, |a, l| a.bge(l)),
-        (0xDB00, |a, l| a.blt(l)),
-        (0xDC00, |a, l| a.bgt(l)),
-        (0xDD00, |a, l| a.ble(l)),
+        (0xD000, |a, l| { a.beq(l); }),
+        (0xD100, |a, l| { a.bne(l); }),
+        (0xD200, |a, l| { a.bhs(l); }),
+        (0xD300, |a, l| { a.blo(l); }),
+        (0xD400, |a, l| { a.bmi(l); }),
+        (0xD500, |a, l| { a.bpl(l); }),
+        (0xD600, |a, l| { a.bvs(l); }),
+        (0xD700, |a, l| { a.bvc(l); }),
+        (0xD800, |a, l| { a.bhi(l); }),
+        (0xD900, |a, l| { a.bls(l); }),
+        (0xDA00, |a, l| { a.bge(l); }),
+        (0xDB00, |a, l| { a.blt(l); }),
+        (0xDC00, |a, l| { a.bgt(l); }),
+        (0xDD00, |a, l| { a.ble(l); }),
     ];
     // Fourteen conditions, and the fourteen bases are exactly 0xD000..=0xDD00 —
     // 0xDE00 (UDF) and 0xDF00 (SVC) are not branches and have no emitter.
@@ -1357,15 +1357,15 @@ fn accepted_hw(build: impl FnOnce(&mut Asm)) -> [u8; 2] {
 fn push_with_a_reglist_that_overflows_its_field_is_rejected_not_encoded() {
     // The regression case. 0xB400 | 0x4000 == 0xF400: hw1[15:11] == 0b11110,
     // which is a 32-bit prefix, so this desynchronises the whole stream.
-    let e = rejected(|a| a.push(0x4000));
+    let e = rejected(|a| { a.push(0x4000); });
     assert!(e.contains("push"), "{e}");
     assert!(e.contains("outside R0-R7"), "{e}");
 
     // And the legitimate forms still work, at the values the doc now cites.
-    assert_eq!(accepted_hw(|a| a.push(0x0100)), 0xB500u16.to_le_bytes());
-    assert_eq!(accepted_hw(|a| a.push(0x0103)), 0xB503u16.to_le_bytes());
-    assert_eq!(accepted_hw(|a| a.pop(0x0100)), 0xBD00u16.to_le_bytes());
-    assert_eq!(accepted_hw(|a| a.pop(0x0103)), 0xBD03u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.push(0x0100); }), 0xB500u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.push(0x0103); }), 0xB503u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.pop(0x0100); }), 0xBD00u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.pop(0x0103); }), 0xBD03u16.to_le_bytes());
 }
 
 #[test]
@@ -1375,17 +1375,17 @@ fn push_and_pop_accept_the_widest_list_the_encoding_can_hold() {
     // uses all the low registers — the most common prologue there is. The
     // bound is inclusive; rejecting the maximum itself would make that
     // prologue unassemblable, so a stub could not be built at all.
-    assert_eq!(accepted_hw(|a| a.push(0x01FF)), 0xB5FFu16.to_le_bytes());
-    assert_eq!(accepted_hw(|a| a.pop(0x01FF)), 0xBDFFu16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.push(0x01FF); }), 0xB5FFu16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.pop(0x01FF); }), 0xBDFFu16.to_le_bytes());
     // One bit past the field is still refused.
-    assert!(rejected(|a| a.push(0x0200)).contains("outside R0-R7"));
-    assert!(rejected(|a| a.pop(0x0200)).contains("outside R0-R7"));
+    assert!(rejected(|a| { a.push(0x0200); }).contains("outside R0-R7"));
+    assert!(rejected(|a| { a.pop(0x0200); }).contains("outside R0-R7"));
 }
 
 #[test]
 fn an_empty_push_or_pop_list_is_unpredictable_and_refused() {
-    assert!(rejected(|a| a.push(0)).contains("empty"));
-    assert!(rejected(|a| a.pop(0)).contains("empty"));
+    assert!(rejected(|a| { a.push(0); }).contains("empty"));
+    assert!(rejected(|a| { a.pop(0); }).contains("empty"));
 }
 
 #[test]
@@ -1396,40 +1396,40 @@ fn every_low_register_operand_rejects_a_high_register() {
     /// fields a high register.
     type Case = (&'static str, fn(&mut Asm));
     let cases: Vec<Case> = vec![
-        ("ldr_lit", |a| a.ldr_lit(8, 0xDEAD)),
-        ("ldrb_imm", |a| a.ldrb_imm(8, 0, 0)),
-        ("ldrb_imm", |a| a.ldrb_imm(0, 8, 0)),
-        ("ldr_imm", |a| a.ldr_imm(8, 0, 0)),
-        ("ldr_imm", |a| a.ldr_imm(0, 8, 0)),
-        ("strh_imm", |a| a.strh_imm(8, 0, 0)),
-        ("strh_imm", |a| a.strh_imm(0, 8, 0)),
-        ("str_imm", |a| a.str_imm(8, 0, 0)),
-        ("str_imm", |a| a.str_imm(0, 8, 0)),
-        ("bics", |a| a.bics(8, 0)),
-        ("bics", |a| a.bics(0, 8)),
-        ("orrs", |a| a.orrs(8, 0)),
-        ("orrs", |a| a.orrs(0, 8)),
-        ("strb_imm", |a| a.strb_imm(8, 0, 0)),
-        ("strb_imm", |a| a.strb_imm(0, 8, 0)),
-        ("cmp_imm", |a| a.cmp_imm(8, 0)),
-        ("cmp_reg", |a| a.cmp_reg(8, 0)),
-        ("cmp_reg", |a| a.cmp_reg(0, 8)),
-        ("movs_imm", |a| a.movs_imm(8, 0)),
-        ("ldrb_reg", |a| a.ldrb_reg(8, 0, 0)),
-        ("ldrb_reg", |a| a.ldrb_reg(0, 8, 0)),
-        ("ldrb_reg", |a| a.ldrb_reg(0, 0, 8)),
-        ("adds_imm", |a| a.adds_imm(8, 0)),
-        ("subs_imm", |a| a.subs_imm(8, 0)),
-        ("lsls_imm", |a| a.lsls_imm(8, 0, 0)),
-        ("lsls_imm", |a| a.lsls_imm(0, 8, 0)),
-        ("lsrs_imm", |a| a.lsrs_imm(8, 0, 1)),
-        ("lsrs_imm", |a| a.lsrs_imm(0, 8, 1)),
-        ("adds_reg", |a| a.adds_reg(8, 0, 0)),
-        ("adds_reg", |a| a.adds_reg(0, 8, 0)),
-        ("adds_reg", |a| a.adds_reg(0, 0, 8)),
-        ("movs_reg", |a| a.movs_reg(8, 0)),
-        ("movs_reg", |a| a.movs_reg(0, 8)),
-        ("adr", |a| a.adr(8, 0)),
+        ("ldr_lit", |a| { a.ldr_lit(8, 0xDEAD); }),
+        ("ldrb_imm", |a| { a.ldrb_imm(8, 0, 0); }),
+        ("ldrb_imm", |a| { a.ldrb_imm(0, 8, 0); }),
+        ("ldr_imm", |a| { a.ldr_imm(8, 0, 0); }),
+        ("ldr_imm", |a| { a.ldr_imm(0, 8, 0); }),
+        ("strh_imm", |a| { a.strh_imm(8, 0, 0); }),
+        ("strh_imm", |a| { a.strh_imm(0, 8, 0); }),
+        ("str_imm", |a| { a.str_imm(8, 0, 0); }),
+        ("str_imm", |a| { a.str_imm(0, 8, 0); }),
+        ("bics", |a| { a.bics(8, 0); }),
+        ("bics", |a| { a.bics(0, 8); }),
+        ("orrs", |a| { a.orrs(8, 0); }),
+        ("orrs", |a| { a.orrs(0, 8); }),
+        ("strb_imm", |a| { a.strb_imm(8, 0, 0); }),
+        ("strb_imm", |a| { a.strb_imm(0, 8, 0); }),
+        ("cmp_imm", |a| { a.cmp_imm(8, 0); }),
+        ("cmp_reg", |a| { a.cmp_reg(8, 0); }),
+        ("cmp_reg", |a| { a.cmp_reg(0, 8); }),
+        ("movs_imm", |a| { a.movs_imm(8, 0); }),
+        ("ldrb_reg", |a| { a.ldrb_reg(8, 0, 0); }),
+        ("ldrb_reg", |a| { a.ldrb_reg(0, 8, 0); }),
+        ("ldrb_reg", |a| { a.ldrb_reg(0, 0, 8); }),
+        ("adds_imm", |a| { a.adds_imm(8, 0); }),
+        ("subs_imm", |a| { a.subs_imm(8, 0); }),
+        ("lsls_imm", |a| { a.lsls_imm(8, 0, 0); }),
+        ("lsls_imm", |a| { a.lsls_imm(0, 8, 0); }),
+        ("lsrs_imm", |a| { a.lsrs_imm(8, 0, 1); }),
+        ("lsrs_imm", |a| { a.lsrs_imm(0, 8, 1); }),
+        ("adds_reg", |a| { a.adds_reg(8, 0, 0); }),
+        ("adds_reg", |a| { a.adds_reg(0, 8, 0); }),
+        ("adds_reg", |a| { a.adds_reg(0, 0, 8); }),
+        ("movs_reg", |a| { a.movs_reg(8, 0); }),
+        ("movs_reg", |a| { a.movs_reg(0, 8); }),
+        ("adr", |a| { a.adr(8, 0); }),
     ];
     for (name, build) in cases {
         let e = rejected(build);
@@ -1448,45 +1448,45 @@ fn every_low_register_operand_rejects_a_high_register() {
 #[test]
 fn immediate_fields_reject_oversized_and_unaligned_values() {
     // (emitter, just-past-the-maximum, misaligned-but-in-range)
-    assert!(rejected(|a| a.ldrb_imm(0, 1, 32)).contains("exceeds maximum 31"));
-    assert!(rejected(|a| a.strb_imm(0, 1, 32)).contains("exceeds maximum 31"));
-    assert!(rejected(|a| a.lsls_imm(0, 1, 32)).contains("exceeds maximum 31"));
-    assert!(rejected(|a| a.lsrs_imm(0, 1, 32)).contains("exceeds maximum 31"));
+    assert!(rejected(|a| { a.ldrb_imm(0, 1, 32); }).contains("exceeds maximum 31"));
+    assert!(rejected(|a| { a.strb_imm(0, 1, 32); }).contains("exceeds maximum 31"));
+    assert!(rejected(|a| { a.lsls_imm(0, 1, 32); }).contains("exceeds maximum 31"));
+    assert!(rejected(|a| { a.lsrs_imm(0, 1, 32); }).contains("exceeds maximum 31"));
 
-    assert!(rejected(|a| a.ldr_imm(0, 1, 128)).contains("exceeds maximum 124"));
-    assert!(rejected(|a| a.ldr_imm(0, 1, 2)).contains("multiple of 4"));
-    assert!(rejected(|a| a.str_imm(0, 1, 128)).contains("exceeds maximum 124"));
-    assert!(rejected(|a| a.str_imm(0, 1, 2)).contains("multiple of 4"));
+    assert!(rejected(|a| { a.ldr_imm(0, 1, 128); }).contains("exceeds maximum 124"));
+    assert!(rejected(|a| { a.ldr_imm(0, 1, 2); }).contains("multiple of 4"));
+    assert!(rejected(|a| { a.str_imm(0, 1, 128); }).contains("exceeds maximum 124"));
+    assert!(rejected(|a| { a.str_imm(0, 1, 2); }).contains("multiple of 4"));
 
-    assert!(rejected(|a| a.strh_imm(0, 1, 64)).contains("exceeds maximum 62"));
-    assert!(rejected(|a| a.strh_imm(0, 1, 1)).contains("multiple of 2"));
+    assert!(rejected(|a| { a.strh_imm(0, 1, 64); }).contains("exceeds maximum 62"));
+    assert!(rejected(|a| { a.strh_imm(0, 1, 1); }).contains("multiple of 2"));
 
     // The maxima themselves are accepted.
-    accepted(|a| a.ldrb_imm(0, 1, 31));
-    accepted(|a| a.ldr_imm(0, 1, 124));
-    accepted(|a| a.str_imm(0, 1, 124));
-    accepted(|a| a.strh_imm(0, 1, 62));
-    accepted(|a| a.lsls_imm(0, 1, 31));
+    accepted(|a| { a.ldrb_imm(0, 1, 31); });
+    accepted(|a| { a.ldr_imm(0, 1, 124); });
+    accepted(|a| { a.str_imm(0, 1, 124); });
+    accepted(|a| { a.strh_imm(0, 1, 62); });
+    accepted(|a| { a.lsls_imm(0, 1, 31); });
     // lsrs #0 is legal and means #32 (DecodeImmShift), so it is not rejected.
-    accepted(|a| a.lsrs_imm(0, 1, 0));
+    accepted(|a| { a.lsrs_imm(0, 1, 0); });
 }
 
 #[test]
 fn full_width_register_operands_reject_only_values_above_r15() {
     for r in 0..=15u16 {
-        accepted(|a| a.bx(r));
-        accepted(|a| a.mov_reg(r, 0));
-        accepted(|a| a.mov_reg(0, r));
+        accepted(|a| { a.bx(r); });
+        accepted(|a| { a.mov_reg(r, 0); });
+        accepted(|a| { a.mov_reg(0, r); });
         if r != 15 {
-            accepted(|a| a.blx(r));
+            accepted(|a| { a.blx(r); });
         }
     }
-    assert!(rejected(|a| a.bx(16)).contains("R0-R15"));
-    assert!(rejected(|a| a.blx(16)).contains("R0-R15"));
-    assert!(rejected(|a| a.mov_reg(16, 0)).contains("R0-R15"));
-    assert!(rejected(|a| a.mov_reg(0, 16)).contains("R0-R15"));
+    assert!(rejected(|a| { a.bx(16); }).contains("R0-R15"));
+    assert!(rejected(|a| { a.blx(16); }).contains("R0-R15"));
+    assert!(rejected(|a| { a.mov_reg(16, 0); }).contains("R0-R15"));
+    assert!(rejected(|a| { a.mov_reg(0, 16); }).contains("R0-R15"));
     // blx pc is encodable but UNPREDICTABLE, so it is refused by name.
-    assert!(rejected(|a| a.blx(15)).contains("UNPREDICTABLE"));
+    assert!(rejected(|a| { a.blx(15); }).contains("UNPREDICTABLE"));
 }
 
 #[test]
@@ -1523,7 +1523,7 @@ fn a_rejected_operand_never_reaches_the_output() {
 fn raw16_stays_raw() {
     // The documented escape hatch: raw16 is the one emitter that promises
     // nothing, so it must keep accepting any halfword including 0xF400.
-    assert_eq!(accepted_hw(|a| a.raw16(0xF400)), 0xF400u16.to_le_bytes());
+    assert_eq!(accepted_hw(|a| { a.raw16(0xF400); }), 0xF400u16.to_le_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,28 +1558,28 @@ fn round_trip(build: impl FnOnce(&mut Asm)) -> String {
 fn every_emitter_assembles_to_the_instruction_its_name_promises() {
     type Case = (fn(&mut Asm), &'static str);
     let cases: Vec<Case> = vec![
-        (|a| a.ldrb_imm(1, 2, 5), "ldrb r1, [r2, #5]"),
-        (|a| a.ldr_imm(1, 2, 8), "ldr r1, [r2, #8]"),
-        (|a| a.strh_imm(1, 2, 6), "strh r1, [r2, #6]"),
-        (|a| a.str_imm(1, 2, 8), "str r1, [r2, #8]"),
-        (|a| a.bics(1, 2), "bics r1, r2"),
-        (|a| a.orrs(1, 2), "orrs r1, r2"),
-        (|a| a.strb_imm(1, 2, 5), "strb r1, [r2, #5]"),
-        (|a| a.cmp_imm(1, 7), "cmp r1, #7"),
-        (|a| a.cmp_reg(1, 2), "cmp r1, r2"),
-        (|a| a.movs_imm(1, 7), "movs r1, #7"),
-        (|a| a.push(0x105), "push {r0, r2, lr}"),
-        (|a| a.pop(0x105), "pop {r0, r2, pc}"),
-        (|a| a.blx(3), "blx r3"),
-        (|a| a.bx(3), "bx r3"),
-        (|a| a.ldrb_reg(1, 2, 3), "ldrb r1, [r2, r3]"),
-        (|a| a.adds_imm(1, 7), "adds r1, #7"),
-        (|a| a.subs_imm(1, 7), "subs r1, #7"),
-        (|a| a.lsls_imm(1, 2, 3), "lsls r1, r2, #3"),
-        (|a| a.lsrs_imm(1, 2, 3), "lsrs r1, r2, #3"),
-        (|a| a.adds_reg(1, 2, 3), "adds r1, r2, r3"),
-        (|a| a.mov_reg(9, 3), "mov r9, r3"),
-        (|a| a.movs_reg(1, 2), "movs r1, r2"),
+        (|a| { a.ldrb_imm(1, 2, 5); }, "ldrb r1, [r2, #5]"),
+        (|a| { a.ldr_imm(1, 2, 8); }, "ldr r1, [r2, #8]"),
+        (|a| { a.strh_imm(1, 2, 6); }, "strh r1, [r2, #6]"),
+        (|a| { a.str_imm(1, 2, 8); }, "str r1, [r2, #8]"),
+        (|a| { a.bics(1, 2); }, "bics r1, r2"),
+        (|a| { a.orrs(1, 2); }, "orrs r1, r2"),
+        (|a| { a.strb_imm(1, 2, 5); }, "strb r1, [r2, #5]"),
+        (|a| { a.cmp_imm(1, 7); }, "cmp r1, #7"),
+        (|a| { a.cmp_reg(1, 2); }, "cmp r1, r2"),
+        (|a| { a.movs_imm(1, 7); }, "movs r1, #7"),
+        (|a| { a.push(0x105); }, "push {r0, r2, lr}"),
+        (|a| { a.pop(0x105); }, "pop {r0, r2, pc}"),
+        (|a| { a.blx(3); }, "blx r3"),
+        (|a| { a.bx(3); }, "bx r3"),
+        (|a| { a.ldrb_reg(1, 2, 3); }, "ldrb r1, [r2, r3]"),
+        (|a| { a.adds_imm(1, 7); }, "adds r1, #7"),
+        (|a| { a.subs_imm(1, 7); }, "subs r1, #7"),
+        (|a| { a.lsls_imm(1, 2, 3); }, "lsls r1, r2, #3"),
+        (|a| { a.lsrs_imm(1, 2, 3); }, "lsrs r1, r2, #3"),
+        (|a| { a.adds_reg(1, 2, 3); }, "adds r1, r2, r3"),
+        (|a| { a.mov_reg(9, 3); }, "mov r9, r3"),
+        (|a| { a.movs_reg(1, 2); }, "movs r1, r2"),
     ];
     for (build, want) in cases {
         assert_eq!(round_trip(build), want);
@@ -1593,16 +1593,16 @@ fn the_register_field_of_every_emitter_that_has_one_is_actually_read() {
     // `rt == 0`, so a single-register test would pass either way.
     for r in 0..8u16 {
         assert_eq!(
-            round_trip(|a| a.ldr_lit(r, 0xDEAD_BEEF)),
+            round_trip(|a| { a.ldr_lit(r, 0xDEAD_BEEF); }),
             format!("ldr r{r}, [pc, #0], 0x4")
         );
-        assert_eq!(round_trip(|a| a.cmp_imm(r, 7)), format!("cmp r{r}, #7"));
-        assert_eq!(round_trip(|a| a.movs_imm(r, 7)), format!("movs r{r}, #7"));
-        assert_eq!(round_trip(|a| a.adds_imm(r, 7)), format!("adds r{r}, #7"));
-        assert_eq!(round_trip(|a| a.subs_imm(r, 7)), format!("subs r{r}, #7"));
-        assert_eq!(round_trip(|a| a.bx(r)), format!("bx r{r}"));
+        assert_eq!(round_trip(|a| { a.cmp_imm(r, 7); }), format!("cmp r{r}, #7"));
+        assert_eq!(round_trip(|a| { a.movs_imm(r, 7); }), format!("movs r{r}, #7"));
+        assert_eq!(round_trip(|a| { a.adds_imm(r, 7); }), format!("adds r{r}, #7"));
+        assert_eq!(round_trip(|a| { a.subs_imm(r, 7); }), format!("subs r{r}, #7"));
+        assert_eq!(round_trip(|a| { a.bx(r); }), format!("bx r{r}"));
         assert_eq!(
-            round_trip(|a| a.movs_reg(r, 7 - r)),
+            round_trip(|a| { a.movs_reg(r, 7 - r); }),
             format!("movs r{r}, r{}", 7 - r)
         );
     }
@@ -1614,7 +1614,7 @@ fn the_register_field_of_every_emitter_that_has_one_is_actually_read() {
             15 => "pc".to_string(),
             n => format!("r{n}"),
         };
-        assert_eq!(round_trip(|a| a.mov_reg(r, 3)), format!("mov {name}, r3"));
+        assert_eq!(round_trip(|a| { a.mov_reg(r, 3); }), format!("mov {name}, r3"));
     }
 }
 

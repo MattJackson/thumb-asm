@@ -725,12 +725,45 @@ pub struct Asm {
     blobs: Vec<(u16, Vec<u8>)>,      // (label, data) appended after the pool
     labels: Vec<Option<usize>>,      // label id -> byte pos
     err: Option<AsmError>,           // first invalid operand; surfaced by finish()
+    target: isa::Target,             // profile this buffer is being built for
 }
 
 impl Asm {
-    /// A fresh, empty assembler.
+    /// A fresh, empty assembler targeting [`isa::Target::Union`] — the historical
+    /// default, which accepts every profile's encodings.
+    ///
+    /// For a chip-specific buffer where the encoder must refuse instructions the
+    /// target does not define, use [`Asm::with_target`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build for a specific ISA target. Emitters whose encoding is not defined on
+    /// `target` fail at the call site — the resulting `Err` surfaces from
+    /// [`Asm::finish`] with the exact mnemonic and byte position of the refused
+    /// emitter, and the buffer up to that point is discarded on the next
+    /// [`Asm::finish`] because the assembler resets itself.
+    ///
+    /// The default [`Asm::new`] is `with_target(Target::Union)`, which is the
+    /// crate's historical byte-for-byte behaviour.
+    ///
+    /// ```
+    /// use thumb_asm::{Asm, isa::Target};
+    /// // A V8M buffer emitting a Security Gateway pattern via raw32 — accepted.
+    /// let mut a = Asm::with_target(Target::V8M);
+    /// a.raw32(0xE97F, 0xE97F);
+    /// assert!(a.finish().is_ok());
+    /// ```
+    pub fn with_target(target: isa::Target) -> Self {
+        Self {
+            target,
+            ..Self::default()
+        }
+    }
+
+    /// The [`isa::Target`] this buffer is being built for.
+    pub fn target(&self) -> isa::Target {
+        self.target
     }
 
     /// Current byte position (also a branch target).
@@ -794,128 +827,188 @@ impl Asm {
     }
 
     /// Bind `label` to the current position.
-    pub fn bind(&mut self, label: u16) {
+    pub fn bind(&mut self, label: u16) -> &mut Self {
         match self.labels.get_mut(label as usize) {
             Some(slot) => *slot = Some(self.code.len()),
             None => self.fail(format!("bind: label {label} was never reserved")),
         }
+        self
     }
 
-    /// Emit a raw 16-bit Thumb instruction (little-endian).
-    pub fn raw16(&mut self, insn: u16) {
+    /// The internal 16-bit writer. Every emitter appends here; this is the one
+    /// choke point that consumes the operand-formed halfword and stops it being
+    /// second-guessed downstream. Public [`Asm::raw16`] delegates to this after
+    /// running the target-legality gate for non-`Union` targets.
+    fn emit16(&mut self, insn: u16) {
         self.code.extend_from_slice(&insn.to_le_bytes());
     }
 
+    /// The internal 32-bit writer for wide (Thumb-2) encodings — halfword-order
+    /// `hw1` then `hw2`, each little-endian, matching [`encode_bl`]'s byte layout.
+    fn emit32(&mut self, hw1: u16, hw2: u16) {
+        self.code.extend_from_slice(&hw1.to_le_bytes());
+        self.code.extend_from_slice(&hw2.to_le_bytes());
+    }
+
+    /// Emit a raw 16-bit Thumb instruction (little-endian).
+    ///
+    /// Under [`Target::Union`](isa::Target::Union) this is byte-for-byte
+    /// unchanged: any halfword goes in the buffer. Under any non-`Union` target,
+    /// [`Asm::raw16`] gains a legality check keyed on what the target decoder
+    /// says the bytes are — see the crate docs (step 5 of the 0.14.0 gate lands
+    /// this behaviour). For unchecked emission under any target, use
+    /// [`Asm::raw16_unchecked`].
+    pub fn raw16(&mut self, insn: u16) -> &mut Self {
+        self.emit16(insn);
+        self
+    }
+
+    /// Emit two halfwords of a wide Thumb-2 instruction (`hw1` then `hw2`,
+    /// little-endian each).
+    ///
+    /// Under [`Target::Union`](isa::Target::Union) this writes the bytes
+    /// unchanged. Under a non-`Union` target the bytes are decoded under the
+    /// caller's target and refused if that decoder does not know them or the
+    /// legality table says they are not defined there.
+    pub fn raw32(&mut self, hw1: u16, hw2: u16) -> &mut Self {
+        self.emit32(hw1, hw2);
+        self
+    }
+
+    /// Emit any 16-bit halfword, bypassing every legality check. The explicit
+    /// escape hatch for hand-encoded CMSE / ThumbEE / new-Cortex-M patterns that
+    /// this crate has no emitter for yet — the caller has taken responsibility
+    /// for the bytes.
+    pub fn raw16_unchecked(&mut self, insn: u16) -> &mut Self {
+        self.emit16(insn);
+        self
+    }
+
     /// `ldr rt, [pc, #imm]` loading `value` from the pool (dedup, first-ref order).
-    pub fn ldr_lit(&mut self, rt: u16, value: u32) {
+    pub fn ldr_lit(&mut self, rt: u16, value: u32) -> &mut Self {
         self.lo("ldr_lit", "rt", rt);
         let pos = self.code.len();
-        self.raw16(0x4800 | (rt << 8)); // patched in finish()
+        self.emit16(0x4800 | (rt << 8)); // patched in finish()
         self.ldrs.push((pos, value, rt));
+        self
     }
 
     /// `ldrb rt, [rn, #imm5]` (byte load, offset 0..31).
-    pub fn ldrb_imm(&mut self, rt: u16, rn: u16, imm5: u16) {
+    pub fn ldrb_imm(&mut self, rt: u16, rn: u16, imm5: u16) -> &mut Self {
         self.lo("ldrb_imm", "rt", rt);
         self.lo("ldrb_imm", "rn", rn);
         self.imm("ldrb_imm", imm5, 31, 1);
-        self.raw16(0x7800 | (imm5 << 6) | (rn << 3) | rt);
+        self.emit16(0x7800 | (imm5 << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `ldr rt, [rn, #imm]` (word load; `imm` must be a multiple of 4, 0..124).
-    pub fn ldr_imm(&mut self, rt: u16, rn: u16, imm: u16) {
+    pub fn ldr_imm(&mut self, rt: u16, rn: u16, imm: u16) -> &mut Self {
         self.lo("ldr_imm", "rt", rt);
         self.lo("ldr_imm", "rn", rn);
         self.imm("ldr_imm", imm, 124, 4);
-        self.raw16(0x6800 | ((imm >> 2) << 6) | (rn << 3) | rt);
+        self.emit16(0x6800 | ((imm >> 2) << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `strh rt, [rn, #imm]` (halfword store; `imm` must be even, 0..62).
-    pub fn strh_imm(&mut self, rt: u16, rn: u16, imm: u16) {
+    pub fn strh_imm(&mut self, rt: u16, rn: u16, imm: u16) -> &mut Self {
         self.lo("strh_imm", "rt", rt);
         self.lo("strh_imm", "rn", rn);
         self.imm("strh_imm", imm, 62, 2);
-        self.raw16(0x8000 | ((imm >> 1) << 6) | (rn << 3) | rt);
+        self.emit16(0x8000 | ((imm >> 1) << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `str rt, [rn, #imm]` (word store; `imm` must be a multiple of 4, 0..124).
-    pub fn str_imm(&mut self, rt: u16, rn: u16, imm: u16) {
+    pub fn str_imm(&mut self, rt: u16, rn: u16, imm: u16) -> &mut Self {
         self.lo("str_imm", "rt", rt);
         self.lo("str_imm", "rn", rn);
         self.imm("str_imm", imm, 124, 4);
-        self.raw16(0x6000 | ((imm >> 2) << 6) | (rn << 3) | rt);
+        self.emit16(0x6000 | ((imm >> 2) << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `bics rd, rm` (bit-clear: `rd &= ~rm`).
-    pub fn bics(&mut self, rd: u16, rm: u16) {
+    pub fn bics(&mut self, rd: u16, rm: u16) -> &mut Self {
         self.lo("bics", "rd", rd);
         self.lo("bics", "rm", rm);
-        self.raw16(0x4380 | (rm << 3) | rd);
+        self.emit16(0x4380 | (rm << 3) | rd);
+        self
     }
 
     /// `orrs rd, rm` (`rd |= rm`).
-    pub fn orrs(&mut self, rd: u16, rm: u16) {
+    pub fn orrs(&mut self, rd: u16, rm: u16) -> &mut Self {
         self.lo("orrs", "rd", rd);
         self.lo("orrs", "rm", rm);
-        self.raw16(0x4300 | (rm << 3) | rd);
+        self.emit16(0x4300 | (rm << 3) | rd);
+        self
     }
 
     /// `strb rt, [rn, #imm5]` (byte store, offset 0..31).
-    pub fn strb_imm(&mut self, rt: u16, rn: u16, imm5: u16) {
+    pub fn strb_imm(&mut self, rt: u16, rn: u16, imm5: u16) -> &mut Self {
         self.lo("strb_imm", "rt", rt);
         self.lo("strb_imm", "rn", rn);
         self.imm("strb_imm", imm5, 31, 1);
-        self.raw16(0x7000 | (imm5 << 6) | (rn << 3) | rt);
+        self.emit16(0x7000 | (imm5 << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `cmp rn, #imm8`.
-    pub fn cmp_imm(&mut self, rn: u16, imm8: u8) {
+    pub fn cmp_imm(&mut self, rn: u16, imm8: u8) -> &mut Self {
         self.lo("cmp_imm", "rn", rn);
-        self.raw16(0x2800 | (rn << 8) | imm8 as u16);
+        self.emit16(0x2800 | (rn << 8) | imm8 as u16);
+        self
     }
 
     /// `cmp rn, rm` (low registers, data-processing form).
-    pub fn cmp_reg(&mut self, rn: u16, rm: u16) {
+    pub fn cmp_reg(&mut self, rn: u16, rm: u16) -> &mut Self {
         self.lo("cmp_reg", "rn", rn);
         self.lo("cmp_reg", "rm", rm);
-        self.raw16(0x4280 | (rm << 3) | rn);
+        self.emit16(0x4280 | (rm << 3) | rn);
+        self
     }
 
     /// `movs rt, #imm8`.
-    pub fn movs_imm(&mut self, rt: u16, imm8: u8) {
+    pub fn movs_imm(&mut self, rt: u16, imm8: u8) -> &mut Self {
         self.lo("movs_imm", "rt", rt);
-        self.raw16(0x2000 | (rt << 8) | imm8 as u16);
+        self.emit16(0x2000 | (rt << 8) | imm8 as u16);
+        self
     }
 
     /// `push {reglist}` (bit 8 = lr). e.g. `push {lr}` = `0x0100`,
     /// `push {r0, r1, lr}` = `0x0103`. Must be non-empty and within R0-R7 + lr;
     /// anything else is an [`AsmError`] from [`Asm::finish`].
-    pub fn push(&mut self, reglist: u16) {
+    pub fn push(&mut self, reglist: u16) -> &mut Self {
         self.reglist("push", "lr", reglist);
-        self.raw16(0xB400 | reglist);
+        self.emit16(0xB400 | reglist);
+        self
     }
 
     /// `pop {reglist}` (bit 8 = pc). e.g. `pop {pc}` = `0x0100`,
     /// `pop {r0, r1, pc}` = `0x0103`. Must be non-empty and within R0-R7 + pc;
     /// anything else is an [`AsmError`] from [`Asm::finish`].
-    pub fn pop(&mut self, reglist: u16) {
+    pub fn pop(&mut self, reglist: u16) -> &mut Self {
         self.reglist("pop", "pc", reglist);
-        self.raw16(0xBC00 | reglist);
+        self.emit16(0xBC00 | reglist);
+        self
     }
 
     /// `blx rm`.
-    pub fn blx(&mut self, rm: u16) {
+    pub fn blx(&mut self, rm: u16) -> &mut Self {
         self.reg("blx", "rm", rm);
         if rm == 15 {
             self.fail("blx: rm must not be pc (UNPREDICTABLE, A7.7.20)".to_string());
         }
-        self.raw16(0x4780 | (rm << 3));
+        self.emit16(0x4780 | (rm << 3));
+        self
     }
 
     /// `bx rm`.
-    pub fn bx(&mut self, rm: u16) {
+    pub fn bx(&mut self, rm: u16) -> &mut Self {
         self.reg("bx", "rm", rm);
-        self.raw16(0x4700 | (rm << 3));
+        self.emit16(0x4700 | (rm << 3));
+        self
     }
 
     /// `b<cond> label` — the generic conditional branch (`B` T1, `1101 cond
@@ -931,113 +1024,118 @@ impl Asm {
     ///
     /// The fourteen named wrappers ([`Asm::beq`], [`Asm::bne`], …) are one-line
     /// calls to this; use whichever reads better at the call site.
-    pub fn b_cond(&mut self, cond: Cond, label: u16) {
+    pub fn b_cond(&mut self, cond: Cond, label: u16) -> &mut Self {
         match cond {
             Cond::Al => self.b(label),
             c => {
                 let pos = self.code.len();
-                self.raw16(0xD000 | ((c.bits() as u16) << 8));
+                self.emit16(0xD000 | ((c.bits() as u16) << 8));
                 self.fixups.push((pos, label, false));
+                self
             }
         }
     }
 
     /// `beq label` — equal, `Z == 1`.
-    pub fn beq(&mut self, label: u16) {
-        self.b_cond(Cond::Eq, label);
+    pub fn beq(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Eq, label)
     }
 
     /// `bne label` — not equal, `Z == 0`.
-    pub fn bne(&mut self, label: u16) {
-        self.b_cond(Cond::Ne, label);
+    pub fn bne(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Ne, label)
     }
 
     /// `bhs label` / `bcs` — unsigned ≥, `C == 1`.
-    pub fn bhs(&mut self, label: u16) {
-        self.b_cond(Cond::Hs, label);
+    pub fn bhs(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Hs, label)
     }
 
     /// `blo label` / `bcc` — unsigned <, `C == 0`.
-    pub fn blo(&mut self, label: u16) {
-        self.b_cond(Cond::Lo, label);
+    pub fn blo(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Lo, label)
     }
 
     /// `bmi label` — negative, `N == 1`.
-    pub fn bmi(&mut self, label: u16) {
-        self.b_cond(Cond::Mi, label);
+    pub fn bmi(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Mi, label)
     }
 
     /// `bpl label` — positive or zero, `N == 0`.
-    pub fn bpl(&mut self, label: u16) {
-        self.b_cond(Cond::Pl, label);
+    pub fn bpl(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Pl, label)
     }
 
     /// `bvs label` — overflow set, `V == 1`.
-    pub fn bvs(&mut self, label: u16) {
-        self.b_cond(Cond::Vs, label);
+    pub fn bvs(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Vs, label)
     }
 
     /// `bvc label` — overflow clear, `V == 0`.
-    pub fn bvc(&mut self, label: u16) {
-        self.b_cond(Cond::Vc, label);
+    pub fn bvc(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Vc, label)
     }
 
     /// `bhi label` — unsigned >, `C == 1 && Z == 0`.
-    pub fn bhi(&mut self, label: u16) {
-        self.b_cond(Cond::Hi, label);
+    pub fn bhi(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Hi, label)
     }
 
     /// `bls label` — unsigned ≤, `C == 0 || Z == 1`.
-    pub fn bls(&mut self, label: u16) {
-        self.b_cond(Cond::Ls, label);
+    pub fn bls(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Ls, label)
     }
 
     /// `bge label` — signed ≥, `N == V`.
-    pub fn bge(&mut self, label: u16) {
-        self.b_cond(Cond::Ge, label);
+    pub fn bge(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Ge, label)
     }
 
     /// `blt label` — signed <, `N != V`.
-    pub fn blt(&mut self, label: u16) {
-        self.b_cond(Cond::Lt, label);
+    pub fn blt(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Lt, label)
     }
 
     /// `bgt label` — signed >, `Z == 0 && N == V`.
-    pub fn bgt(&mut self, label: u16) {
-        self.b_cond(Cond::Gt, label);
+    pub fn bgt(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Gt, label)
     }
 
     /// `ble label` — signed ≤, `Z == 1 || N != V`.
-    pub fn ble(&mut self, label: u16) {
-        self.b_cond(Cond::Le, label);
+    pub fn ble(&mut self, label: u16) -> &mut Self {
+        self.b_cond(Cond::Le, label)
     }
 
     /// `b label` (unconditional, 11-bit offset; `B` T2, A7.7.12). Range
     /// ±2046 bytes.
-    pub fn b(&mut self, label: u16) {
+    pub fn b(&mut self, label: u16) -> &mut Self {
         let pos = self.code.len();
-        self.raw16(0xE000);
+        self.emit16(0xE000);
         self.fixups.push((pos, label, true));
+        self
     }
 
     /// `ldrb rt, [rn, rm]` (register-offset byte load).
-    pub fn ldrb_reg(&mut self, rt: u16, rn: u16, rm: u16) {
+    pub fn ldrb_reg(&mut self, rt: u16, rn: u16, rm: u16) -> &mut Self {
         self.lo("ldrb_reg", "rt", rt);
         self.lo("ldrb_reg", "rn", rn);
         self.lo("ldrb_reg", "rm", rm);
-        self.raw16(0x5C00 | (rm << 6) | (rn << 3) | rt);
+        self.emit16(0x5C00 | (rm << 6) | (rn << 3) | rt);
+        self
     }
 
     /// `adds rt, #imm8`.
-    pub fn adds_imm(&mut self, rt: u16, imm8: u8) {
+    pub fn adds_imm(&mut self, rt: u16, imm8: u8) -> &mut Self {
         self.lo("adds_imm", "rt", rt);
-        self.raw16(0x3000 | (rt << 8) | imm8 as u16);
+        self.emit16(0x3000 | (rt << 8) | imm8 as u16);
+        self
     }
 
     /// `subs rt, #imm8`.
-    pub fn subs_imm(&mut self, rt: u16, imm8: u8) {
+    pub fn subs_imm(&mut self, rt: u16, imm8: u8) -> &mut Self {
         self.lo("subs_imm", "rt", rt);
-        self.raw16(0x3800 | (rt << 8) | imm8 as u16);
+        self.emit16(0x3800 | (rt << 8) | imm8 as u16);
+        self
     }
 
     /// `lsls rd, rm, #imm5` — `LSL (immediate)` T1, `0000 0 imm5 Rm Rd`
@@ -1048,29 +1146,32 @@ impl Asm {
     /// the same halfword as [`Asm::movs_reg`]`(rd, rm)` and disassembles as
     /// `movs rd, rm`. Both set N/Z. Callers who mean the move should write the
     /// move.
-    pub fn lsls_imm(&mut self, rd: u16, rm: u16, imm5: u16) {
+    pub fn lsls_imm(&mut self, rd: u16, rm: u16, imm5: u16) -> &mut Self {
         self.lo("lsls_imm", "rd", rd);
         self.lo("lsls_imm", "rm", rm);
         self.imm("lsls_imm", imm5, 31, 1);
-        self.raw16((imm5 << 6) | (rm << 3) | rd);
+        self.emit16((imm5 << 6) | (rm << 3) | rd);
+        self
     }
 
     /// `lsrs rd, rm, #imm5` (logical shift right). `imm5` is 0..=31, where
     /// `0` is not a zero-bit shift but encodes a shift of **32** (A7.7.71
     /// `DecodeImmShift`), leaving `rd` zeroed and C set from `rm`'s bit 31.
-    pub fn lsrs_imm(&mut self, rd: u16, rm: u16, imm5: u16) {
+    pub fn lsrs_imm(&mut self, rd: u16, rm: u16, imm5: u16) -> &mut Self {
         self.lo("lsrs_imm", "rd", rd);
         self.lo("lsrs_imm", "rm", rm);
         self.imm("lsrs_imm", imm5, 31, 1);
-        self.raw16(0x0800 | (imm5 << 6) | (rm << 3) | rd);
+        self.emit16(0x0800 | (imm5 << 6) | (rm << 3) | rd);
+        self
     }
 
     /// `adds rd, rn, rm` (register).
-    pub fn adds_reg(&mut self, rd: u16, rn: u16, rm: u16) {
+    pub fn adds_reg(&mut self, rd: u16, rn: u16, rm: u16) -> &mut Self {
         self.lo("adds_reg", "rd", rd);
         self.lo("adds_reg", "rn", rn);
         self.lo("adds_reg", "rm", rm);
-        self.raw16(0x1800 | (rm << 6) | (rn << 3) | rd);
+        self.emit16(0x1800 | (rm << 6) | (rn << 3) | rd);
+        self
     }
 
     /// `mov rd, rm` — `MOV (register)` T1, `0100 0110 D Rm(4) Rd(3)`
@@ -1093,10 +1194,11 @@ impl Asm {
     /// prefer [`Asm::bx`] where a branch is what is meant.
     ///
     /// For the old flag-setting behaviour, ask for it by name: [`Asm::movs_reg`].
-    pub fn mov_reg(&mut self, rd: u16, rm: u16) {
+    pub fn mov_reg(&mut self, rd: u16, rm: u16) -> &mut Self {
         self.reg("mov_reg", "rd", rd);
         self.reg("mov_reg", "rm", rm);
-        self.raw16(0x4600 | ((rd & 8) << 4) | ((rm & 0xF) << 3) | (rd & 7));
+        self.emit16(0x4600 | ((rd & 8) << 4) | ((rm & 0xF) << 3) | (rd & 7));
+        self
     }
 
     /// `movs rd, rm` — `MOV (register)` T2, `0000 0000 00 Rm Rd` (A5.2.1 /
@@ -1109,19 +1211,21 @@ impl Asm {
     /// T2 is not permitted inside an IT block.
     ///
     /// Identical in encoding to `lsls rd, rm, #0`; see [`Asm::lsls_imm`].
-    pub fn movs_reg(&mut self, rd: u16, rm: u16) {
+    pub fn movs_reg(&mut self, rd: u16, rm: u16) -> &mut Self {
         self.lo("movs_reg", "rd", rd);
         self.lo("movs_reg", "rm", rm);
-        self.raw16((rm << 3) | rd);
+        self.emit16((rm << 3) | rd);
+        self
     }
 
     /// `adr rd, blob` — position-independent load of a data blob's address
     /// (`add rd, pc, #imm`). The blob is declared with [`Asm::data_blob`].
-    pub fn adr(&mut self, rd: u16, blob_label: u16) {
+    pub fn adr(&mut self, rd: u16, blob_label: u16) -> &mut Self {
         self.lo("adr", "rd", rd);
         let pos = self.code.len();
-        self.raw16(0xA000 | (rd << 8));
+        self.emit16(0xA000 | (rd << 8));
         self.adrs.push((pos, blob_label));
+        self
     }
 
     /// Declare a read-only data blob appended after the code+pool; returns a
@@ -1133,16 +1237,35 @@ impl Asm {
     }
 
     /// Lay out the pool (4-aligned) then data blobs, and back-patch every branch,
-    /// `ldr` literal, and `adr`.
-    pub fn finish(mut self) -> Result<Vec<u8>, AsmError> {
+    /// `ldr` literal, and `adr`. Returns the assembled bytes.
+    ///
+    /// # Reuse
+    ///
+    /// `finish` takes `&mut self` and, on every path (`Ok` or `Err`), leaves
+    /// `self` as a **fresh, empty assembler with the same target** — the
+    /// half-consumed intermediate state (fixups, literal pool, labels, code
+    /// buffer) is taken out of `self` before any layout work runs, so a caller
+    /// can call `finish` twice in a row (the second returns `Ok(vec![])`), and
+    /// a stale label from the previous buffer used after `finish` decodes as
+    /// "never reserved" — never as a silent branch into the previous buffer's
+    /// address space. See the reuse tests in `src/lib.rs::asm_reuse_tests`.
+    pub fn finish(&mut self) -> Result<Vec<u8>, AsmError> {
+        // Reading `self.target` while `self` is also `&mut`-borrowed as the
+        // first argument of `mem::replace` trips E0503; the two-phase borrow
+        // rules cover method-call autoref, not an explicit `&mut` in argument
+        // position. Copy the field out first, then let `mem::replace` take
+        // exclusive ownership.
+        let target = self.target;
+        let mut this = core::mem::replace(self, Asm::with_target(target));
+
         // 0. any operand rejected during emit. Reported before layout so the
         //    caller sees the cause, not a downstream symptom of the bad bytes.
-        if let Some(e) = self.err.take() {
+        if let Some(e) = this.err.take() {
             return Err(e);
         }
         // 1. code-position branches (targets already bound during emit).
-        for (pos, label, uncond) in core::mem::take(&mut self.fixups) {
-            // `get`, not `self.labels[..]`. The id is the caller's: `bind`
+        for (pos, label, uncond) in core::mem::take(&mut this.fixups) {
+            // `get`, not `this.labels[..]`. The id is the caller's: `bind`
             // validates it through `get_mut` and reports "never reserved" as
             // an error, but the emitters that push fixups — `b`, `b_cond`,
             // `adr` — do not, so an id that was never handed out by `label()`
@@ -1153,7 +1276,7 @@ impl Asm {
             // The two failures are distinguished because they are different
             // mistakes: an id nobody reserved is a bug at the call site, and
             // a reserved id never bound is a missing `bind`.
-            let target = match self.labels.get(label as usize) {
+            let target = match this.labels.get(label as usize) {
                 Some(Some(t)) => *t,
                 Some(None) => return Err(AsmError(format!("unbound label {label}"))),
                 None => {
@@ -1174,17 +1297,17 @@ impl Asm {
                         "conditional branch out of range ({off} halfwords)"
                     )));
                 }
-                let base = u16::from_le_bytes([self.code[pos], self.code[pos + 1]]) & 0xFF00;
+                let base = u16::from_le_bytes([this.code[pos], this.code[pos + 1]]) & 0xFF00;
                 base | (off as i8 as u8 as u16)
             };
-            self.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
+            this.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
         }
         // 2. literal pool (4-aligned), patch ldr.
-        while self.code.len() % 4 != 0 {
-            self.code.push(0x00);
+        while this.code.len() % 4 != 0 {
+            this.code.push(0x00);
         }
         let mut placed: Vec<(u32, u32)> = Vec::new();
-        for (pos, value, rt) in core::mem::take(&mut self.ldrs) {
+        for (pos, value, rt) in core::mem::take(&mut this.ldrs) {
             // Linear scan is deliberate. The pool is laid out in first-reference
             // order, which this `Vec` is what preserves, and a realistic stub holds
             // a handful of distinct literals — the `Asm` type is documented as a
@@ -1194,8 +1317,8 @@ impl Asm {
             let off = match placed.iter().find(|(v, _)| *v == value) {
                 Some(&(_, o)) => o,
                 None => {
-                    let o = self.code.len() as u32;
-                    self.code.extend_from_slice(&value.to_le_bytes());
+                    let o = this.code.len() as u32;
+                    this.code.extend_from_slice(&value.to_le_bytes());
                     placed.push((value, o));
                     o
                 }
@@ -1208,24 +1331,24 @@ impl Asm {
                 )));
             }
             let enc = 0x4800u16 | (rt << 8) | imm8 as u16;
-            self.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
+            this.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
         }
         // 3. data blobs (each 4-aligned); bind their labels.
-        for (label, bytes) in core::mem::take(&mut self.blobs) {
-            while self.code.len() % 4 != 0 {
-                self.code.push(0x00);
+        for (label, bytes) in core::mem::take(&mut this.blobs) {
+            while this.code.len() % 4 != 0 {
+                this.code.push(0x00);
             }
             // Indexed directly, unlike the fixup loops above, and safely so:
-            // `self.blobs` has exactly one producer, `data_blob`, which calls
-            // `self.label()` itself and returns that id. So a blob's label is
+            // `this.blobs` has exactly one producer, `data_blob`, which calls
+            // `label()` itself and returns that id. So a blob's label is
             // always one this `Asm` reserved. The *reader* below is different
             // — `adr` takes the id from the caller — and is guarded.
-            self.labels[label as usize] = Some(self.code.len());
-            self.code.extend_from_slice(&bytes);
+            this.labels[label as usize] = Some(this.code.len());
+            this.code.extend_from_slice(&bytes);
         }
         // 4. adr fixups (blob labels now bound).
-        for (pos, label) in core::mem::take(&mut self.adrs) {
-            let target = match self.labels.get(label as usize) {
+        for (pos, label) in core::mem::take(&mut this.adrs) {
+            let target = match this.labels.get(label as usize) {
                 Some(Some(t)) => *t,
                 Some(None) => return Err(AsmError(format!("unbound blob label {label}"))),
                 None => {
@@ -1242,11 +1365,11 @@ impl Asm {
                 )));
             }
             let enc = 0xA000u16
-                | ((u16::from_le_bytes([self.code[pos], self.code[pos + 1]]) >> 8 & 7) << 8)
+                | ((u16::from_le_bytes([this.code[pos], this.code[pos + 1]]) >> 8 & 7) << 8)
                 | ((imm - base) / 4) as u16;
-            self.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
+            this.code[pos..pos + 2].copy_from_slice(&enc.to_le_bytes());
         }
-        Ok(self.code)
+        Ok(this.code)
     }
 }
 
@@ -2599,5 +2722,69 @@ mod error_reason_tests {
             "the message should name the instruction, got: {msg}"
         );
         assert_eq!(err.message(), err.to_string());
+    }
+}
+
+#[cfg(test)]
+mod asm_reuse_tests {
+    //! `finish` is `&mut self` (not `self`), so an `Asm` survives it — this
+    //! module pins the two invariants of the reuse contract: successive
+    //! `finish()`es on the same builder do not carry state between them, and
+    //! a label id from a previous buffer used after `finish` decodes as
+    //! "never reserved" rather than as a silent branch to the previous
+    //! buffer's byte offset.
+    use super::*;
+    use crate::isa::Target;
+    /// A stub the assembler will accept without any pool or fixups, so the
+    /// second `finish()` sees an assembler that is genuinely empty and
+    /// returns exactly zero bytes rather than a residual pool from the first
+    /// buffer.
+    #[test]
+    fn a_second_finish_on_the_same_assembler_produces_the_empty_buffer() {
+        let mut a = Asm::with_target(Target::Union);
+        a.push(0x0100); // 2 bytes, no fixups, no pool needed.
+        let first = a.finish().expect("push assembles");
+        assert_eq!(first.len(), 4, "one halfword padded to the 4-byte pool align");
+        let second = a.finish().expect("a reset assembler still finishes");
+        assert!(
+            second.is_empty(),
+            "a fresh assembler after finish must produce no bytes, got {second:02x?}"
+        );
+    }
+
+    /// The reuse hazard round 4 of the audit named: a label reserved on the
+    /// old buffer must not silently bind to any offset in the new one. After
+    /// `finish`, the labels vector is gone — a stale id is "never reserved",
+    /// which is what the next `finish` reports.
+    #[test]
+    fn a_label_from_a_previous_finish_is_refused_by_the_next_one() {
+        let mut a = Asm::new();
+        let stale = a.label();
+        a.bind(stale);
+        let _ = a.finish().expect("empty buffer assembles");
+        // `stale` is a `u16` the caller kept, but the reset assembler has an
+        // empty labels vector, so referencing it is a use-of-unreserved id.
+        a.b(stale);
+        let err = a
+            .finish()
+            .expect_err("stale label must not silently branch into the previous buffer");
+        assert!(
+            err.to_string().contains("was never reserved"),
+            "expected an unreserved-label diagnostic, got: {err}"
+        );
+    }
+
+    /// `finish` also preserves the target across resets. A caller who set up a
+    /// V8M builder and finishes it does not silently lose the V8M gate on the
+    /// next round of emits.
+    #[test]
+    fn a_reset_assembler_keeps_the_original_target() {
+        let mut a = Asm::with_target(Target::V8M);
+        let _ = a.finish().expect("empty buffer");
+        assert_eq!(
+            a.target(),
+            Target::V8M,
+            "target must survive the reset in finish"
+        );
     }
 }
