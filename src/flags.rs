@@ -859,9 +859,24 @@ mod tests {
         // each look like a no-op: `Flags::NZC.contains(Flags::ALL)` already
         // distinguishes the V clause, so it is the only one under test until
         // these lines land.
-        let n_only = Flags { n: true, z: false, c: false, v: false };
-        let z_only = Flags { n: false, z: true, c: false, v: false };
-        let c_only = Flags { n: false, z: false, c: true, v: false };
+        let n_only = Flags {
+            n: true,
+            z: false,
+            c: false,
+            v: false,
+        };
+        let z_only = Flags {
+            n: false,
+            z: true,
+            c: false,
+            v: false,
+        };
+        let c_only = Flags {
+            n: false,
+            z: false,
+            c: true,
+            v: false,
+        };
         assert!(!Flags::NONE.contains(n_only));
         assert!(!Flags::NONE.contains(z_only));
         assert!(!Flags::NONE.contains(c_only));
