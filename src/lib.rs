@@ -950,26 +950,129 @@ impl Asm {
 
     /// Emit a raw 16-bit Thumb instruction (little-endian).
     ///
-    /// Under [`Target::Union`](isa::Target::Union) this is byte-for-byte
-    /// unchanged: any halfword goes in the buffer. Under any non-`Union` target,
-    /// [`Asm::raw16`] gains a legality check keyed on what the target decoder
-    /// says the bytes are — see the crate docs (step 5 of the 0.14.0 gate lands
-    /// this behaviour). For unchecked emission under any target, use
-    /// [`Asm::raw16_unchecked`].
+    /// # Under [`Target::Union`](isa::Target::Union)
+    ///
+    /// Byte-for-byte unchanged from pre-0.14: any halfword goes in the
+    /// buffer. This is the historical contract callers depended on.
+    ///
+    /// # Under any non-`Union` target
+    ///
+    /// The rule is *bytes as this chip reads them*. The decoder itself is
+    /// authoritative for what a target's CPU makes of the halfword — Armv8-M
+    /// CMSE and ThumbEE state both reassign patterns Armv7 uses for
+    /// something else — so `raw16` runs [`isa::decode_at_with`] under
+    /// `self.target` on the two-byte slice and, if the decoder returns
+    /// `Some(insn)`, consults [`isa::legality::defined_on`] with the
+    /// recovered `(mnemonic, encoding form)` pair.
+    ///
+    /// - `insn_len(insn) == 4` (a wide-instruction prefix) is refused
+    ///   distinctly, pointing at [`Asm::raw32`] or
+    ///   [`Asm::raw16_unchecked`]. This is the isolated
+    ///   `raw16(0xF400)`-style case: the second halfword is missing, so
+    ///   the target decoder cannot recover the mnemonic.
+    /// - `decode_at_with` returns `None` (the halfword is UNDEFINED on
+    ///   this target) → `AsmError::Unsupported { mnemonic: "raw16", .. }`.
+    /// - `defined_on` returns `false` for the recovered mnemonic → same.
+    /// - Otherwise the halfword is written.
+    ///
+    /// Use [`Asm::raw16_unchecked`] to bypass every check.
     pub fn raw16(&mut self, insn: u16) -> &mut Self {
-        self.emit16(insn);
+        if self.target == isa::Target::Union {
+            self.emit16(insn);
+            return self;
+        }
+        if isa::insn_len(insn) == 4 {
+            if self.err.is_none() {
+                self.err = Some(AsmError::Unsupported {
+                    at: self.code.len(),
+                    mnemonic: "raw16",
+                    target: self.target,
+                });
+            }
+            // Emit the byte anyway to keep pos() consistent for later
+            // fixups; finish() will still refuse to hand back bytes.
+            self.emit16(insn);
+            return self;
+        }
+        let bytes = insn.to_le_bytes();
+        match isa::decode_at_with(&bytes, 0, 0, self.target) {
+            Some(decoded) => {
+                let form = isa::legality::EncForm::from(decoded.encoding);
+                if isa::legality::defined_on(
+                    decoded.mnemonic,
+                    form,
+                    self.target,
+                    isa::legality::OpExtra::Plain,
+                ) {
+                    self.emit16(insn);
+                } else {
+                    // Report under the decoded mnemonic so the caller sees
+                    // what the chip actually reads these bytes as — the
+                    // "raw" contract in the docstring.
+                    self.fail_target(decoded.mnemonic);
+                    self.emit16(insn);
+                }
+            }
+            None => {
+                self.fail_target("raw16");
+                self.emit16(insn);
+            }
+        }
         self
     }
 
     /// Emit two halfwords of a wide Thumb-2 instruction (`hw1` then `hw2`,
     /// little-endian each).
     ///
-    /// Under [`Target::Union`](isa::Target::Union) this writes the bytes
-    /// unchanged. Under a non-`Union` target the bytes are decoded under the
-    /// caller's target and refused if that decoder does not know them or the
-    /// legality table says they are not defined there.
+    /// Same rule as [`Asm::raw16`] under non-Union: decode under
+    /// `self.target`, then look the recovered mnemonic up in the legality
+    /// table. Under [`Target::Union`](isa::Target::Union) the bytes are
+    /// written unchanged.
+    ///
+    /// # Example: SG on V8M
+    ///
+    /// ```
+    /// use thumb_asm::{Asm, isa::Target};
+    /// // Security Gateway T1 (ARM ARM CMSE) — halfwords 0xE97F 0xE97F.
+    /// // Accepted under V8M because the V8M decoder recovers `sg`, which
+    /// // the legality table accepts; refused under V7A because that
+    /// // decoder recovers `ldrd`, which the legality table does accept
+    /// // there — this is the "bytes as this chip reads them" contract.
+    /// let mut a = Asm::with_target(Target::V8M);
+    /// a.raw32(0xE97F, 0xE97F);
+    /// assert!(a.finish().is_ok());
+    /// ```
     pub fn raw32(&mut self, hw1: u16, hw2: u16) -> &mut Self {
-        self.emit32(hw1, hw2);
+        if self.target == isa::Target::Union {
+            self.emit32(hw1, hw2);
+            return self;
+        }
+        let bytes = [
+            (hw1 & 0xFF) as u8,
+            (hw1 >> 8) as u8,
+            (hw2 & 0xFF) as u8,
+            (hw2 >> 8) as u8,
+        ];
+        match isa::decode_at_with(&bytes, 0, 0, self.target) {
+            Some(decoded) => {
+                let form = isa::legality::EncForm::from(decoded.encoding);
+                if isa::legality::defined_on(
+                    decoded.mnemonic,
+                    form,
+                    self.target,
+                    isa::legality::OpExtra::Plain,
+                ) {
+                    self.emit32(hw1, hw2);
+                } else {
+                    self.fail_target(decoded.mnemonic);
+                    self.emit32(hw1, hw2);
+                }
+            }
+            None => {
+                self.fail_target("raw32");
+                self.emit32(hw1, hw2);
+            }
+        }
         self
     }
 
@@ -2960,5 +3063,147 @@ mod asm_reuse_tests {
             Target::V8M,
             "target must survive the reset in finish"
         );
+    }
+}
+
+#[cfg(test)]
+mod asm_target_gate_tests {
+    //! End-to-end tests for the [`Asm::with_target`] gate: the `sdiv`/`udiv`
+    //! demonstration emitters and the `raw16`/`raw32` decode-under-target
+    //! recovery path. This module covers the observable behaviour a consumer
+    //! would test; the pin-set / whole-target-variant / EncForm mutation
+    //! tripwires live in [`crate::isa::legality::tests`].
+    use super::*;
+    use crate::isa::Target;
+
+    /// `sdiv` under Armv7-A is UNDEFINED (see `Asm::sdiv` docstring). The
+    /// gate reports it as [`AsmError::Unsupported`] with the exact mnemonic
+    /// and byte position of the emit.
+    #[test]
+    fn sdiv_is_refused_under_v7a() {
+        let mut a = Asm::with_target(Target::V7A);
+        a.sdiv(0, 1, 2);
+        let err = a.finish().expect_err("sdiv is UNDEFINED on Armv7-A");
+        match err {
+            AsmError::Unsupported {
+                at,
+                mnemonic,
+                target,
+            } => {
+                assert_eq!(mnemonic, "sdiv");
+                assert_eq!(target, Target::V7A);
+                assert_eq!(at, 0, "the refused emit sits at the start of the buffer");
+            }
+            other => panic!("expected AsmError::Unsupported, got {other:?}"),
+        }
+    }
+
+    /// V7R accepts `sdiv` — it is mandatory on Armv7-R. The bytes match the
+    /// hand-computed encoding from ARM ARM A8.8.165.
+    #[test]
+    fn sdiv_is_accepted_under_v7r_and_encodes_correctly() {
+        let mut a = Asm::with_target(Target::V7R);
+        a.sdiv(0, 1, 2);
+        let bytes = a.finish().expect("sdiv is mandatory on Armv7-R");
+        // hw1 = 0xFB90 | Rn(=1); hw2 = 0xF0F0 | (Rd=0 << 8) | Rm(=2).
+        assert_eq!(
+            &bytes[..4],
+            &[0x91, 0xFB, 0xF2, 0xF0],
+            "sdiv r0, r1, r2 encoding"
+        );
+    }
+
+    /// V7AR is the strict intersection of V7A and V7R — `sdiv` is refused
+    /// because V7A refuses it. The point Fable's round-4 audit named:
+    /// V7AR is strictly stricter than V7R.
+    #[test]
+    fn v7ar_is_strictly_stricter_than_v7r() {
+        let mut a = Asm::with_target(Target::V7AR);
+        a.sdiv(0, 1, 2);
+        let err = a.finish().expect_err("V7AR must refuse anything V7A refuses");
+        assert!(matches!(err, AsmError::Unsupported { mnemonic: "sdiv", target: Target::V7AR, .. }));
+    }
+
+    /// `raw16` under a non-Union target with a wide-instruction prefix
+    /// halfword (e.g. `0xF400`) is refused distinctly, pointing at
+    /// `raw32`/`raw16_unchecked`. Under Union the same call is accepted —
+    /// the pre-0.14 byte-for-byte contract.
+    #[test]
+    fn raw16_refuses_a_wide_prefix_under_non_union() {
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw16(0xF400);
+        let err = a
+            .finish()
+            .expect_err("wide prefix via raw16 has no second halfword to decode");
+        assert!(matches!(
+            err,
+            AsmError::Unsupported { mnemonic: "raw16", target: Target::V7A, .. }
+        ));
+
+        // Same call under Union: accepted, byte-for-byte.
+        let mut u = Asm::with_target(Target::Union);
+        u.raw16(0xF400);
+        let bytes = u.finish().expect("Union is permissive");
+        assert_eq!(
+            &bytes[..2],
+            &[0x00, 0xF4],
+            "Union writes 0xF400 little-endian"
+        );
+    }
+
+    /// A ThumbEE-only halfword outside the legal `0xC000..=0xCFFF` reassignment
+    /// slice — `0xC100` decodes as UNDEFINED in the ThumbEE table. `raw16`
+    /// under `Target::ThumbEE` therefore refuses.
+    #[test]
+    fn raw16_refuses_thumbee_undefined_pattern() {
+        let mut a = Asm::with_target(Target::ThumbEE);
+        a.raw16(0xC100);
+        let err = a
+            .finish()
+            .expect_err("0xC1xx is UNDEFINED in ThumbEE (Table A9-2)");
+        assert!(matches!(err, AsmError::Unsupported { .. }));
+    }
+
+    /// The Security Gateway pattern is `0xE97F 0xE97F`. On `V8M` the decoder
+    /// recovers `sg` (accepted), on `V7A` it recovers `ldrd` (also accepted
+    /// there — the "bytes as this chip reads them" contract), so both
+    /// targets emit. Only the pattern-does-not-decode-on-target case
+    /// refuses.
+    #[test]
+    fn raw32_accepts_the_v8m_sg_pattern() {
+        let mut a = Asm::with_target(Target::V8M);
+        a.raw32(0xE97F, 0xE97F);
+        let bytes = a.finish().expect("V8M decoder recovers this as sg");
+        assert_eq!(
+            &bytes[..4],
+            &[0x7F, 0xE9, 0x7F, 0xE9],
+            "SG bytes emitted in little-endian order"
+        );
+    }
+
+    /// `raw32` with an `sdiv` pattern under `V7A` refuses — the V7A decoder
+    /// recovers `sdiv` and the legality table rejects it there.
+    #[test]
+    fn raw32_refuses_sdiv_pattern_under_v7a() {
+        // sdiv r2, r1, r3: hw1 = 0xFB91, hw2 = 0xF2F3.
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw32(0xFB91, 0xF2F3);
+        let err = a.finish().expect_err("sdiv via raw32 is UNDEFINED on V7A");
+        assert!(matches!(
+            err,
+            AsmError::Unsupported { mnemonic: "sdiv", target: Target::V7A, .. }
+        ));
+    }
+
+    /// `raw16_unchecked` is the escape hatch: nothing gated, ever. The
+    /// caller has taken responsibility for the bytes.
+    #[test]
+    fn raw16_unchecked_bypasses_the_gate() {
+        let mut a = Asm::with_target(Target::V7A);
+        a.raw16_unchecked(0xF400); // wide prefix, gated on raw16.
+        let bytes = a
+            .finish()
+            .expect("raw16_unchecked bypasses every legality check");
+        assert_eq!(&bytes[..2], &[0x00, 0xF4]);
     }
 }
