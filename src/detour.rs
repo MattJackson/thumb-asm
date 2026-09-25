@@ -845,14 +845,7 @@ fn plan(
     let live: Vec<crate::flags::Flags> = if opts.rewrite_compare_branches {
         insns
             .iter()
-            .map(|i| {
-                crate::flags::live_after(
-                    image,
-                    i.addr as usize,
-                    opts.target,
-                    FLAG_WALK_LIMIT,
-                )
-            })
+            .map(|i| crate::flags::live_after(image, i.addr as usize, opts.target, FLAG_WALK_LIMIT))
             .collect()
     } else {
         // Not asked for, so not computed: the walk is not free and its answer

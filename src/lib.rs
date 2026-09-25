@@ -1470,7 +1470,11 @@ impl Asm {
                 ));
             }
         }
-        self.check_target(mnemonic, isa::legality::EncForm::T1, isa::legality::OpExtra::Plain);
+        self.check_target(
+            mnemonic,
+            isa::legality::EncForm::T1,
+            isa::legality::OpExtra::Plain,
+        );
         let hw1 = hw1_base | (rn & 0xF);
         let hw2 = 0xF0F0 | ((rd & 0xF) << 8) | (rm & 0xF);
         self.emit32(hw1, hw2);
@@ -3054,7 +3058,11 @@ mod asm_reuse_tests {
         let mut a = Asm::with_target(Target::Union);
         a.push(0x0100); // 2 bytes, no fixups, no pool needed.
         let first = a.finish().expect("push assembles");
-        assert_eq!(first.len(), 4, "one halfword padded to the 4-byte pool align");
+        assert_eq!(
+            first.len(),
+            4,
+            "one halfword padded to the 4-byte pool align"
+        );
         let second = a.finish().expect("a reset assembler still finishes");
         assert!(
             second.is_empty(),
@@ -3153,8 +3161,17 @@ mod asm_target_gate_tests {
     fn v7ar_is_strictly_stricter_than_v7r() {
         let mut a = Asm::with_target(Target::V7AR);
         a.sdiv(0, 1, 2);
-        let err = a.finish().expect_err("V7AR must refuse anything V7A refuses");
-        assert!(matches!(err, AsmError::Unsupported { mnemonic: "sdiv", target: Target::V7AR, .. }));
+        let err = a
+            .finish()
+            .expect_err("V7AR must refuse anything V7A refuses");
+        assert!(matches!(
+            err,
+            AsmError::Unsupported {
+                mnemonic: "sdiv",
+                target: Target::V7AR,
+                ..
+            }
+        ));
     }
 
     /// `raw16` under a non-Union target with a wide-instruction prefix
@@ -3170,7 +3187,11 @@ mod asm_target_gate_tests {
             .expect_err("wide prefix via raw16 has no second halfword to decode");
         assert!(matches!(
             err,
-            AsmError::Unsupported { mnemonic: "raw16", target: Target::V7A, .. }
+            AsmError::Unsupported {
+                mnemonic: "raw16",
+                target: Target::V7A,
+                ..
+            }
         ));
 
         // Same call under Union: accepted, byte-for-byte.
@@ -3224,7 +3245,11 @@ mod asm_target_gate_tests {
         let err = a.finish().expect_err("sdiv via raw32 is UNDEFINED on V7A");
         assert!(matches!(
             err,
-            AsmError::Unsupported { mnemonic: "sdiv", target: Target::V7A, .. }
+            AsmError::Unsupported {
+                mnemonic: "sdiv",
+                target: Target::V7A,
+                ..
+            }
         ));
     }
 
@@ -3285,9 +3310,7 @@ mod asm_target_gate_tests {
     fn udiv_is_accepted_under_v7r() {
         let mut a = Asm::with_target(Target::V7R);
         a.udiv(0, 1, 2);
-        let bytes = a
-            .finish()
-            .expect("udiv is mandatory on Armv7-R (spec:874)");
+        let bytes = a.finish().expect("udiv is mandatory on Armv7-R (spec:874)");
         assert_eq!(&bytes[..4], &[0xB1, 0xFB, 0xF2, 0xF0]);
     }
 

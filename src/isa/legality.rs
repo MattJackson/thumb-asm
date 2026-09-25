@@ -91,12 +91,7 @@ pub(crate) enum OpExtra {
 /// behaviour); everything else consults the per-profile table.
 ///
 /// See the module docstring for what's in the table today.
-pub(crate) fn defined_on(
-    mnemonic: &str,
-    form: EncForm,
-    target: Target,
-    extra: OpExtra,
-) -> bool {
+pub(crate) fn defined_on(mnemonic: &str, form: EncForm, target: Target, extra: OpExtra) -> bool {
     // Union always accepts — that's the pre-0.14 byte-for-byte contract.
     if target == Target::Union {
         return true;
@@ -149,7 +144,10 @@ mod tests {
             (Target::V7EM, &[]),
             (Target::V7A, &[("sdiv", EncForm::T1), ("udiv", EncForm::T1)]),
             (Target::V7R, &[]),
-            (Target::V7AR, &[("sdiv", EncForm::T1), ("udiv", EncForm::T1)]),
+            (
+                Target::V7AR,
+                &[("sdiv", EncForm::T1), ("udiv", EncForm::T1)],
+            ),
             (Target::V8M, &[]),
             (Target::ThumbEE, &[]),
         ];
@@ -158,10 +156,7 @@ mod tests {
         // this crate can currently produce that could plausibly differ
         // across profiles. When new emitters land, extend this set (and
         // then the `cases` above will start rejecting stale expectations).
-        let universe: &[(&str, EncForm)] = &[
-            ("sdiv", EncForm::T1),
-            ("udiv", EncForm::T1),
-        ];
+        let universe: &[(&str, EncForm)] = &[("sdiv", EncForm::T1), ("udiv", EncForm::T1)];
 
         for (target, expected_false) in cases {
             for probe in universe {
