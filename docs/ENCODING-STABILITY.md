@@ -64,6 +64,17 @@ own corpus, and it covers instructions nobody thought to write a test for.
 | version | decoded halfwords | digest |
 | --- | ---: | --- |
 | 0.11.1 | 58,233 | `0x0e06fda25d6b89e8` |
+| 0.14.0 | 58,233 | `0x0e06fda25d6b89e8` |
+
+The digest is over the emitted bytes under [`Target::Union`], which is the
+default and reproduces the crate's historical behaviour byte for byte. Under
+a non-`Union` target the encoder consults a per-profile legality table
+(`src/isa/legality.rs`), and bytes an existing emitter refuses on the target
+are not written — that is the whole point of the target gate. Per-target
+byte digests may land in a future release; for 0.14.0 the promise is:
+`Target::Union` output is unchanged, and any non-`Union` output that
+succeeds is byte-identical to what `Union` produces for the same emitter
+call.
 
 The digest is pinned in the test suite, so a change fails the build here before
 it reaches anyone. A failure is not automatically a defect — it is a prompt to

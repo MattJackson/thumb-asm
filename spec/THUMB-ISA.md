@@ -990,6 +990,18 @@ throughout, because a decoder that knows only one of them mis-reads the other,
 and the halfwords carry nothing that distinguishes them. A consumer that must
 reject an instruction its target does not have has to do so itself, by mnemonic.
 
+### Encoder-side legality gate (0.14.0)
+
+`Asm::with_target` — added in 0.14.0 — provides the encoder-side answer to
+this: the assembler consults a per-profile legality table
+(`src/isa/legality.rs`) keyed on the emitter's own static knowledge of what
+mnemonic and encoding form it produces, and refuses at the call site any
+emitter the target does not accept. The decoder stays a union by design;
+the table is what discriminates. For the same reason the crate ships
+`V7A`, `V7R`, `V7EM` alongside `V7AR` (a strict-intersection alias for
+images of unknown sub-profile) — `SDIV` on V7A is exactly the example
+that requires the split.
+
 ---
 
 ## 4. Coverage, counted

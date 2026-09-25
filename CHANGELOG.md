@@ -7,6 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-24
+
+The encoder learns to say "not on this chip". `isa::Target` — decoder-only
+through 0.13 — now runs through the assembler and the install/verify/analysis
+surfaces, so a caller who knows their image's profile gets refusal at the
+emitter that would produce an instruction the target does not define, and a
+detour that would misread a CMSE Security Gateway as a spurious pc-relative
+`LDRD` gets the honest answer.
+
+The mechanism is a per-emitter legality table (see
+`src/isa/legality.rs`), not decode-back: `spec/THUMB-ISA.md` §988–991 makes
+the decoder a union by design, so "does it decode under V7A?" is not the
+question. "Does this mnemonic + encoding form appear on V7A?" is, and that is
+what the table answers.
+
+The 0.14.0 table is deliberately minimal: only `sdiv` and `udiv` (Thumb-2
+T1) are restricted, on Armv7-A and on the strict `V7AR` intersection.
+Every other current Asm emitter is baseline T1 that is defined across
+Armv6-M / V7-M / V7-A / V7-R / V7E-M / V8-M identically, so the gate is a
+no-op for the pre-existing emitter surface today. The follow-on rows —
+`sg`/`bxns`/`blxns` under V8M, `enterx`/`leavex` under ThumbEE, `blx label`
+T2, DSP, and the operand-discriminated `mrs`/`msr`/`cps`/`dsb`/`dmb`
+mnemonics — land in 0.14.x / 0.15.0 alongside their emitters.
+
+### Emitted bytes changed
+
+Nothing changes for an existing caller under `Target::Union` — the crate's
+default. Bytes for `sdiv`/`udiv` are unchanged (they weren't emittable
+before 0.14). The 16-bit digest across the baseline emitter corpus is
+unchanged.
+
+### Added
+
+- **`Asm::with_target(isa::Target)`** and **`Asm::target()`** — construct
+  a chip-specific assembler that refuses at the emit site any instruction
+  the target does not define. Under `Target::Union` the behaviour is
+  byte-for-byte identical to `Asm::new()`.
+
+- **Every `Asm` emitter is now fluent**: `-> &mut Self`, so
+  `Asm::with_target(V8M).sdiv(0, 1, 2).finish().unwrap()` reads as a
+  single expression. `label()`, `data_blob()`, `pos()`, `target()` and
+  `finish()` do not chain (they return values other than the builder).
+
+- **`Asm::finish(&mut self)`** replaces the by-value `finish(self)`.
+  Every path (`Ok` or `Err`) leaves `self` a fresh empty assembler with
+  the same target — the reuse contract Fable's audit named. Two `finish()`
+  calls in a row: the second returns `Ok(vec![])`. A label from the
+  previous buffer used after `finish` is refused as
+  `AsmError::Layout { .. }` by the next `finish`, never silently bound to
+  an offset in the new buffer.
+
+- **`Asm::sdiv(rd, rn, rm)`** and **`Asm::udiv(rd, rn, rm)`** — the
+  demonstration restricted emitters. Both emit the Thumb-2 T1 wide
+  encoding (ARM ARM A8.8.165 / A8.8.267); both refuse SP (r13) and PC
+  (r15) in any argument as `AsmError::Operand`. Under
+  `Target::V7A`/`V7AR` they refuse as `AsmError::Unsupported`; under
+  `V7R`/`V7M`/`V7EM`/`V8M`/`Union` they emit.
+
+- **`Asm::raw16_unchecked(hw)`** — the explicit "these bytes, no gate"
+  escape hatch. `raw16(hw)` under a non-Union target now decodes `hw` under
+  `self.target`, refuses a wide-instruction prefix (points at `raw32`),
+  and consults the legality table on the recovered mnemonic; use the
+  `_unchecked` form to bypass every check.
+
+- **`Asm::raw32(hw1, hw2)`** — first-class emitter for wide (Thumb-2)
+  patterns. Same non-Union rule as `raw16` — decode under `self.target`,
+  legality-check the recovered mnemonic — the load-bearing correctness for
+  hand-encoding CMSE (`SG`) sequences on V8M.
+
+- **`isa::Target::V7A`**, **`isa::Target::V7R`**, **`isa::Target::V7EM`**
+  — the sub-profile split V7AR needed. `Target` is `#[non_exhaustive]` so
+  the additions are additive. `V7AR` is retained as the **strict
+  intersection** — legal iff legal on both V7A and V7R — which makes it
+  strictly stricter than V7R alone (the answer for images of unknown
+  sub-profile). V7M/V7A/V7R/V7EM are legality-discriminated only; the
+  decoder treats them identically to `Union`. V8M and ThumbEE remain
+  decoder-discriminated.
+
+- **`can_install_with(target, ...)`**, **`classify_branch_with(target,
+  ...)`**, **`analysis::xrefs_with(target, ...)`**,
+  **`analysis::reachable_with(target, ...)`**,
+  **`analysis::function_start_with(target, ...)`**,
+  **`analysis::literal_value_with(target, ...)`** — target-aware overloads
+  of every install / analysis surface that previously hardcoded
+  `Target::Union`. The old signatures are retained and delegate to Union.
+
+- **`DetourOptions::target: isa::Target`** and
+  **`DetourOptions::with_target(...)`** — threads the caller's profile
+  through the detour path (displaced-instruction sweep, flag-liveness
+  analysis, stub verifier). Consequence: on an Armv8-M image a Security
+  Gateway (`SG`) at the hook site is now decoded as `sg`, not as a
+  phantom pc-relative `LDRD` whose "literal target" the detour follows
+  into whatever bytes sit at that offset.
+
+### Changed (breaking, pre-1.0)
+
+- **`AsmError` becomes an enum** with three variants:
+  `Operand { at, msg }`, `Unsupported { at, mnemonic, target }`,
+  `Layout { at, msg }`. `reason()` accordingly returns `"operand"`,
+  `"unsupported"` or `"layout"`. `message()` is removed — use
+  `format!("{err}")` or the `Display` impl. Every variant carries `at`,
+  the byte position in the code buffer the error refers to. `AsmError::at()`
+  exposes it.
+
+- **`Asm::finish` takes `&mut self`** rather than `self`. Callers doing
+  `asm.finish()?` on a `mut` binding are unaffected; a caller passing
+  `Asm` by value into a function that then called `.finish()` will need
+  to pass `&mut Asm` instead.
+
+- **Every `Asm` emitter returns `&mut Self`** rather than `()`. Callers
+  who wrote closures like `|a| a.push(0)` in a `FnOnce(&mut Asm)` context
+  will need to add a discard: `|a| { a.push(0); }`.
+
 ## [0.13.0] - 2026-09-23
 
 Know what the registers and flags are doing. The crate stops refusing

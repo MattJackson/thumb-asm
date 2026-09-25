@@ -20,6 +20,29 @@ not, is counted section by section in
 
 ## Near term
 
+- **Grow the 0.14.0 legality table** into the follow-on restricted
+  emitters the table was scaffolded for. Named on their own lines below;
+  each is a self-contained row plus an `Asm` method plus a per-target
+  test, so they can land one at a time in 0.14.x patches.
+
+  - `Asm::sg`, `Asm::bxns`, `Asm::blxns` — the CMSE gateway family,
+    V8M-only. The whole reason the detour-side `SecureGateway` refusal
+    landed in 0.12.0, and the whole reason `raw32(0xE97F, 0xE97F)`
+    already accepts under V8M; the emitters make the operation
+    ergonomic and let the consumer's `AsmError::Unsupported` diagnostic
+    name `sg` explicitly under a wrong target.
+  - `Asm::enterx`, `Asm::leavex` — the ThumbEE transitions, ThumbEE-only.
+  - `Asm::blx_label` (T2) — Armv7-A/R only (not on any M profile). The
+    only mnemonic where the `_label` T2 form has to be discriminated
+    from the register-form T1 `blx`.
+  - `Asm::smlad`, `Asm::smlsd`, `Asm::usada8` and the rest of the DSP
+    family — V7E-M / V7A / V7R, not plain V7M.
+  - `Asm::mrs`, `Asm::msr`, `Asm::cps`, `Asm::dsb #option`,
+    `Asm::dmb #option`, hint-space `Asm::pld` — the four
+    operand-discriminated cases the `OpExtra` enum was made
+    non-exhaustive for. Each grows a corresponding `OpExtra` variant
+    (`SysReg`, `CpsMode`, `BarrierOpt`, `Hint`) when it lands.
+
 - **Close the remaining real mutation survivors.** `cargo-mutants` generates
   7,820 mutants, of which 7,569 are viable. 6,835 are caught outright and a
   further 53 hang a loop until the run times out, which is a detected
