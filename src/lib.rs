@@ -843,7 +843,6 @@ impl Asm {
 
     /// Record the first target-legality failure. Same first-wins semantics as
     /// [`Asm::fail`] — one class of error, one report.
-    #[allow(dead_code)] // wired to check_target in step 4.
     fn fail_target(&mut self, mnemonic: &'static str) {
         if self.err.is_none() {
             self.err = Some(AsmError::Unsupported {
@@ -851,6 +850,30 @@ impl Asm {
                 mnemonic,
                 target: self.target,
             });
+        }
+    }
+
+    /// Consult the per-profile legality table for `(mnemonic, form)` and
+    /// record an [`AsmError::Unsupported`] on this assembler if the target
+    /// does not accept it. Under [`Target::Union`](isa::Target::Union) this
+    /// is a no-op (Union is permissive by design); every other target routes
+    /// through [`isa::legality::defined_on`].
+    ///
+    /// Call **after** every operand check (`lo`/`reg`/`imm`/…) and after
+    /// cond validation, so an operand or condition error still surfaces as
+    /// the primary cause rather than being masked by a downstream
+    /// "not defined on target" that the caller cannot act on.
+    fn check_target(
+        &mut self,
+        mnemonic: &'static str,
+        form: isa::legality::EncForm,
+        extra: isa::legality::OpExtra,
+    ) {
+        if self.target == isa::Target::Union {
+            return;
+        }
+        if !isa::legality::defined_on(mnemonic, form, self.target, extra) {
+            self.fail_target(mnemonic);
         }
     }
 
@@ -1291,6 +1314,60 @@ impl Asm {
         self.lo("movs_reg", "rm", rm);
         self.emit16((rm << 3) | rd);
         self
+    }
+
+    /// `sdiv rd, rn, rm` — signed integer divide, `SDIV` T1
+    /// (ARM ARM A8.8.165). Wide (32-bit) Thumb-2 encoding.
+    ///
+    /// # Target legality
+    ///
+    /// `SDIV` is UNDEFINED on Armv7-A but mandatory on Armv7-R and every
+    /// Armv7-M / Armv7E-M / Armv8-M profile. Under
+    /// [`Target::V7A`](isa::Target::V7A) or
+    /// [`Target::V7AR`](isa::Target::V7AR) (the strict intersection),
+    /// [`Asm::finish`] returns `AsmError::Unsupported { mnemonic: "sdiv", .. }`.
+    /// Under [`Target::Union`](isa::Target::Union) — the default — it emits
+    /// unconditionally, matching the crate's pre-0.14 behaviour.
+    ///
+    /// # Operands
+    ///
+    /// `Rd`, `Rn`, `Rm` are 4-bit register fields. `PC` (r15) is
+    /// UNPREDICTABLE and `SP` (r13) is refused for the same reason as
+    /// [`Asm::blx`]'s guard on r15 — a decoder can accept them, but the
+    /// hardware behaviour is unspecified. This helper reports either as
+    /// [`AsmError::Operand`].
+    pub fn sdiv(&mut self, rd: u16, rn: u16, rm: u16) -> &mut Self {
+        self.divmod_wide("sdiv", 0xFB90, rd, rn, rm);
+        self
+    }
+
+    /// `udiv rd, rn, rm` — unsigned integer divide, `UDIV` T1
+    /// (ARM ARM A8.8.267). Same encoding shape and same target legality
+    /// story as [`Asm::sdiv`].
+    pub fn udiv(&mut self, rd: u16, rn: u16, rm: u16) -> &mut Self {
+        self.divmod_wide("udiv", 0xFBB0, rd, rn, rm);
+        self
+    }
+
+    /// Shared body of `sdiv`/`udiv` — same operand-validation, same target
+    /// check, same 4-byte encoding shape, only the base of `hw1` changes
+    /// (`0xFB90` for signed, `0xFBB0` for unsigned; both keep the `0xF0F0 |
+    /// (Rd << 8) | Rm` layout for `hw2`).
+    fn divmod_wide(&mut self, mnemonic: &'static str, hw1_base: u16, rd: u16, rn: u16, rm: u16) {
+        self.reg(mnemonic, "rd", rd);
+        self.reg(mnemonic, "rn", rn);
+        self.reg(mnemonic, "rm", rm);
+        for (field, r) in [("rd", rd), ("rn", rn), ("rm", rm)] {
+            if r == 13 || r == 15 {
+                self.fail(format!(
+                    "{mnemonic}: {field} = r{r} is UNPREDICTABLE (SP/PC), refuse rather than emit"
+                ));
+            }
+        }
+        self.check_target(mnemonic, isa::legality::EncForm::T1, isa::legality::OpExtra::Plain);
+        let hw1 = hw1_base | (rn & 0xF);
+        let hw2 = 0xF0F0 | ((rd & 0xF) << 8) | (rm & 0xF);
+        self.emit32(hw1, hw2);
     }
 
     /// `adr rd, blob` — position-independent load of a data blob's address

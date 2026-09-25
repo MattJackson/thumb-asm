@@ -38,6 +38,7 @@ use crate::Cond;
 
 // One module per encoding group, named for the sub-table it implements.
 mod cmse;
+pub(crate) mod legality;
 mod t16_branch;
 mod t16_dataproc;
 mod t16_loadstore;
