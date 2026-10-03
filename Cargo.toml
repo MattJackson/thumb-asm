@@ -8,7 +8,7 @@ edition = "2021"
 # `u32::from/to_le_bytes`, `std::mem::take`, `BTreeSet`) needs anything newer than 1.35.
 # Verified by building and testing with `+1.58.1` locally; see CI's msrv job for the standing check.
 rust-version = "1.58"
-authors = ["Matthew Jackson <dev4@getbusbar.com>"]
+authors = ["Matthew Jackson <matthew@pq.io>"]
 description = "An ARM Thumb/Thumb-2 decoder, disassembler, assembler and detour installer in pure safe Rust. Decodes and re-encodes the instruction set against Arm's own architecture reference manuals, relocates instructions, and installs trampolines over live code in a firmware image."
 license = "MIT"
 repository = "https://github.com/MattJackson/thumb-asm"

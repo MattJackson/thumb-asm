@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: 2026 Matthew Jackson <dev4@getbusbar.com>
+SPDX-FileCopyrightText: 2026 Matthew Jackson <matthew@pq.io>
 SPDX-License-Identifier: MIT
 -->
 

@@ -278,7 +278,7 @@ jobs:
         if: steps.state.outputs.tagged == 'false' && env.DRY_RUN != 'true'
         run: |
           set -euo pipefail
-          git -c user.name="thumb-asm release" -c user.email="dev4@getbusbar.com" \
+          git -c user.name="thumb-asm release" -c user.email="matthew@pq.io" \
             tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin "refs/tags/v${VERSION}"
 
