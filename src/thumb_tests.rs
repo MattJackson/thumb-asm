@@ -2941,3 +2941,56 @@ fn the_masked_needle_step_is_two_bytes_per_halfword() {
         Err(FindError::Ambiguous { count: 2, first: 0 })
     );
 }
+
+#[test]
+fn stack_and_memory_emitters_roundtrip_decoded_operands() {
+    use crate::isa::{decode_at, Operand, Reg};
+    let mut a = Asm::new();
+    a.str_sp(3, 4).ldrh_reg(0, 0, 6).add_sp(4).ands(0, 2);
+    let bytes = a.finish().unwrap();
+    for (at, mnemonic) in [(0, "str"), (2, "ldrh"), (4, "add"), (6, "and")] {
+        let ins = decode_at(&bytes, at).unwrap();
+        assert_eq!(ins.mnemonic, mnemonic);
+    }
+    let store = decode_at(&bytes, 0).unwrap();
+    assert_eq!(store.operands.get(0), Some(Operand::Reg(Reg(3))));
+    assert!(
+        matches!(store.operands.get(1),Some(Operand::Mem(m)) if m.base==Reg::SP && m.offset==4)
+    );
+    for (register, offset) in [(8, 4), (3, 2), (3, 1024)] {
+        let mut a = Asm::new();
+        a.str_sp(register, offset);
+        assert!(a.finish().is_err());
+    }
+    let mut a = Asm::new();
+    a.add_sp(2);
+    assert!(a.finish().is_err());
+    let mut a = Asm::new();
+    a.ldrh_reg(0, 0, 8);
+    assert!(a.finish().is_err());
+}
+
+#[test]
+fn native_replay_refuses_address_and_control_flow_dependencies() {
+    let mut original = Asm::new();
+    original.ldrb_imm(0, 4, 0).lsrs_imm(0, 0, 4).cmp_imm(0, 12);
+    let bytes = original.finish().unwrap();
+    let mut replay = Asm::new();
+    replay.replay(&bytes);
+    assert_eq!(replay.finish().unwrap(), bytes);
+    for halfwords in [
+        &[0x4800u16][..],
+        &[0xe000][..],
+        &[0xbf08][..],
+        &[0xf000][..],
+        &[0xbd10][..],
+    ] {
+        let bytes = halfwords
+            .iter()
+            .flat_map(|op| op.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut replay = Asm::new();
+        replay.replay(&bytes);
+        assert!(replay.finish().is_err());
+    }
+}

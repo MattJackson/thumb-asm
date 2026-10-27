@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add validated stack-relative store, halfword register-load, SP adjustment and
+  AND emitters, plus decoded position-independent instruction replay. Replay
+  refuses PC-relative, conditional, incomplete and control-flow instructions.
+
 ## [0.14.1] - 2026-09-25
 
 Mutation-coverage patch. No API changes, no behaviour changes. Adds tests

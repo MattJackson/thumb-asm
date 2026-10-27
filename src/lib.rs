@@ -1082,6 +1082,89 @@ impl Asm {
         self
     }
 
+    /// `str rt, [sp, #offset]`, with an aligned byte offset in 0..=1020.
+    pub fn str_sp(&mut self, rt: u16, offset: u16) -> &mut Self {
+        self.lo("str_sp", "rt", rt);
+        self.imm("str_sp", offset, 1020, 4);
+        self.emit16(0x9000 | (rt << 8) | (offset >> 2));
+        self
+    }
+
+    /// `ldrh rt, [rn, rm]`, using three low registers.
+    pub fn ldrh_reg(&mut self, rt: u16, rn: u16, rm: u16) -> &mut Self {
+        self.lo("ldrh_reg", "rt", rt);
+        self.lo("ldrh_reg", "rn", rn);
+        self.lo("ldrh_reg", "rm", rm);
+        self.emit16(0x5a00 | (rm << 6) | (rn << 3) | rt);
+        self
+    }
+
+    /// `add sp, #offset`, with an aligned byte offset in 0..=508.
+    pub fn add_sp(&mut self, offset: u16) -> &mut Self {
+        self.imm("add_sp", offset, 508, 4);
+        self.emit16(0xb000 | (offset >> 2));
+        self
+    }
+
+    /// `ands rd, rm`, updating N/Z and preserving C/V.
+    pub fn ands(&mut self, rd: u16, rm: u16) -> &mut Self {
+        self.lo("ands", "rd", rd);
+        self.lo("ands", "rm", rm);
+        self.emit16(0x4000 | (rm << 3) | rd);
+        self
+    }
+
+    /// Decode and re-encode position-independent native instructions.
+    /// PC-relative operations, branches, conditional instructions and incomplete
+    /// encodings are refused; use the relocator for address-dependent code.
+    pub fn replay(&mut self, bytes: &[u8]) -> &mut Self {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let ins = match isa::decode_at_with(bytes, offset, offset as u32, self.target) {
+                Some(ins) => ins,
+                None => {
+                    self.fail("replay: invalid or incomplete instruction".into());
+                    break;
+                }
+            };
+            let dependent = ins.is_branch()
+                || ins.writes_pc()
+                || ins.cond.is_some()
+                || ins.mnemonic == "it"
+                || ins.operands.as_slice().any(|operand| match operand {
+                    isa::Operand::Reg(isa::Reg::PC)
+                    | isa::Operand::RegShifted(isa::Reg::PC, _)
+                    | isa::Operand::Target(_) => true,
+                    isa::Operand::Mem(memory) => {
+                        memory.base == isa::Reg::PC
+                            || memory.index.map_or(false, |(reg, _)| reg == isa::Reg::PC)
+                    }
+                    _ => false,
+                });
+            if dependent {
+                self.fail(
+                    "replay: instruction depends on its original address or control flow".into(),
+                );
+                break;
+            }
+            match isa::encode(&ins) {
+                Some((low, high)) => {
+                    if ins.len() == 2 {
+                        self.raw16(low);
+                    } else {
+                        self.raw32(low, high);
+                    }
+                }
+                None => {
+                    self.fail("replay: instruction cannot be re-encoded".into());
+                    break;
+                }
+            }
+            offset += ins.len();
+        }
+        self
+    }
+
     /// `ldrb rt, [rn, #imm5]` (byte load, offset 0..31).
     pub fn ldrb_imm(&mut self, rt: u16, rn: u16, imm5: u16) -> &mut Self {
         self.lo("ldrb_imm", "rt", rt);
