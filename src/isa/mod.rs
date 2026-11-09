@@ -175,6 +175,21 @@ pub enum Target {
     /// ThumbEE state has to say so. See [`thumbee`](crate::isa) for why
     /// getting it wrong invents register traffic where the hardware branches.
     ThumbEE,
+    /// ARMv4T / ARMv5TE — Thumb-1 only, no Thumb-2.
+    ///
+    /// The 1939-class MediaTek optical controllers run an ARMv5TE core whose
+    /// Thumb state has *no* 32-bit Thumb-2 instructions at all — the only
+    /// 32-bit encoding is the `BL`/`BLX` branch pair. Build injected code with
+    /// this target and the encoder refuses every wide (Thumb-2) encoding at the
+    /// call site ([`Asm::raw32`] and every wide emitter routed through it), so a
+    /// stray `ldr.w`/`b.w` can never reach a Thumb-1 core, where it is an
+    /// undefined instruction (and faults). Thumb-1 is a strict subset of
+    /// Thumb-2, so a buffer built for this target also runs unchanged on a
+    /// Thumb-2 core — the one safe target for "all injected code is Thumb-1".
+    ///
+    /// Legality-discriminated: the decoder treats it like
+    /// [`Union`](Target::Union); only the encoder's wide path refuses.
+    Thumb1,
 }
 
 impl Default for Target {
@@ -192,6 +207,15 @@ impl Target {
     /// Whether the Armv8-M Security Extension's encodings are decodable.
     fn cmse(self) -> bool {
         matches!(self, Target::V8M)
+    }
+
+    /// Whether 32-bit Thumb-2 (wide) encodings exist on this target.
+    ///
+    /// False only for [`Thumb1`](Target::Thumb1) (ARMv4T/ARMv5TE), where the
+    /// encoder must refuse every wide encoding. True for every other target,
+    /// including [`Union`](Target::Union).
+    pub fn supports_thumb2(self) -> bool {
+        !matches!(self, Target::Thumb1)
     }
 }
 

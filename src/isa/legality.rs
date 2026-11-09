@@ -105,7 +105,11 @@ pub(crate) fn defined_on(mnemonic: &str, form: EncForm, target: Target, extra: O
         // Mandatory on Armv7-R and Armv7-M / Armv7E-M / Armv8-M. Not part
         // of Armv7-A: the Thumb T1 encoding is UNDEFINED on Armv7-A
         // proper. V7AR is the strict intersection, so it refuses too.
-        ("sdiv" | "udiv", EncForm::T1) => !matches!(target, Target::V7A | Target::V7AR),
+        // Also UNDEFINED on Thumb-1 (ARMv4T/ARMv5TE): it is a wide Thumb-2
+        // encoding, and a Thumb-1 core has no Thumb-2 at all.
+        ("sdiv" | "udiv", EncForm::T1) => {
+            !matches!(target, Target::V7A | Target::V7AR | Target::Thumb1)
+        }
         // Everything else: currently unrestricted across all non-Union
         // targets. Restricted mnemonics land here as new arms.
         _ => true,
@@ -150,6 +154,10 @@ mod tests {
             ),
             (Target::V8M, &[]),
             (Target::ThumbEE, &[]),
+            (
+                Target::Thumb1,
+                &[("sdiv", EncForm::T1), ("udiv", EncForm::T1)],
+            ),
         ];
 
         // A restricted-mnemonic universe to probe: every (mnemonic, form)
@@ -188,6 +196,7 @@ mod tests {
             Target::V7AR,
             Target::V8M,
             Target::ThumbEE,
+            Target::Thumb1,
         ];
         // The `cases` array above is the source of truth for the pinned
         // literal; a new `Target` variant not present in `all` here means

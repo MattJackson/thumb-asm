@@ -1044,12 +1044,18 @@ impl Asm {
         match isa::decode_at_with(&bytes, 0, 0, self.target) {
             Some(decoded) => {
                 let form = isa::legality::EncForm::from(decoded.encoding);
-                if isa::legality::defined_on(
-                    decoded.mnemonic,
-                    form,
-                    self.target,
-                    isa::legality::OpExtra::Plain,
-                ) {
+                // A Thumb-1 target (ARMv4T/ARMv5TE) has no 32-bit Thumb-2
+                // instructions at all — only the BL/BLX branch pair, which is
+                // emitted via the branch path, not raw32. So any wide encoding
+                // reaching raw32 is refused outright on such a target.
+                let legal = self.target.supports_thumb2()
+                    && isa::legality::defined_on(
+                        decoded.mnemonic,
+                        form,
+                        self.target,
+                        isa::legality::OpExtra::Plain,
+                    );
+                if legal {
                     self.emit32(hw1, hw2);
                 } else {
                     self.fail_target(decoded.mnemonic);
@@ -1079,6 +1085,89 @@ impl Asm {
         let pos = self.code.len();
         self.emit16(0x4800 | (rt << 8)); // patched in finish()
         self.ldrs.push((pos, value, rt));
+        self
+    }
+
+    /// `str rt, [sp, #offset]`, with an aligned byte offset in 0..=1020.
+    pub fn str_sp(&mut self, rt: u16, offset: u16) -> &mut Self {
+        self.lo("str_sp", "rt", rt);
+        self.imm("str_sp", offset, 1020, 4);
+        self.emit16(0x9000 | (rt << 8) | (offset >> 2));
+        self
+    }
+
+    /// `ldrh rt, [rn, rm]`, using three low registers.
+    pub fn ldrh_reg(&mut self, rt: u16, rn: u16, rm: u16) -> &mut Self {
+        self.lo("ldrh_reg", "rt", rt);
+        self.lo("ldrh_reg", "rn", rn);
+        self.lo("ldrh_reg", "rm", rm);
+        self.emit16(0x5a00 | (rm << 6) | (rn << 3) | rt);
+        self
+    }
+
+    /// `add sp, #offset`, with an aligned byte offset in 0..=508.
+    pub fn add_sp(&mut self, offset: u16) -> &mut Self {
+        self.imm("add_sp", offset, 508, 4);
+        self.emit16(0xb000 | (offset >> 2));
+        self
+    }
+
+    /// `ands rd, rm`, updating N/Z and preserving C/V.
+    pub fn ands(&mut self, rd: u16, rm: u16) -> &mut Self {
+        self.lo("ands", "rd", rd);
+        self.lo("ands", "rm", rm);
+        self.emit16(0x4000 | (rm << 3) | rd);
+        self
+    }
+
+    /// Decode and re-encode position-independent native instructions.
+    /// PC-relative operations, branches, conditional instructions and incomplete
+    /// encodings are refused; use the relocator for address-dependent code.
+    pub fn replay(&mut self, bytes: &[u8]) -> &mut Self {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let ins = match isa::decode_at_with(bytes, offset, offset as u32, self.target) {
+                Some(ins) => ins,
+                None => {
+                    self.fail("replay: invalid or incomplete instruction".into());
+                    break;
+                }
+            };
+            let dependent = ins.is_branch()
+                || ins.writes_pc()
+                || ins.cond.is_some()
+                || ins.mnemonic == "it"
+                || ins.operands.as_slice().any(|operand| match operand {
+                    isa::Operand::Reg(isa::Reg::PC)
+                    | isa::Operand::RegShifted(isa::Reg::PC, _)
+                    | isa::Operand::Target(_) => true,
+                    isa::Operand::Mem(memory) => {
+                        memory.base == isa::Reg::PC
+                            || memory.index.map_or(false, |(reg, _)| reg == isa::Reg::PC)
+                    }
+                    _ => false,
+                });
+            if dependent {
+                self.fail(
+                    "replay: instruction depends on its original address or control flow".into(),
+                );
+                break;
+            }
+            match isa::encode(&ins) {
+                Some((low, high)) => {
+                    if ins.len() == 2 {
+                        self.raw16(low);
+                    } else {
+                        self.raw32(low, high);
+                    }
+                }
+                None => {
+                    self.fail("replay: instruction cannot be re-encoded".into());
+                    break;
+                }
+            }
+            offset += ins.len();
+        }
         self
     }
 
@@ -3178,6 +3267,28 @@ mod asm_target_gate_tests {
             &bytes[..2],
             &[0x00, 0xF4],
             "Union writes 0xF400 little-endian"
+        );
+    }
+
+    /// A Thumb-1 (ARMv4T/ARMv5TE) target has no 32-bit Thumb-2 instructions, so
+    /// any wide encoding reaching `raw32` is refused — here `ldr.w pc,[pc,#0]`
+    /// (`0xF8DF 0xF000`), the exact pattern that faulted a Thumb-1 core as a
+    /// breadcrumb return trampoline. Plain Thumb-1 16-bit ops still assemble.
+    #[test]
+    fn thumb1_refuses_wide_thumb2_but_accepts_thumb1() {
+        let mut a = Asm::with_target(Target::Thumb1);
+        a.raw32(0xF8DF, 0xF000); // ldr.w pc,[pc,#0] — Thumb-2, undefined on Thumb-1
+        assert!(
+            a.finish().is_err(),
+            "Thumb1 must refuse a wide Thumb-2 encoding"
+        );
+
+        let mut b = Asm::with_target(Target::Thumb1);
+        b.push(0b1); // push {r0}
+        b.pop(0b1); // pop  {r0}
+        assert!(
+            b.finish().is_ok(),
+            "Thumb1 must accept Thumb-1 base 16-bit ops"
         );
     }
 
