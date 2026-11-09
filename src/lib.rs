@@ -1044,12 +1044,18 @@ impl Asm {
         match isa::decode_at_with(&bytes, 0, 0, self.target) {
             Some(decoded) => {
                 let form = isa::legality::EncForm::from(decoded.encoding);
-                if isa::legality::defined_on(
-                    decoded.mnemonic,
-                    form,
-                    self.target,
-                    isa::legality::OpExtra::Plain,
-                ) {
+                // A Thumb-1 target (ARMv4T/ARMv5TE) has no 32-bit Thumb-2
+                // instructions at all — only the BL/BLX branch pair, which is
+                // emitted via the branch path, not raw32. So any wide encoding
+                // reaching raw32 is refused outright on such a target.
+                let legal = self.target.supports_thumb2()
+                    && isa::legality::defined_on(
+                        decoded.mnemonic,
+                        form,
+                        self.target,
+                        isa::legality::OpExtra::Plain,
+                    );
+                if legal {
                     self.emit32(hw1, hw2);
                 } else {
                     self.fail_target(decoded.mnemonic);
@@ -3261,6 +3267,28 @@ mod asm_target_gate_tests {
             &bytes[..2],
             &[0x00, 0xF4],
             "Union writes 0xF400 little-endian"
+        );
+    }
+
+    /// A Thumb-1 (ARMv4T/ARMv5TE) target has no 32-bit Thumb-2 instructions, so
+    /// any wide encoding reaching `raw32` is refused — here `ldr.w pc,[pc,#0]`
+    /// (`0xF8DF 0xF000`), the exact pattern that faulted a Thumb-1 core as a
+    /// breadcrumb return trampoline. Plain Thumb-1 16-bit ops still assemble.
+    #[test]
+    fn thumb1_refuses_wide_thumb2_but_accepts_thumb1() {
+        let mut a = Asm::with_target(Target::Thumb1);
+        a.raw32(0xF8DF, 0xF000); // ldr.w pc,[pc,#0] — Thumb-2, undefined on Thumb-1
+        assert!(
+            a.finish().is_err(),
+            "Thumb1 must refuse a wide Thumb-2 encoding"
+        );
+
+        let mut b = Asm::with_target(Target::Thumb1);
+        b.push(0b1); // push {r0}
+        b.pop(0b1); // pop  {r0}
+        assert!(
+            b.finish().is_ok(),
+            "Thumb1 must accept Thumb-1 base 16-bit ops"
         );
     }
 
