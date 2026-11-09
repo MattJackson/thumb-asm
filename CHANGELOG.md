@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-09
+
 - Add `Target::Thumb1` (ARMv4T/ARMv5TE) and `Target::supports_thumb2()`. The
   encoder refuses all wide Thumb-2 encodings on this target (`raw32` and
   emitters routed through it, incl. sdiv/udiv).
